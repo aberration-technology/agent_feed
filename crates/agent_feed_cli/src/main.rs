@@ -6,7 +6,9 @@ use agent_feed_auth_github::{
 };
 use agent_feed_core::AgentEvent;
 use agent_feed_directory::RemoteUserRoute;
-use agent_feed_edge::{EdgeConfig, EdgeServerConfig, OrgDeploymentPolicy, serve_http};
+use agent_feed_edge::{
+    EdgeConfig, EdgeFabricConfig, EdgeServerConfig, OrgDeploymentPolicy, serve_http,
+};
 use agent_feed_ingest::source_from_str;
 use agent_feed_install::{doctor_report, init_plan};
 use agent_feed_p2p_proto::{FeedVisibility, Signed, StoryCapsule};
@@ -759,7 +761,12 @@ async fn main() -> Result<(), CliError> {
                     authority_id: "edge.feed".to_string(),
                     org_policy: OrgDeploymentPolicy::from_env(),
                 };
-                serve_http(EdgeServerConfig { bind, edge }).await?;
+                serve_http(EdgeServerConfig {
+                    bind,
+                    edge,
+                    fabric: EdgeFabricConfig::from_env(),
+                })
+                .await?;
             }
             EdgeCommand::Health => {
                 println!("feed edge: healthz=/healthz readyz=/readyz");

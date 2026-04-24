@@ -4,7 +4,7 @@ production uses the same split-host shape as the burn_dragon p2p deployment:
 
 ```text
 feed.aberration.technology
-  static github pages browser shell and username deep links
+  public browser shell and username deep links through the edge
 
 edge.feed.aberration.technology
   github resolver, browser seeds, directory, rendezvous/bootstrap edge
@@ -40,11 +40,11 @@ it writes:
 index.html
 404.html
 feed-config.json
-CNAME
 ```
 
-`404.html` is intentional. it keeps deep links such as `/mosure?all` working on
-github pages.
+`404.html` is intentional for the default github pages URL. production deep
+links such as `/mosure?all` are served through the edge Caddy host so they return
+`200` instead of relying on a github pages custom-domain fallback.
 
 ## github environment
 
@@ -112,8 +112,11 @@ one ec2 edge host
 one elastic ip
 one small public vpc/subnet
 route53 A record for edge.feed.aberration.technology
-route53 CNAME for feed.aberration.technology -> github pages
+route53 A record for feed.aberration.technology -> edge host
 caddy tls termination on the host
+caddy proxy to the github pages static shell
+tcp/udp p2p fabric probes on 7747
+udp browser handoff probe on 443
 ssm-enabled instance role
 basic cloudwatch status alarm
 ```
@@ -134,6 +137,8 @@ deploy is not considered green until these pass:
 ```text
 https://feed.aberration.technology/{canary_github_login}?all loads the static shell
 https://edge.feed.aberration.technology/healthz returns ok
+edge.feed.aberration.technology:7747 accepts tcp p2p fabric probes
+edge.feed.aberration.technology:7747 answers udp p2p fabric probes
 ```
 
 resolver and feed-discovery checks can be tightened as live publisher directory

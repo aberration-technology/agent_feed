@@ -348,6 +348,39 @@ jobs:
           echo "edge health canary failed after waiting for ${url}" >&2
           exit 1
 
+      - name: p2p fabric canary
+        if: ${{ github.event.inputs.apply == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          edge_url="${{ steps.terraform_outputs.outputs.edge_url }}"
+          edge_host="${edge_url#https://}"
+          edge_host="${edge_host#http://}"
+          edge_host="${edge_host%%/*}"
+
+          for attempt in $(seq 1 30); do
+            tcp_probe="$(
+              timeout 5 bash -c "exec 3<>/dev/tcp/${edge_host}/7747; head -n 1 <&3" 2>/dev/null || true
+            )"
+            if grep -q 'agent-feed.edge/1' <<<"$tcp_probe"; then
+              break
+            fi
+            echo "p2p tcp fabric not ready yet; retry ${attempt}/30"
+            sleep 5
+          done
+          if ! grep -q 'agent-feed.edge/1' <<<"${tcp_probe:-}"; then
+            echo "p2p tcp fabric canary failed for ${edge_host}:7747" >&2
+            exit 1
+          fi
+
+          udp_probe="$(
+            timeout 5 bash -c "exec 3<>/dev/udp/${edge_host}/7747; printf 'agent-feed-probe\n' >&3; head -n 1 <&3" 2>/dev/null || true
+          )"
+          if ! grep -q 'agent-feed.edge/1' <<<"$udp_probe"; then
+            echo "p2p udp fabric canary failed for ${edge_host}:7747" >&2
+            exit 1
+          fi
+
       - name: dispatch pages publish
         if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}
         env:

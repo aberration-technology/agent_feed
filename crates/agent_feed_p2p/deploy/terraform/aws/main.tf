@@ -71,6 +71,7 @@ locals {
     browser_app_base_url                = local.browser_app_base_url
     edge_base_url                       = local.edge_url
     network_id                          = var.network_id
+    p2p_port                            = var.p2p_port
     github_required_org                 = var.github_required_org
     github_required_teams               = var.github_required_teams
     github_required_repo                = var.github_required_repo

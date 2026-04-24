@@ -19,7 +19,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
@@ -419,6 +419,7 @@ pub fn resolve_endpoint(login: &GithubLogin) -> String {
 pub struct EdgeServerConfig {
     pub bind: SocketAddr,
     pub edge: EdgeConfig,
+    pub fabric: EdgeFabricConfig,
 }
 
 impl Default for EdgeServerConfig {
@@ -426,7 +427,41 @@ impl Default for EdgeServerConfig {
         Self {
             bind: SocketAddr::from(([127, 0, 0, 1], 7778)),
             edge: EdgeConfig::mainnet(),
+            fabric: EdgeFabricConfig::disabled(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeFabricConfig {
+    pub enabled: bool,
+    pub bind_ip: IpAddr,
+    pub tcp_port: u16,
+    pub quic_port: u16,
+    pub webrtc_direct_port: u16,
+}
+
+impl EdgeFabricConfig {
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            tcp_port: 7747,
+            quic_port: 7747,
+            webrtc_direct_port: 443,
+        }
+    }
+
+    #[must_use]
+    pub fn from_env() -> Self {
+        let mut config = Self::disabled();
+        config.enabled = env_bool("AGENT_FEED_EDGE_LISTEN_P2P");
+        config.tcp_port = env_u16("AGENT_FEED_P2P_TCP_PORT").unwrap_or(config.tcp_port);
+        config.quic_port = env_u16("AGENT_FEED_P2P_QUIC_PORT").unwrap_or(config.quic_port);
+        config.webrtc_direct_port =
+            env_u16("AGENT_FEED_P2P_WEBRTC_DIRECT_PORT").unwrap_or(config.webrtc_direct_port);
+        config
     }
 }
 
@@ -436,6 +471,9 @@ struct HttpState {
 }
 
 pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> {
+    if config.fabric.enabled {
+        spawn_fabric_listeners(config.edge.clone(), config.fabric.clone()).await?;
+    }
     let state = Arc::new(HttpState {
         config: config.edge,
     });
@@ -457,6 +495,109 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
     tracing::info!(bind = %config.bind, "feed edge serving");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn spawn_fabric_listeners(
+    edge: EdgeConfig,
+    fabric: EdgeFabricConfig,
+) -> Result<(), EdgeServeError> {
+    let tcp_addr = SocketAddr::new(fabric.bind_ip, fabric.tcp_port);
+    let tcp_listener = tokio::net::TcpListener::bind(tcp_addr).await?;
+    let tcp_edge = edge.clone();
+    tokio::spawn(async move {
+        loop {
+            match tcp_listener.accept().await {
+                Ok((stream, peer)) => {
+                    let edge = tcp_edge.clone();
+                    tokio::spawn(async move {
+                        let payload = fabric_probe_payload(&edge, "tcp");
+                        match stream.writable().await {
+                            Ok(()) => {
+                                if let Err(error) = stream.try_write(payload.as_bytes()) {
+                                    tracing::warn!(%peer, %error, "feed fabric tcp probe write failed");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%peer, %error, "feed fabric tcp probe not writable");
+                            }
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "feed fabric tcp accept failed");
+                }
+            }
+        }
+    });
+    tracing::info!(%tcp_addr, "feed fabric tcp listener serving");
+
+    spawn_udp_probe_listener(
+        SocketAddr::new(fabric.bind_ip, fabric.quic_port),
+        edge.clone(),
+        "quic",
+    )
+    .await?;
+    if fabric.webrtc_direct_port != fabric.quic_port {
+        spawn_udp_probe_listener(
+            SocketAddr::new(fabric.bind_ip, fabric.webrtc_direct_port),
+            edge,
+            "webrtc-direct",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn spawn_udp_probe_listener(
+    addr: SocketAddr,
+    edge: EdgeConfig,
+    transport: &'static str,
+) -> Result<(), EdgeServeError> {
+    let socket = tokio::net::UdpSocket::bind(addr).await?;
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 2048];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((_len, peer)) => {
+                    let payload = fabric_probe_payload(&edge, transport);
+                    if let Err(error) = socket.send_to(payload.as_bytes(), peer).await {
+                        tracing::warn!(%peer, %error, transport, "feed fabric udp probe failed");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, transport, "feed fabric udp receive failed");
+                }
+            }
+        }
+    });
+    tracing::info!(%addr, transport, "feed fabric udp listener serving");
+    Ok(())
+}
+
+fn fabric_probe_payload(edge: &EdgeConfig, transport: &str) -> String {
+    serde_json::json!({
+        "product": "feed",
+        "protocol": "agent-feed.edge/1",
+        "transport": transport,
+        "network_id": edge.network_id,
+        "edge": edge.edge_domain,
+        "state": "ready"
+    })
+    .to_string()
+        + "\n"
+}
+
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn env_u16(name: &str) -> Option<u16> {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
 }
 
 async fn healthz() -> &'static str {
@@ -1180,6 +1321,18 @@ mod tests {
             Some("/avatar/github/123")
         );
         assert!(response.feeds[0].publisher_verified);
+    }
+
+    #[test]
+    fn fabric_probe_payload_is_display_safe() {
+        let payload = fabric_probe_payload(&config(), "tcp");
+
+        assert!(payload.contains("\"product\":\"feed\""));
+        assert!(payload.contains("\"protocol\":\"agent-feed.edge/1\""));
+        assert!(payload.contains("\"transport\":\"tcp\""));
+        assert!(payload.contains("\"state\":\"ready\""));
+        assert!(!payload.contains("secret"));
+        assert!(!payload.contains("token"));
     }
 
     #[test]
