@@ -36,6 +36,7 @@ const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-feed")]
+#[command(version)]
 #[command(about = "agent activity, reduced to signal")]
 struct Cli {
     #[arg(
