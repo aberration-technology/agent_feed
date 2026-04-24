@@ -426,3 +426,97 @@ impl IntoResponse for AppError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_feed_core::{EventKind, PrivacyClass, Severity};
+
+    fn test_state() -> Arc<AppState> {
+        let (tx, _) = broadcast::channel(16);
+        Arc::new(AppState {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            p2p_enabled: false,
+            reel: Mutex::new(ReelBuffer::default()),
+            store: Mutex::new(InMemoryStore::default()),
+            tx,
+            redactor: Redactor::default(),
+            story: Mutex::new(StoryCompiler::default()),
+            metrics: Metrics::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn ingest_redacts_before_store_and_story_compiler() {
+        let state = test_state();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tester".to_string());
+        let mut event = AgentEvent::new(
+            SourceKind::Codex,
+            EventKind::FileChanged,
+            "codex found sk-test_secret in patch",
+        );
+        event.agent = "codex".to_string();
+        event.adapter = "codex.test".to_string();
+        event.project = Some("agent_feed".to_string());
+        event.session_id = Some("session".to_string());
+        event.turn_id = Some("turn".to_string());
+        event.summary = Some("patch mentioned ghp_privateToken and raw diff omitted.".to_string());
+        event.command = Some("echo sk-test_secret".to_string());
+        event.cwd = Some(format!("{home}/repo/.env"));
+        event.files = vec![format!("{home}/repo/secrets/token.key")];
+        event.score_hint = Some(88);
+        event.severity = Severity::Notice;
+
+        let Json(view) = ingest_event(state.clone(), event)
+            .await
+            .expect("event ingests");
+
+        assert!(view.accepted);
+        let events = state.store.lock().expect("store lock").events();
+        assert_eq!(events.len(), 1);
+        let stored = &events[0];
+        assert_eq!(stored.privacy, PrivacyClass::Redacted);
+        let stored_text = serde_json::to_string(stored).expect("stored event serializes");
+        assert!(!stored_text.contains("sk-test_secret"));
+        assert!(!stored_text.contains("ghp_privateToken"));
+        assert!(!stored_text.contains("secrets/token.key"));
+        assert_eq!(stored.cwd.as_deref(), Some("[sensitive-path]"));
+        assert_eq!(stored.files, vec!["[sensitive-path]"]);
+        assert!(
+            state
+                .reel
+                .lock()
+                .expect("reel lock")
+                .snapshot()
+                .bulletins
+                .iter()
+                .all(|bulletin| {
+                    let text = serde_json::to_string(bulletin).expect("bulletin serializes");
+                    !text.contains("sk-test_secret") && !text.contains("ghp_privateToken")
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_ingest_route_uses_first_party_adapter_normalization() {
+        let state = test_state();
+        let value = serde_json::json!({
+            "type": "turn.completed",
+            "agent": "codex",
+            "title": "turn.completed",
+            "cwd": "/tmp/agent-feed-test-workspace",
+            "session_id": "session",
+            "summary": "turn completed without raw output"
+        });
+
+        let Json(view) = ingest_agent_value(state.clone(), value, SourceKind::Codex)
+            .await
+            .expect("codex event ingests");
+
+        assert!(view.accepted);
+        let events = state.store.lock().expect("store lock").events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::TurnComplete);
+        assert_eq!(events[0].adapter, "codex.exec-json");
+    }
+}

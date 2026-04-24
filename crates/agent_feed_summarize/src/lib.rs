@@ -2031,6 +2031,53 @@ mod tests {
         assert!(!prompt.contains("secret_repo"));
     }
 
+    #[test]
+    fn external_processor_request_redacts_context_and_recent_history() {
+        let config = SummaryConfig::p2p_default();
+        let mut request = SummaryRequest::new(
+            "local:workstation",
+            FeedSummaryMode::PerStory,
+            vec![story(
+                "codex ran cargo test in secret_repo from /home/mosure/private",
+                82,
+            )],
+        );
+        request.branch = Some("feature/customer-secret".to_string());
+        request.session_hint = Some("session-with-private-context".to_string());
+        request.recent_summaries = vec![RecentSummary {
+            headline: "codex changed secret_repo".to_string(),
+            deck: "git push mentioned alice@example.com".to_string(),
+            story_family: StoryFamily::FileChange,
+            score: 78,
+        }];
+
+        let redacted = request_for_external_processor(&request, &config).expect("request redacts");
+        assert_eq!(redacted.branch.as_deref(), Some("[redacted]"));
+        assert_eq!(redacted.session_hint.as_deref(), Some("[redacted]"));
+        assert_eq!(redacted.stories[0].project, None);
+        assert_eq!(redacted.stories[0].key.project_hash, None);
+        assert!(!redacted.stories[0].headline.contains("secret_repo"));
+        assert!(!redacted.stories[0].headline.contains("/home/mosure"));
+        assert!(!redacted.stories[0].headline.contains("cargo test"));
+        assert!(
+            !redacted.recent_summaries[0]
+                .headline
+                .contains("secret_repo")
+        );
+        assert!(!redacted.recent_summaries[0].deck.contains("git push"));
+        assert!(
+            !redacted.recent_summaries[0]
+                .deck
+                .contains("alice@example.com")
+        );
+
+        let prompt = processor_prompt(&redacted);
+        assert!(!prompt.contains("secret_repo"));
+        assert!(!prompt.contains("/home/mosure"));
+        assert!(!prompt.contains("cargo test"));
+        assert!(!prompt.contains("alice@example.com"));
+    }
+
     struct EndpointLikeProcessor;
 
     impl SummaryProcessor for EndpointLikeProcessor {

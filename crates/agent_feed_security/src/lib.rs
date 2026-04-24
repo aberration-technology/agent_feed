@@ -41,3 +41,44 @@ pub fn is_loopback(ip: IpAddr) -> bool {
         IpAddr::V6(addr) => addr.is_loopback(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_bind_is_allowed_without_display_token() {
+        let config = SecurityConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 7777)),
+            display_token: None,
+            ..SecurityConfig::default()
+        };
+
+        validate_bind(&config).expect("loopback bind is local-only");
+    }
+
+    #[test]
+    fn public_bind_requires_display_token_by_default() {
+        let config = SecurityConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 7777)),
+            display_token: None,
+            ..SecurityConfig::default()
+        };
+
+        assert!(matches!(
+            validate_bind(&config),
+            Err(SecurityError::PublicBindRequiresToken)
+        ));
+    }
+
+    #[test]
+    fn public_bind_is_allowed_with_explicit_display_token() {
+        let config = SecurityConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 7777)),
+            display_token: Some("display-token".to_string()),
+            ..SecurityConfig::default()
+        };
+
+        validate_bind(&config).expect("token gates non-loopback display");
+    }
+}

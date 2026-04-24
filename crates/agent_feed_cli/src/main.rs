@@ -1369,6 +1369,23 @@ fn print_import_complete(label: &str, stats: ImportStats) {
 mod tests {
     use super::*;
 
+    fn temp_test_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("agent-feed-cli-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root creates");
+        root
+    }
+
+    fn write_jsonl(path: &Path, values: impl IntoIterator<Item = Value>) {
+        let lines = values
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{lines}\n")).expect("jsonl writes");
+    }
+
     #[test]
     fn p2p_publish_accepts_feed_name_alias() {
         let cli = Cli::try_parse_from([
@@ -1454,6 +1471,85 @@ mod tests {
     }
 
     #[test]
+    fn summary_config_routes_cli_processors_and_keeps_strict_defaults() {
+        let guardrail_patterns = vec![r"(?i)customer-name".to_string()];
+        let config = summary_config(SummaryCliOptions {
+            summarizer: "claude-code",
+            summary_style: "quiet feed style",
+            summary_prompt_max_chars: 128,
+            per_story: true,
+            allow_project_names: false,
+            guardrail_patterns: &guardrail_patterns,
+            images: false,
+            image_processor: "http-endpoint",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect("summary config builds");
+
+        assert_eq!(config.mode, FeedSummaryMode::PerStory);
+        assert_eq!(config.processor, SummaryProcessorConfig::ClaudeCodeExec);
+        assert_eq!(config.prompt.style, "quiet feed style");
+        assert_eq!(config.prompt.max_prompt_chars, 512);
+        assert!(!config.guardrails.allow_project_names);
+        assert!(!config.guardrails.allow_command_text);
+        assert!(config.guardrails.patterns.iter().any(|pattern| {
+            pattern.name == "cli-guardrail-0" && pattern.pattern == "(?i)customer-name"
+        }));
+        assert!(!config.image.enabled);
+        assert_eq!(config.image.processor, ImageProcessorConfig::Disabled);
+    }
+
+    #[test]
+    fn summary_config_rejects_unknown_routes_and_unsafe_image_config() {
+        let unknown = summary_config(SummaryCliOptions {
+            summarizer: "random-llm",
+            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
+            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+            per_story: false,
+            allow_project_names: false,
+            guardrail_patterns: &[],
+            images: false,
+            image_processor: "codex-exec",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect_err("unknown summarizer is rejected");
+        assert!(unknown.to_string().contains("unknown summarizer"));
+
+        let missing_endpoint = summary_config(SummaryCliOptions {
+            summarizer: "codex-exec",
+            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
+            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+            per_story: false,
+            allow_project_names: false,
+            guardrail_patterns: &[],
+            images: true,
+            image_processor: "http-endpoint",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect_err("http image processor requires endpoint");
+        assert!(
+            missing_endpoint
+                .to_string()
+                .contains("--image-endpoint is required")
+        );
+    }
+
+    #[test]
     fn p2p_share_rejects_invalid_feed_name_alias() {
         let error = Cli::try_parse_from(["agent-feed", "p2p", "share", "--feed-name", ".env"])
             .expect_err("invalid feed label is rejected");
@@ -1502,59 +1598,54 @@ mod tests {
 
     #[test]
     fn codex_collection_filters_by_workspace_cwd() {
-        let root = std::env::temp_dir().join(format!(
-            "agent-feed-cli-workspace-filter-{}",
-            std::process::id()
-        ));
+        let root = temp_test_root("codex-workspace-filter");
         let workspace = root.join("repo");
         let other = root.join("other");
         fs::create_dir_all(&workspace).expect("workspace dir");
         fs::create_dir_all(&other).expect("other dir");
         let transcript = root.join("codex.jsonl");
-        let lines = [
-            json!({
-                "type": "session_meta",
-                "timestamp": "2026-04-24T03:16:49.696Z",
-                "payload": {"id": "codex-workspace-test", "cwd": workspace}
-            }),
-            json!({
-                "type": "turn_context",
-                "timestamp": "2026-04-24T03:16:49.697Z",
-                "payload": {"cwd": workspace, "turn_id": "turn_1"}
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-04-24T03:17:00.000Z",
-                "payload": {
-                    "type": "exec_command_end",
-                    "status": "completed",
-                    "exit_code": 0,
-                    "duration": "120ms",
-                    "command": ["cargo", "test"]
-                }
-            }),
-            json!({
-                "type": "turn_context",
-                "timestamp": "2026-04-24T03:18:49.697Z",
-                "payload": {"cwd": other, "turn_id": "turn_2"}
-            }),
-            json!({
-                "type": "event_msg",
-                "timestamp": "2026-04-24T03:19:00.000Z",
-                "payload": {
-                    "type": "exec_command_end",
-                    "status": "completed",
-                    "exit_code": 0,
-                    "duration": "120ms",
-                    "command": ["cargo", "fmt"]
-                }
-            }),
-        ]
-        .into_iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-        fs::write(&transcript, format!("{lines}\n")).expect("write transcript");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "codex-workspace-test", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-04-24T03:16:49.697Z",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "duration": "120ms",
+                        "command": ["cargo", "test"]
+                    }
+                }),
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-04-24T03:18:49.697Z",
+                    "payload": {"cwd": other, "turn_id": "turn_2"}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:19:00.000Z",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "duration": "120ms",
+                        "command": ["cargo", "fmt"]
+                    }
+                }),
+            ],
+        );
 
         let filter = WorkspaceFilter::from_cli(Some(workspace.clone()))
             .expect("filter builds")
@@ -1567,6 +1658,152 @@ mod tests {
 
         let unfiltered = collect_codex_events(&transcript, None).expect("unfiltered collection");
         assert!(unfiltered.events.len() > collected.events.len());
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_workspace_scope_drops_events_without_cwd() {
+        let root = temp_test_root("codex-missing-cwd");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-24T03:17:00.000Z",
+                "payload": {"type": "task_started", "turn_id": "turn_1"}
+            })],
+        );
+
+        let filter = WorkspaceFilter::from_cli(Some(workspace))
+            .expect("filter builds")
+            .expect("filter enabled");
+        let collected =
+            collect_codex_events(&transcript, Some(&filter)).expect("codex collection works");
+        assert!(collected.events.is_empty());
+        assert_eq!(collected.filtered, 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn claude_collection_filters_by_workspace_cwd() {
+        let root = temp_test_root("claude-workspace-filter");
+        let workspace = root.join("repo");
+        let other = root.join("other");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&other).expect("other dir");
+        let stream = root.join("claude.jsonl");
+        write_jsonl(
+            &stream,
+            [
+                json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "claude-workspace-test",
+                    "cwd": workspace,
+                    "model": "claude-sonnet"
+                }),
+                json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [{
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": "cargo test"}
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "claude-other-test",
+                    "cwd": other,
+                    "model": "claude-sonnet"
+                }),
+                json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_ms": 1200,
+                    "result": "raw answer omitted"
+                }),
+            ],
+        );
+
+        let filter = WorkspaceFilter::from_cli(Some(workspace.clone()))
+            .expect("filter builds")
+            .expect("filter enabled");
+        let collected =
+            collect_claude_events(&stream, Some(&filter)).expect("claude collection works");
+        assert!(collected.filtered > 0);
+        assert!(!collected.events.is_empty());
+        assert!(collected.events.iter().all(|event| filter.allows(event)));
+
+        let unfiltered = collect_claude_events(&stream, None).expect("unfiltered collection");
+        assert!(unfiltered.events.len() > collected.events.len());
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn active_codex_workspace_scope_scans_past_latest_nonmatching_session() {
+        let root = temp_test_root("active-codex-workspace-filter");
+        let workspace = root.join("repo");
+        let other = root.join("other");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&other).expect("other dir");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let history = root.join("history.jsonl");
+        let inside = sessions.join("inside-session.jsonl");
+        let outside = sessions.join("outside-session.jsonl");
+        write_jsonl(
+            &inside,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "inside-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {"type": "task_started", "turn_id": "turn-inside"}
+                }),
+            ],
+        );
+        write_jsonl(
+            &outside,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "outside-session", "cwd": other}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {"type": "task_started", "turn_id": "turn-outside"}
+                }),
+            ],
+        );
+        write_jsonl(
+            &history,
+            [
+                json!({"session_id": "inside-session"}),
+                json!({"session_id": "outside-session"}),
+            ],
+        );
+
+        let filter = WorkspaceFilter::from_cli(Some(workspace))
+            .expect("filter builds")
+            .expect("filter enabled");
+        let paths = active_codex_session_paths(&history, &sessions, 1, Some(&filter))
+            .expect("active sessions resolve");
+
+        assert_eq!(paths, vec![inside]);
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
