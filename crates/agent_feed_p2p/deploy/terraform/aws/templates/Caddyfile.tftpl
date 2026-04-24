@@ -12,8 +12,43 @@ http://${browser_app_hostname} {
     redir https://${browser_app_hostname}{uri} 308
 }
 
-https://${browser_app_hostname} {
+https://${browser_app_hostname}, https://${edge_domain_name} {
     encode gzip zstd
+
+    @edgePreflight {
+        host ${edge_domain_name}
+        method OPTIONS
+    }
+    handle @edgePreflight {
+        header Access-Control-Allow-Origin "${browser_app_origin}"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
+        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
+        header Access-Control-Max-Age "3600"
+        header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        respond "" 204
+    }
+
+    @edgeHealth {
+        host ${edge_domain_name}
+        path /healthz
+    }
+    respond @edgeHealth "ok" 200
+
+    @edgeReady {
+        host ${edge_domain_name}
+        path /readyz
+    }
+    respond @edgeReady "ready" 200
+
+    @edgeHost host ${edge_domain_name}
+    handle @edgeHost {
+        header Access-Control-Allow-Origin "${browser_app_origin}"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
+        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
+        reverse_proxy 127.0.0.1:${edge_loopback_port}
+    }
 
     @githubAuth {
         path /auth/github
@@ -42,36 +77,5 @@ https://${browser_app_hostname} {
         reverse_proxy https://${browser_pages_origin_host} {
             header_up Host ${browser_pages_origin_host}
         }
-    }
-}
-
-https://${edge_domain_name} {
-    encode gzip zstd
-
-    @preflight method OPTIONS
-    handle @preflight {
-        header Access-Control-Allow-Origin "${browser_app_origin}"
-        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
-        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
-        header Access-Control-Max-Age "3600"
-        header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
-        respond "" 204
-    }
-
-    handle /healthz {
-        respond "ok" 200
-    }
-
-    handle /readyz {
-        respond "ready" 200
-    }
-
-    handle {
-        header Access-Control-Allow-Origin "${browser_app_origin}"
-        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
-        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
-        reverse_proxy 127.0.0.1:${edge_loopback_port}
     }
 }
