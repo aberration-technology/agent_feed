@@ -14,6 +14,7 @@ pub enum RemoteFeedMode {
     #[default]
     Discovery,
     Subscribed,
+    Local,
 }
 
 impl RemoteFeedMode {
@@ -25,7 +26,9 @@ impl RemoteFeedMode {
             .or_else(|| params.first("feedMode"))
             .or_else(|| params.first("source"))
             .unwrap_or_default();
-        if matches!(explicit, "subscribed" | "subscriptions" | "following")
+        if matches!(explicit, "local" | "loopback") {
+            Self::Local
+        } else if matches!(explicit, "subscribed" | "subscriptions" | "following")
             || params.has("subscriptions")
             || params.has("subscribed")
             || params
@@ -460,6 +463,10 @@ mod tests {
         assert_eq!(
             RemoteFeedMode::from_query("feed_mode=subscribed"),
             RemoteFeedMode::Subscribed
+        );
+        assert_eq!(
+            RemoteFeedMode::from_query("feed_mode=local"),
+            RemoteFeedMode::Local
         );
         assert_eq!(
             RemoteFeedMode::from_query("subscriptions=mosure/workstation"),

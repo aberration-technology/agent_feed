@@ -99,6 +99,13 @@ the hosted browser shell is:
 https://feed.aberration.technology/
 ```
 
+local loopback streams are served by the local daemon, not scraped by the
+hosted static page:
+
+```text
+http://127.0.0.1:7777/reel
+```
+
 with p2p enabled, the root page is the global discovery feed: it asks the edge
 for network bootstrap/snapshot material and displays any visible, settled story
 headlines. it never requests raw events.

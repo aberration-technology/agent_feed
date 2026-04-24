@@ -18,6 +18,7 @@ const timeline = document.querySelector("#timeline");
 const modeSwitcher = document.querySelector("#mode-switcher");
 const modeDiscovery = document.querySelector("#mode-discovery");
 const modeSubscribed = document.querySelector("#mode-subscribed");
+const modeLocal = document.querySelector("#mode-local");
 
 let bulletins = [];
 let activeIndex = 0;
@@ -88,11 +89,11 @@ function setText(node, value) {
   }
 }
 
-function setAuthAction(url, label = "sign in with github") {
+function setAuthAction(url, label = "sign in with github", force = false) {
   if (!authAction) {
     return;
   }
-  if (!url || !isNetworkView()) {
+  if (!url || (!force && !isNetworkView())) {
     authAction.hidden = true;
     authAction.removeAttribute("href");
     return;
@@ -385,6 +386,30 @@ function renderP2pDisabled(route) {
   stopStageProgress();
 }
 
+function renderLocalLoopbackRoute(route) {
+  logInfo("feed.local.loopback.selected", {
+    scope: route.kind || "global",
+    login: route.login,
+    network: route.network,
+    local_reel_url: localReelUrl(),
+  });
+  showStage();
+  document.body.dataset.mode = "dispatch";
+  setText(liveState, "local");
+  setText(eyebrow, "feed / local / loopback");
+  setText(headline, "open local reel");
+  setText(
+    deck,
+    "the hosted shell does not read loopback streams by default · use the daemon-served reel for local agent activity",
+  );
+  renderPublisher(undefined);
+  renderHeadlineImage(undefined);
+  setAuthAction(localReelUrl(), "open local reel", true);
+  renderChips(["local", "loopback", "opt-in", "redacted"]);
+  renderTicker(["agent-feed serve publishes local streams at 127.0.0.1:7777/reel"]);
+  stopStageProgress();
+}
+
 function renderAuthRequired(route) {
   renderRemoteState(route, "auth-required", [
     "github sign-in required",
@@ -579,6 +604,9 @@ function routeFeedMode(params, scope = "user") {
     params.get("source") ||
     ""
   ).toLowerCase();
+  if (["local", "loopback"].includes(explicit)) {
+    return "local";
+  }
   if (["subscribed", "subscriptions", "following"].includes(explicit)) {
     return "subscribed";
   }
@@ -677,7 +705,19 @@ function decodeFeedSegment(segment) {
 
 function routeSelection(login, params) {
   const streams = params.get("streams");
-  if (params.has("all") || streams === "all" || streams === "*" || streams === `${login}/*`) {
+  const explicit = (
+    params.get("feed_mode") ||
+    params.get("feedMode") ||
+    params.get("source") ||
+    ""
+  ).toLowerCase();
+  if (
+    params.has("all") ||
+    streams === "all" ||
+    streams === "*" ||
+    streams === `${login}/*` ||
+    ["discovery", "discover", "hero", "public"].includes(explicit)
+  ) {
     return `${login}/*`;
   }
   if (streams && !streams.includes(",")) {
@@ -691,14 +731,22 @@ function p2pEnabled() {
 }
 
 function setupModeSwitcher(route) {
-  if (!modeSwitcher || !modeDiscovery || !modeSubscribed || !p2pEnabled()) {
+  if (!modeSwitcher || !modeDiscovery || !modeSubscribed || !modeLocal || !p2pEnabled()) {
     hideModeSwitcher();
     return;
   }
+  modeDiscovery.textContent = route.kind === "global" ? "discovery" : `${route.login}/*`;
+  modeSubscribed.textContent = route.kind === "global" ? "subscribed" : "subscribed";
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
   modeSubscribed.setAttribute("href", modeUrl(route, "subscribed"));
-  modeDiscovery.toggleAttribute("aria-current", route.kind === "global" && route.feedMode === "discovery");
+  modeLocal.setAttribute("href", localReelUrl());
+  modeDiscovery.toggleAttribute(
+    "aria-current",
+    (route.kind === "global" && route.feedMode === "discovery") ||
+      (route.kind === "user" && route.feedMode !== "subscribed" && route.feedMode !== "local"),
+  );
   modeSubscribed.toggleAttribute("aria-current", route.feedMode === "subscribed");
+  modeLocal.toggleAttribute("aria-current", route.feedMode === "local");
   modeSwitcher.hidden = false;
   const reveal = () => revealControls();
   window.addEventListener("pointermove", reveal, { passive: true });
@@ -727,6 +775,9 @@ function revealControls() {
 }
 
 function modeUrl(route, mode) {
+  if (mode === "local") {
+    return localReelUrl();
+  }
   const params = new URLSearchParams(route.query);
   params.set("feed_mode", mode);
   if (route.network && route.network !== "mainnet") {
@@ -739,16 +790,42 @@ function modeUrl(route, mode) {
     params.delete("subscriptions");
     params.delete("subscribed");
     params.delete("following");
+    params.delete("streams");
   }
-  const query = params.toString();
-  if (mode === "discovery" || route.kind === "global") {
+  if (mode === "subscribed") {
+    params.delete("all");
+    params.delete("streams");
+  }
+  if (route.kind === "global") {
+    const query = params.toString();
     return query ? `/?${query}` : "/";
   }
+  if (mode === "discovery") {
+    params.delete("feed_mode");
+    params.set("all", "true");
+  }
+  const userFeed =
+    mode === "discovery"
+      ? "*"
+      : route.feed && route.feed !== "*"
+        ? route.feed
+        : route.subscriptionTargets.length === 1 &&
+            route.subscriptionTargets[0].replace(/^@/, "").startsWith(`${route.login}/`)
+          ? route.subscriptionTargets[0].replace(/^@/, "").split("/")[1] || "*"
+          : route.feed === "*"
+            ? "*"
+            : "";
+  const nextParams = new URLSearchParams(params);
+  const nextQuery = nextParams.toString();
   const path =
-    route.feed && route.feed !== "*"
-      ? `/${encodeURIComponent(route.login)}/${encodeURIComponent(route.feed)}`
-      : `/${encodeURIComponent(route.login)}${route.feed === "*" ? "/*" : ""}`;
-  return query ? `${path}?${query}` : path;
+    userFeed && userFeed !== "*"
+      ? `/${encodeURIComponent(route.login)}/${encodeURIComponent(userFeed)}`
+      : `/${encodeURIComponent(route.login)}${userFeed === "*" ? "/*" : ""}`;
+  return nextQuery ? `${path}?${nextQuery}` : path;
+}
+
+function localReelUrl() {
+  return "http://127.0.0.1:7777/reel";
 }
 
 function parseGithubAuthCallback(location) {
@@ -924,6 +1001,11 @@ async function startRemoteRoute(route) {
     interactive: route.interactive,
     p2p_enabled: p2pEnabled(),
   });
+  if (route.feedMode === "local") {
+    setupModeSwitcher(route);
+    renderLocalLoopbackRoute(route);
+    return;
+  }
   if (!p2pEnabled()) {
     renderP2pDisabled(route);
     return;

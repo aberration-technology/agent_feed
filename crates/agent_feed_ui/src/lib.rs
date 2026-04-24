@@ -162,4 +162,23 @@ mod tests {
         assert!(html.contains("params.set(\"feed_mode\", mode);"));
         assert!(html.contains("per-user discovery is represented by user/* wildcard routes"));
     }
+
+    #[test]
+    fn mode_switcher_preserves_user_scope_and_exposes_local_reel() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("id=\"mode-local\" href=\"http://127.0.0.1:7777/reel\""));
+        assert!(
+            html.contains(
+                "modeDiscovery.textContent = route.kind === \"global\" ? \"discovery\" : `${route.login}/*`;"
+            )
+        );
+        assert!(html.contains("params.set(\"all\", \"true\");"));
+        assert!(
+            html.contains("[\"discovery\", \"discover\", \"hero\", \"public\"].includes(explicit)")
+        );
+        assert!(html.contains("return \"http://127.0.0.1:7777/reel\";"));
+        assert!(html.contains("function renderLocalLoopbackRoute"));
+        assert!(html.contains("the hosted shell does not read loopback streams by default"));
+    }
 }
