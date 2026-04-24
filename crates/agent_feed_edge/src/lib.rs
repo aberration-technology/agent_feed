@@ -1,6 +1,6 @@
 use agent_feed_directory::{
     DirectoryError, DirectoryStore, GithubDiscoveryTicket, GithubProfileView, OrgDiscoveryTicket,
-    OrgRouteFilter, RemoteUserRoute, SignedBrowserSeed,
+    OrgRouteFilter, RemoteHeadlineView, RemoteUserRoute, SignedBrowserSeed,
 };
 use agent_feed_identity::{GithubLogin, GithubOrgName, GithubTeamSlug};
 use agent_feed_identity_github::{
@@ -8,21 +8,28 @@ use agent_feed_identity_github::{
     GithubUserResponse, StaticGithubResolver,
 };
 use agent_feed_p2p_proto::{
-    ProtocolCompatibility, Signature, github_org_provider_key, github_org_topic,
-    github_provider_key, github_team_provider_key, github_team_topic, github_user_topic,
+    ProtocolCompatibility, Signature, Signed, StoryCapsule, github_org_provider_key,
+    github_org_topic, github_provider_key, github_team_provider_key, github_team_topic,
+    github_user_topic,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::Sha256;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
+use tower_http::cors::{Any, CorsLayer};
+
+const SNAPSHOT_HEADLINE_LIMIT: usize = 64;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeConfig {
@@ -533,6 +540,39 @@ impl EdgeFabricConfig {
 #[derive(Clone)]
 struct HttpState {
     config: EdgeConfig,
+    snapshot: SnapshotStore,
+}
+
+#[derive(Clone, Default)]
+struct SnapshotStore {
+    headlines: Arc<Mutex<VecDeque<RemoteHeadlineView>>>,
+}
+
+impl SnapshotStore {
+    fn push(&self, headline: RemoteHeadlineView) {
+        let Ok(mut headlines) = self.headlines.lock() else {
+            tracing::warn!("network snapshot headline store lock poisoned");
+            return;
+        };
+        if headlines.iter().any(|existing| {
+            existing.feed_id == headline.feed_id
+                && existing.headline == headline.headline
+                && existing.deck == headline.deck
+        }) {
+            return;
+        }
+        headlines.push_back(headline);
+        while headlines.len() > SNAPSHOT_HEADLINE_LIMIT {
+            headlines.pop_front();
+        }
+    }
+
+    fn headlines(&self) -> Vec<RemoteHeadlineView> {
+        self.headlines
+            .lock()
+            .map(|headlines| headlines.iter().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> {
@@ -541,6 +581,7 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
     }
     let state = Arc::new(HttpState {
         config: config.edge,
+        snapshot: SnapshotStore::default(),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -556,7 +597,14 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
         .route("/avatar/github/{github_user_id}", get(avatar_github))
         .route("/browser-seed", get(browser_seed))
         .route("/network/snapshot", get(network_snapshot))
-        .with_state(state);
+        .route("/network/publish", post(network_publish))
+        .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        );
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "feed edge serving");
     axum::serve(listener, app).await?;
@@ -800,11 +848,16 @@ async fn callback_github(
     {
         return edge_error(StatusCode::FORBIDDEN, message);
     }
-    let session = format!(
-        "feed.{}.{}",
-        profile.id.get(),
-        OffsetDateTime::now_utc().unix_timestamp()
-    );
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
+    let session = match issue_session_token(profile.id.get(), expires_at) {
+        Some(session) => session,
+        None => {
+            return edge_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "github session signing is not configured",
+            );
+        }
+    };
     let final_url = if payload.client.ends_with("-cli") {
         payload.redirect_uri.unwrap_or_default()
     } else {
@@ -814,7 +867,6 @@ async fn callback_github(
                 .unwrap_or_else(|| state.config.browser_app_base_url.clone())
         )
     };
-    let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
     let github_user_id = profile.id.get().to_string();
     let avatar_url = state.config.github_avatar_url(profile.id.get());
     let expires_at = expires_at
@@ -952,10 +1004,102 @@ async fn browser_seed(State(state): State<Arc<HttpState>>) -> impl IntoResponse 
 }
 
 async fn network_snapshot(State(state): State<Arc<HttpState>>) -> Json<serde_json::Value> {
-    Json(network_snapshot_value(&state.config))
+    Json(network_snapshot_value(
+        &state.config,
+        state.snapshot.headlines(),
+    ))
 }
 
-fn network_snapshot_value(config: &EdgeConfig) -> serde_json::Value {
+#[derive(Debug, Deserialize)]
+struct NetworkPublishRequest {
+    #[serde(default)]
+    feed_name: Option<String>,
+    #[serde(default)]
+    capsules: Vec<Signed<StoryCapsule>>,
+}
+
+#[derive(Debug, Serialize)]
+struct NetworkPublishResponse {
+    state: &'static str,
+    accepted: usize,
+    headlines: usize,
+}
+
+async fn network_publish(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    Json(request): Json<NetworkPublishRequest>,
+) -> impl IntoResponse {
+    let Some(session) = verify_bearer_session(&headers) else {
+        return edge_error(StatusCode::UNAUTHORIZED, "github session required");
+    };
+    if request.capsules.is_empty() {
+        return Json(NetworkPublishResponse {
+            state: "accepted",
+            accepted: 0,
+            headlines: state.snapshot.headlines().len(),
+        })
+        .into_response();
+    }
+
+    let feed_name = request
+        .feed_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("workstation");
+    let mut accepted = 0usize;
+    for capsule in request.capsules {
+        if !capsule.verify_capsule().unwrap_or(false) {
+            return edge_error(StatusCode::BAD_REQUEST, "invalid capsule signature");
+        }
+        if capsule.value.privacy_class != agent_feed_core::PrivacyClass::Redacted {
+            return edge_error(StatusCode::BAD_REQUEST, "capsule must be redacted");
+        }
+        let Some(publisher) = capsule.value.publisher.clone() else {
+            return edge_error(StatusCode::BAD_REQUEST, "verified publisher is required");
+        };
+        if publisher.github_user_id != Some(session.github_user_id) || !publisher.verified {
+            return edge_error(StatusCode::FORBIDDEN, "publisher identity mismatch");
+        }
+        let publisher_login = publisher
+            .github_login
+            .clone()
+            .unwrap_or_else(|| format!("github:{}", session.github_user_id));
+        let view = RemoteHeadlineView {
+            feed_id: capsule.value.feed_id.clone(),
+            feed_label: feed_name.to_string(),
+            publisher_login,
+            publisher_display_name: publisher.display_name.clone(),
+            publisher_avatar: publisher.avatar.clone(),
+            verified: true,
+            headline: capsule.value.headline.clone(),
+            deck: capsule.value.deck.clone(),
+            lower_third: format!("{} / {}", publisher.display_label(), feed_name),
+            chips: capsule.value.chips.clone(),
+            image: capsule.value.image.clone(),
+        };
+        state.snapshot.push(view);
+        accepted += 1;
+    }
+    tracing::info!(
+        github_user_id = session.github_user_id,
+        feed_name,
+        accepted,
+        "network story capsules accepted"
+    );
+    Json(NetworkPublishResponse {
+        state: "accepted",
+        accepted,
+        headlines: state.snapshot.headlines().len(),
+    })
+    .into_response()
+}
+
+fn network_snapshot_value(
+    config: &EdgeConfig,
+    headlines: Vec<RemoteHeadlineView>,
+) -> serde_json::Value {
     serde_json::json!({
         "state": "ready",
         "product": "feed",
@@ -968,7 +1112,7 @@ fn network_snapshot_value(config: &EdgeConfig) -> serde_json::Value {
         "story_only": true,
         "raw_events": false,
         "feeds": [],
-        "headlines": [],
+        "headlines": headlines,
     })
 }
 
@@ -981,6 +1125,94 @@ fn edge_error(status: StatusCode, message: impl Into<String>) -> axum::response:
         })),
     )
         .into_response()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedSession {
+    github_user_id: u64,
+}
+
+fn issue_session_token(github_user_id: u64, expires_at: OffsetDateTime) -> Option<String> {
+    let expires = expires_at.unix_timestamp();
+    let secret = session_secret()?;
+    Some(issue_session_token_with_secret(
+        github_user_id,
+        expires,
+        &secret,
+    ))
+}
+
+fn verify_bearer_session(headers: &HeaderMap) -> Option<VerifiedSession> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let token = value.strip_prefix("Bearer ")?.trim();
+    verify_session_token(token)
+}
+
+fn verify_session_token(token: &str) -> Option<VerifiedSession> {
+    let secret = session_secret()?;
+    verify_session_token_with_secret(token, &secret, OffsetDateTime::now_utc().unix_timestamp())
+}
+
+fn issue_session_token_with_secret(github_user_id: u64, expires: i64, secret: &str) -> String {
+    let sig = session_signature(github_user_id, expires, secret);
+    format!("feed.{github_user_id}.{expires}.{sig}")
+}
+
+fn verify_session_token_with_secret(
+    token: &str,
+    secret: &str,
+    now_unix: i64,
+) -> Option<VerifiedSession> {
+    let mut parts = token.split('.');
+    if parts.next()? != "feed" {
+        return None;
+    }
+    let github_user_id = parts.next()?.parse::<u64>().ok()?;
+    let expires = parts.next()?.parse::<i64>().ok()?;
+    let signature = parts.next()?;
+    if parts.next().is_some() || expires <= now_unix {
+        return None;
+    }
+    let expected = session_signature(github_user_id, expires, secret);
+    constant_time_eq(signature.as_bytes(), expected.as_bytes())
+        .then_some(VerifiedSession { github_user_id })
+}
+
+fn session_secret() -> Option<String> {
+    env::var("AGENT_FEED_EDGE_SESSION_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(github_client_secret)
+}
+
+fn session_signature(github_user_id: u64, expires: i64, secret: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts arbitrary key lengths");
+    mac.update(b"agent-feed-session-v1");
+    mac.update(github_user_id.to_string().as_bytes());
+    mac.update(b":");
+    mac.update(expires.to_string().as_bytes());
+    hex_lower(&mac.finalize().into_bytes())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1479,7 +1711,7 @@ mod tests {
 
     #[test]
     fn network_snapshot_supports_global_discovery_shape() {
-        let snapshot = network_snapshot_value(&config());
+        let snapshot = network_snapshot_value(&config(), Vec::new());
 
         assert_eq!(snapshot["state"], "ready");
         assert_eq!(snapshot["feed_mode"], "discovery");
@@ -1488,6 +1720,61 @@ mod tests {
         assert!(snapshot["feeds"].as_array().is_some());
         assert!(snapshot["headlines"].as_array().is_some());
         assert_eq!(snapshot["compatibility"]["protocol_version"], 1);
+    }
+
+    #[test]
+    fn signed_session_tokens_verify_and_reject_tamper() {
+        let token = issue_session_token_with_secret(123, 4_102_444_800, "secret");
+
+        assert_eq!(
+            verify_session_token_with_secret(&token, "secret", 1_767_225_600),
+            Some(VerifiedSession {
+                github_user_id: 123
+            })
+        );
+        assert_eq!(
+            verify_session_token_with_secret(&token, "wrong", 1_767_225_600),
+            None
+        );
+        assert_eq!(
+            verify_session_token_with_secret(&token, "secret", 4_102_444_801),
+            None
+        );
+    }
+
+    #[test]
+    fn network_snapshot_store_dedupes_and_exposes_headlines() {
+        let store = SnapshotStore::default();
+        let headline = RemoteHeadlineView {
+            feed_id: "local:workstation".to_string(),
+            feed_label: "workstation".to_string(),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            verified: true,
+            headline: "codex finished release pass".to_string(),
+            deck: "settled story capsule reached the edge.".to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["verified".to_string(), "codex".to_string()],
+            image: None,
+        };
+
+        store.push(headline.clone());
+        store.push(headline);
+        let snapshot = network_snapshot_value(&config(), store.headlines());
+
+        assert_eq!(
+            snapshot["headlines"].as_array().expect("headlines").len(),
+            1
+        );
+        assert_eq!(
+            snapshot["headlines"][0]["publisher_login"],
+            serde_json::json!("mosure")
+        );
+        assert_eq!(
+            snapshot["headlines"][0]["headline"],
+            serde_json::json!("codex finished release pass")
+        );
     }
 
     #[test]

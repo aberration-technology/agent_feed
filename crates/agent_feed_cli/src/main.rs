@@ -1,8 +1,8 @@
 use agent_feed_adapters::claude::{ClaudeState, normalize_stream_value};
 use agent_feed_adapters::codex::{TranscriptState, normalize_transcript_value};
 use agent_feed_auth_github::{
-    GithubAuthError, GithubCliAuthConfig, GithubSessionStore, begin_cli_login, complete_cli_login,
-    parse_cli_callback_request,
+    GithubAuthError, GithubAuthSession, GithubCliAuthConfig, GithubSessionStore, begin_cli_login,
+    complete_cli_login, parse_cli_callback_request,
 };
 use agent_feed_core::AgentEvent;
 use agent_feed_directory::{RemoteUserRoute, validate_logical_feed_label};
@@ -11,7 +11,7 @@ use agent_feed_edge::{
 };
 use agent_feed_ingest::source_from_str;
 use agent_feed_install::{doctor_report, init_plan};
-use agent_feed_p2p_proto::{FeedVisibility, Signed, StoryCapsule};
+use agent_feed_p2p_proto::{FeedVisibility, PublisherIdentity, Signed, StoryCapsule};
 use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve};
 use agent_feed_story::{CompiledStory, compile_events};
@@ -27,7 +27,7 @@ use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -301,6 +301,10 @@ enum P2pCommand {
     Publish {
         #[arg(long)]
         dry_run: bool,
+        #[arg(long, default_value = "https://api.feed.aberration.technology")]
+        edge: String,
+        #[arg(long)]
+        auth_store: Option<PathBuf>,
         #[arg(
             long,
             visible_aliases = ["feed-name", "feed-label"],
@@ -960,6 +964,8 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             }
             P2pCommand::Publish {
                 dry_run,
+                edge,
+                auth_store,
                 feed,
                 sessions,
                 agents,
@@ -982,17 +988,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 image_prompt_max_chars,
                 allow_remote_image_urls,
             } => {
-                if !dry_run {
-                    warn!(feed_name = %feed, "p2p publish rejected because dry-run is required");
-                    return Err(CliError::Http(
-                        "p2p publish requires --dry-run until a native runtime is configured"
-                            .to_string(),
-                    ));
-                }
                 let selected_agents = parse_agent_list(&agents);
                 let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
                 info!(
                     feed_name = %feed,
+                    %edge,
                     agents = %agents,
                     selected_agents = ?selected_agents,
                     sessions,
@@ -1000,7 +1000,8 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     summarizer = %summarizer,
                     per_story,
                     images,
-                    "p2p publish dry-run capture starting"
+                    dry_run,
+                    "p2p publish capture starting"
                 );
                 let mut captured_paths = Vec::new();
                 let mut stories = Vec::new();
@@ -1043,7 +1044,21 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     image_prompt_max_chars,
                     allow_remote_image_urls,
                 })?;
-                let capsules = signed_capsules(&feed, &stories, &summary_config)?;
+                let session = if dry_run {
+                    None
+                } else {
+                    Some(load_publish_session(auth_store, &edge)?)
+                };
+                let publisher = session.as_ref().map(|session| {
+                    PublisherIdentity::github(
+                        session.github_user_id,
+                        session.login.clone(),
+                        session.name.clone(),
+                        session.avatar_url.clone(),
+                    )
+                });
+                let capsules =
+                    signed_capsules(&feed, &stories, &summary_config, publisher.as_ref())?;
                 info!(
                     feed_name = %feed,
                     capsules = capsules.len(),
@@ -1051,26 +1066,50 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     local_agent_sessions = captured_paths.len(),
                     processor = ?summary_config.processor,
                     image_enabled = summary_config.image.enabled,
-                    "p2p publish dry-run summarized"
+                    dry_run,
+                    "p2p publish summarized"
                 );
-                println!(
-                    "p2p publish dry-run: feed_name={} capsules={} stories={} local_agent_sessions={}",
-                    feed,
-                    capsules.len(),
-                    stories.len(),
-                    captured_paths.len()
-                );
-                println!("logical feed bundle: all selected agent sessions publish under {feed}");
-                for capsule in capsules.iter().take(8) {
-                    debug!(
-                        feed_id = %capsule.value.feed_id,
-                        capsule_id = %capsule.value.capsule_id,
-                        seq = capsule.value.seq,
-                        score = capsule.value.score,
-                        story_kind = ?capsule.value.story_kind,
-                        "p2p capsule outgoing dry-run"
+                if dry_run {
+                    println!(
+                        "p2p publish dry-run: feed_name={} capsules={} stories={} local_agent_sessions={}",
+                        feed,
+                        capsules.len(),
+                        stories.len(),
+                        captured_paths.len()
                     );
-                    println!("{}", serde_json::to_string(capsule)?);
+                    println!(
+                        "logical feed bundle: all selected agent sessions publish under {feed}"
+                    );
+                    for capsule in capsules.iter().take(8) {
+                        debug!(
+                            feed_id = %capsule.value.feed_id,
+                            capsule_id = %capsule.value.capsule_id,
+                            seq = capsule.value.seq,
+                            score = capsule.value.score,
+                            story_kind = ?capsule.value.story_kind,
+                            "p2p capsule outgoing dry-run"
+                        );
+                        println!("{}", serde_json::to_string(capsule)?);
+                    }
+                } else if let Some(session) = session {
+                    let body = serde_json::to_string(&json!({
+                        "feed_name": feed,
+                        "capsules": capsules,
+                    }))?;
+                    let response =
+                        post_edge_json_with_bearer(&edge, "/network/publish", &body, &session)?;
+                    info!(
+                        feed_name = %feed,
+                        response = %response.trim(),
+                        "p2p publish sent to edge"
+                    );
+                    println!(
+                        "p2p publish sent: feed_name={} capsules={} stories={} local_agent_sessions={}",
+                        feed,
+                        capsules.len(),
+                        stories.len(),
+                        captured_paths.len()
+                    );
                 }
             }
         },
@@ -2143,6 +2182,7 @@ fn signed_capsules(
     feed: &str,
     stories: &[CompiledStory],
     summary_config: &SummaryConfig,
+    publisher: Option<&PublisherIdentity>,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
     let feed_id = format!("local:{feed}");
     let summaries = summarize_feed(&feed_id, stories, summary_config)?;
@@ -2156,12 +2196,15 @@ fn signed_capsules(
         .iter()
         .enumerate()
         .map(|(index, summary)| {
-            let capsule = StoryCapsule::from_summary(
+            let mut capsule = StoryCapsule::from_summary(
                 feed_id.clone(),
                 (index + 1) as u64,
                 "local:codex",
                 summary,
             )?;
+            if let Some(publisher) = publisher {
+                capsule = capsule.with_publisher(publisher.clone())?;
+            }
             Signed::sign_capsule(capsule, "local-codex").map_err(CliError::from)
         })
         .collect()
@@ -2782,6 +2825,84 @@ fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {
     }
 
     Err(CliError::Http(response))
+}
+
+fn load_publish_session(
+    auth_store: Option<PathBuf>,
+    edge: &str,
+) -> Result<GithubAuthSession, CliError> {
+    let store = GithubSessionStore::new(auth_store_path(auth_store));
+    let Some(session) = store.load()? else {
+        return Err(CliError::Http(
+            "github auth required before live p2p publish; run `agent-feed auth github`"
+                .to_string(),
+        ));
+    };
+    if session.is_expired_at(time::OffsetDateTime::now_utc()) {
+        return Err(CliError::Http(
+            "github auth session expired; run `agent-feed auth github`".to_string(),
+        ));
+    }
+    if session.session_token.as_deref().unwrap_or("").is_empty() {
+        return Err(CliError::Http(
+            "github auth session does not include a publish token; run `agent-feed auth github`"
+                .to_string(),
+        ));
+    }
+    let expected = edge.trim_end_matches('/');
+    let actual = session.edge_base_url.trim_end_matches('/');
+    if expected != actual {
+        return Err(CliError::Http(format!(
+            "github auth session is for {actual}; re-run auth with --edge {expected}"
+        )));
+    }
+    Ok(session)
+}
+
+fn post_edge_json_with_bearer(
+    edge: &str,
+    path: &str,
+    body: &str,
+    session: &GithubAuthSession,
+) -> Result<String, CliError> {
+    let token = session
+        .session_token
+        .as_deref()
+        .ok_or_else(|| CliError::Http("github session token missing".to_string()))?;
+    let url = format!("{}{}", edge.trim_end_matches('/'), path);
+    let mut child = ProcessCommand::new("curl")
+        .args([
+            "-fsS",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            &format!("Authorization: Bearer {token}"),
+            "--data-binary",
+            "@-",
+            &url,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| CliError::Http(format!("failed to start curl: {err}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(body.as_bytes())?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| CliError::Http(format!("curl failed: {err}")))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    Err(CliError::Http(format!(
+        "edge publish failed with {}: {}{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
 
 fn auth_store_path(path: Option<PathBuf>) -> PathBuf {

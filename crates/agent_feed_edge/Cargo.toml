@@ -10,6 +10,7 @@ rust-version.workspace = true
 
 [dependencies]
 agent_feed_auth = { workspace = true }
+agent_feed_core = { workspace = true }
 agent_feed_directory = { workspace = true }
 agent_feed_identity = { workspace = true }
 agent_feed_identity_github = { workspace = true }
@@ -18,11 +19,14 @@ agent_feed_p2p_proto = { workspace = true }
 agent_feed_security = { workspace = true }
 agent_feed_social = { workspace = true }
 axum = { workspace = true }
+hmac = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["serde", "formatting"] }
 tokio = { workspace = true, features = ["net"] }
+tower-http = { workspace = true, features = ["cors"] }
 tracing = { workspace = true }
 
 [lints]
