@@ -67,6 +67,11 @@ mod tests {
     fn chrome_uses_lowercase_accented_site_links() {
         let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
 
+        assert!(html.contains("--sans: ui-monospace, monospace;"));
+        assert!(html.contains("--mono: ui-monospace, monospace;"));
+        assert!(html.contains("font-family: ui-monospace, monospace;"));
+        assert!(!html.contains("ui-sans-serif"));
+        assert!(!html.contains("SFMono-Regular"));
         assert!(html.contains("--secondary: #d87c7c;"));
         assert!(html.contains(".brand {\n  color: var(--secondary);\n}"));
         assert!(html.contains(".footer-links a {\n  color: var(--secondary);"));

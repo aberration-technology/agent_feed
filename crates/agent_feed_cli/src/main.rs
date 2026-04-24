@@ -1575,6 +1575,28 @@ mod tests {
     }
 
     #[test]
+    fn auth_callback_page_uses_aberration_font_stack() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = TcpStream::connect(addr).expect("client connects");
+        let (mut server, _) = listener.accept().expect("server accepts");
+
+        write_auth_callback_response(&mut server, true, "github sign-in complete")
+            .expect("callback response writes");
+        drop(server);
+
+        let mut response = String::new();
+        client
+            .take(8192)
+            .read_to_string(&mut response)
+            .expect("response reads");
+
+        assert!(response.contains("font-family: ui-monospace, monospace;"));
+        assert!(!response.contains("ui-sans-serif"));
+        assert!(!response.contains("system-ui"));
+    }
+
+    #[test]
     fn workspace_filter_accepts_child_cwd_and_rejects_missing_cwd() {
         let root = PathBuf::from("/tmp/agent-feed-workspace");
         let filter = WorkspaceFilter::from_cli(Some(root.clone()))
@@ -2830,7 +2852,7 @@ fn write_auth_callback_response(
         "agent_feed sign-in failed"
     };
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><main style=\"font-family: ui-sans-serif, system-ui; padding: 3rem;\"><h1>{}</h1><p>{}</p><p>you can return to the terminal.</p></main></body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body><main style=\"font-family: ui-monospace, monospace; padding: 3rem;\"><h1>{}</h1><p>{}</p><p>you can return to the terminal.</p></main></body></html>",
         html_escape(title),
         html_escape(title),
         html_escape(message)
