@@ -41,14 +41,26 @@ mod tests {
     fn idle_state_avoids_redundant_local_status_chips() {
         let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
 
-        assert!(html.contains("id=\"eyebrow\">LOCAL FEED</div>"));
+        assert!(html.contains("<div class=\"brand\">feed</div>"));
+        assert!(html.contains("id=\"eyebrow\">local feed</div>"));
         assert!(html.contains("<span>privacy on</span>"));
         assert!(!html.contains("LOCAL / QUIET / IDLE"));
         assert!(!html.contains(
             "<span>local</span>\n          <span>redacted</span>\n          <span>idle</span>"
         ));
-        assert!(html.contains("setText(eyebrow, \"P2P DISABLED\");"));
+        assert!(html.contains("setText(eyebrow, \"p2p disabled\");"));
         assert!(html.contains("renderChips([\"p2p off\", \"privacy on\"]);"));
+    }
+
+    #[test]
+    fn chrome_uses_lowercase_accented_site_links() {
+        let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
+
+        assert!(html.contains("--secondary: #d87c7c;"));
+        assert!(html.contains(".brand {\n  color: var(--secondary);\n}"));
+        assert!(html.contains(".footer-links a {\n  color: var(--secondary);"));
+        assert!(html.contains("text-decoration: underline;"));
+        assert!(!html.contains("text-transform: uppercase;"));
     }
 
     #[test]

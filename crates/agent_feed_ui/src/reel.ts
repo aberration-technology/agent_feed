@@ -277,10 +277,10 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   });
   showStage();
   document.body.dataset.mode = state === "failed" ? "breaking" : "dispatch";
-  setText(liveState, state === "live" ? "LIVE" : "WAIT");
+  setText(liveState, state === "live" ? "live" : "wait");
   setText(
     eyebrow,
-    `@${route.login} / ${route.selection.toUpperCase()} / ${route.feedMode.toUpperCase()}`,
+    `@${route.login} / ${route.selection} / ${route.feedMode}`,
   );
   setText(headline, `@${route.login}`);
   setText(deck, lines.join(" · "));
@@ -306,8 +306,8 @@ function renderP2pDisabled(route) {
   showStage();
   hideModeSwitcher();
   document.body.dataset.mode = "dispatch";
-  setText(liveState, "LOCAL");
-  setText(eyebrow, "P2P DISABLED");
+  setText(liveState, "local");
+  setText(eyebrow, "p2p disabled");
   setText(headline, "local feed only");
   setText(
     deck,
@@ -407,7 +407,7 @@ async function hydrate() {
     applySnapshot(await response.json());
     logInfo("feed.snapshot.applied", { bulletins: bulletins.length });
   } catch (error) {
-    setText(liveState, "WAIT");
+    setText(liveState, "wait");
     stopStageProgress();
     logError("snapshot hydration failed", error);
   }
@@ -705,8 +705,8 @@ function randomState() {
 }
 
 function handleGithubAuthCallback(callback) {
-  setText(liveState, "AUTH");
-  setText(eyebrow, "GITHUB / SIGN-IN / CALLBACK");
+  setText(liveState, "auth");
+  setText(eyebrow, "github / sign-in / callback");
   setText(headline, "github sign-in");
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
@@ -764,8 +764,8 @@ function startNetworkView() {
     edge_base_url: edgeBaseUrl(),
   });
   document.body.dataset.mode = "dispatch";
-  setText(liveState, session ? "AUTH" : "WAIT");
-  setText(eyebrow, "FEED / NETWORK / GITHUB");
+  setText(liveState, session ? "auth" : "wait");
+  setText(eyebrow, "feed / network / github");
   if (session) {
     setText(headline, `@${session.login}`);
     setText(deck, "github session is available for browser feed discovery and private stream grants.");
@@ -893,8 +893,8 @@ function startSubscribedRoute(route) {
   const targets = route.subscriptionTargets.length ? route.subscriptionTargets : [route.selection];
   showStage();
   document.body.dataset.mode = "dispatch";
-  setText(liveState, "WAIT");
-  setText(eyebrow, `FEED / ${route.network.toUpperCase()} / SUBSCRIBED`);
+  setText(liveState, "wait");
+  setText(eyebrow, `feed / ${route.network} / subscribed`);
   setText(headline, "subscribed feed");
   setText(
     deck,
@@ -952,7 +952,7 @@ function renderTimeline(route, ticket) {
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
-  setText(liveState, "BROWSE");
+  setText(liveState, "browse");
   updateSourceCountFromFeeds(ticket.feeds || ticket.candidate_feeds || []);
   timeline.replaceChildren();
 
@@ -1026,8 +1026,8 @@ function renderSubscribedTimeline(route, targets) {
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
-  setText(liveState, "FOLLOW");
-  setText(sourceCount, `${targets.length} SUB`);
+  setText(liveState, "follow");
+  setText(sourceCount, `${targets.length} sub`);
   timeline.replaceChildren();
 
   const toolbar = document.createElement("div");
@@ -1152,18 +1152,18 @@ function publisherText(feed, ticket) {
 }
 
 function updateSourceCountFromFeeds(feeds) {
-  setText(sourceCount, `${feeds.length} FEEDS`);
+  setText(sourceCount, `${feeds.length} feeds`);
 }
 
 function connectSse() {
   logInfo("feed.sse.connecting", { url: "/events.sse" });
   const source = new EventSource("/events.sse");
   source.addEventListener("open", () => {
-    setText(liveState, "LIVE");
+    setText(liveState, "live");
     logInfo("feed.sse.open", { ready_state: source.readyState });
   });
   source.addEventListener("error", (event) => {
-    setText(liveState, "RETRY");
+    setText(liveState, "retry");
     logError("sse connection error", event);
   });
   source.addEventListener("bulletin", (event) => {
@@ -1209,7 +1209,7 @@ function updateSourceCount() {
       sources.add(label);
     }
   }
-  setText(sourceCount, `${sources.size} SRC`);
+  setText(sourceCount, `${sources.size} src`);
 }
 
 updateClock();
