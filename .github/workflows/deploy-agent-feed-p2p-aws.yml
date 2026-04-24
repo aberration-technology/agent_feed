@@ -65,12 +65,16 @@ jobs:
           VAR_ALARM_SNS_TOPIC_ARN: ${{ vars.AGENT_FEED_P2P_ALARM_SNS_TOPIC_ARN }}
           VAR_SECRET_PARAMETER_PREFIX: ${{ vars.AGENT_FEED_P2P_SECRET_PARAMETER_PREFIX }}
           VAR_ALLOW_ROUTE53_ZONE_APEX_RECORDS: ${{ vars.AGENT_FEED_P2P_ALLOW_ROUTE53_ZONE_APEX_RECORDS }}
+          VAR_TERRAFORM_STATE_BUCKET: ${{ vars.AGENT_FEED_P2P_TERRAFORM_STATE_BUCKET }}
+          VAR_TERRAFORM_STATE_KEY: ${{ vars.AGENT_FEED_P2P_TERRAFORM_STATE_KEY }}
         run: |
           set -euo pipefail
           secret_parameter_prefix="${VAR_SECRET_PARAMETER_PREFIX:-/agent-feed-p2p/mainnet/edge}"
           allow_apex="${VAR_ALLOW_ROUTE53_ZONE_APEX_RECORDS:-false}"
           aws_region="${VAR_AWS_REGION:-us-east-2}"
           aws_role_arn="${VAR_AWS_ROLE_ARN:-}"
+          stack_name="${VAR_STACK_NAME:-agent-feed-p2p-production}"
+          aws_account_id="$(cut -d: -f5 <<<"$aws_role_arn")"
           environment_name="$DEPLOY_ENVIRONMENT"
           environment_name="${environment_name#agent-real-p2p-}"
           environment_name="${environment_name#agent-feed-p2p-}"
@@ -81,10 +85,12 @@ jobs:
           {
             echo "AWS_REGION=$aws_region"
             echo "AWS_ROLE_ARN=$aws_role_arn"
-            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$aws_role_arn")"
+            echo "AWS_ACCOUNT_ID=$aws_account_id"
+            echo "TF_STATE_BUCKET=${VAR_TERRAFORM_STATE_BUCKET:-agent-feed-p2p-tfstate-${aws_account_id}-${aws_region}}"
+            echo "TF_STATE_KEY=${VAR_TERRAFORM_STATE_KEY:-${stack_name}/${TF_WORKSPACE_NAME}/terraform.tfstate}"
             echo "TF_VAR_aws_region=$aws_region"
             echo "TF_VAR_environment_name=$environment_name"
-            echo "TF_VAR_stack_name=${VAR_STACK_NAME:-agent-feed-p2p-production}"
+            echo "TF_VAR_stack_name=$stack_name"
             echo "TF_VAR_edge_domain_name=${VAR_EDGE_DOMAIN_NAME:-edge.feed.aberration.technology}"
             echo "TF_VAR_browser_app_base_url=${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}"
             echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
@@ -154,6 +160,30 @@ jobs:
             --value "$client_secret" \
             --overwrite
 
+      - name: bootstrap terraform state bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$TF_STATE_BUCKET" --region "$AWS_REGION"
+            else
+              aws s3api create-bucket \
+                --bucket "$TF_STATE_BUCKET" \
+                --region "$AWS_REGION" \
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            fi
+          fi
+          aws s3api put-public-access-block \
+            --bucket "$TF_STATE_BUCKET" \
+            --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          aws s3api put-bucket-encryption \
+            --bucket "$TF_STATE_BUCKET" \
+            --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          aws s3api put-bucket-versioning \
+            --bucket "$TF_STATE_BUCKET" \
+            --versioning-configuration Status=Enabled
+
       - name: setup terraform
         uses: hashicorp/setup-terraform@v3
 
@@ -163,7 +193,12 @@ jobs:
 
       - name: terraform init
         working-directory: ${{ env.TF_ROOT }}
-        run: terraform init
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=$TF_STATE_BUCKET" \
+            -backend-config="key=$TF_STATE_KEY" \
+            -backend-config="region=$AWS_REGION" \
+            -backend-config="encrypt=true"
 
       - name: terraform workspace
         working-directory: ${{ env.TF_ROOT }}
@@ -172,6 +207,84 @@ jobs:
       - name: terraform validate
         working-directory: ${{ env.TF_ROOT }}
         run: terraform validate
+
+      - name: import existing production stack
+        if: ${{ github.event.inputs.apply == 'true' }}
+        working-directory: ${{ env.TF_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(terraform state list)" ]; then
+            echo "terraform state already has resources; import skipped"
+            exit 0
+          fi
+
+          try_import() {
+            local address="$1"
+            local id="$2"
+            if [ -z "$id" ] || [ "$id" = "None" ] || [ "$id" = "null" ]; then
+              echo "skip import ${address}: empty id"
+              return 0
+            fi
+            terraform import -input=false "$address" "$id" || true
+          }
+
+          stack="$TF_VAR_stack_name"
+          role_name="${stack}-edge"
+          policy_arn="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+          edge_name="${stack}-edge"
+
+          instances_json="$(
+            aws ec2 describe-instances \
+              --filters "Name=tag:Name,Values=${edge_name}" "Name=instance-state-name,Values=pending,running,stopping,stopped"
+          )"
+          instance_id="$(printf '%s' "$instances_json" | jq -r '[.Reservations[].Instances[]] | sort_by(.LaunchTime) | .[0].InstanceId // empty')"
+          vpc_id="$(printf '%s' "$instances_json" | jq -r '[.Reservations[].Instances[]] | sort_by(.LaunchTime) | .[0].VpcId // empty')"
+          subnet_id="$(printf '%s' "$instances_json" | jq -r '[.Reservations[].Instances[]] | sort_by(.LaunchTime) | .[0].SubnetId // empty')"
+          security_group_id="$(printf '%s' "$instances_json" | jq -r '[.Reservations[].Instances[]] | sort_by(.LaunchTime) | .[0].SecurityGroups[0].GroupId // empty')"
+
+          try_import terraform_data.apex_guardrail "$stack"
+          try_import aws_instance.edge "$instance_id"
+          try_import aws_vpc.edge "$vpc_id"
+          try_import aws_subnet.edge "$subnet_id"
+          try_import aws_security_group.edge "$security_group_id"
+
+          if [ -n "$vpc_id" ]; then
+            igw_id="$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=${vpc_id}" | jq -r '.InternetGateways[0].InternetGatewayId // empty')"
+            try_import aws_internet_gateway.edge "$igw_id"
+          fi
+          if [ -n "$subnet_id" ]; then
+            route_tables_json="$(aws ec2 describe-route-tables --filters "Name=association.subnet-id,Values=${subnet_id}")"
+            route_table_id="$(printf '%s' "$route_tables_json" | jq -r '.RouteTables[0].RouteTableId // empty')"
+            route_table_association_id="$(printf '%s' "$route_tables_json" | jq -r --arg subnet "$subnet_id" '.RouteTables[0].Associations[]? | select(.SubnetId == $subnet) | .RouteTableAssociationId' | head -n1)"
+            try_import aws_route_table.edge "$route_table_id"
+            try_import aws_route_table_association.edge "$route_table_association_id"
+          fi
+          if [ -n "$instance_id" ]; then
+            addresses_json="$(aws ec2 describe-addresses --filters "Name=instance-id,Values=${instance_id}")"
+            eip_allocation_id="$(printf '%s' "$addresses_json" | jq -r '.Addresses[0].AllocationId // empty')"
+            eip_association_id="$(printf '%s' "$addresses_json" | jq -r '.Addresses[0].AssociationId // empty')"
+            try_import aws_eip.edge "$eip_allocation_id"
+            try_import aws_eip_association.edge "$eip_association_id"
+          fi
+
+          try_import aws_iam_role.edge "$role_name"
+          try_import aws_iam_role_policy_attachment.ssm_managed_instance "${role_name}/${policy_arn}"
+          try_import aws_iam_role_policy.edge_ssm "${role_name}:${stack}-edge-ssm"
+          try_import aws_iam_instance_profile.edge "$role_name"
+
+          zone_name="${TF_VAR_route53_zone_name%.}."
+          zone_id="$(aws route53 list-hosted-zones-by-name --dns-name "$zone_name" | jq -r --arg name "$zone_name" '.HostedZones[] | select(.Name == $name and .Config.PrivateZone == false) | .Id' | head -n1 | sed 's#/hostedzone/##')"
+          if [ -n "$zone_id" ]; then
+            browser_host="${TF_VAR_browser_app_base_url#https://}"
+            browser_host="${browser_host#http://}"
+            browser_host="${browser_host%%/*}"
+            try_import aws_route53_record.edge "${zone_id}_${TF_VAR_edge_domain_name}_A"
+            try_import aws_route53_record.browser "${zone_id}_${browser_host}_CNAME"
+          fi
+
+          alarm_name="$(aws cloudwatch describe-alarms --alarm-names "${stack}-edge-status-check" | jq -r '.MetricAlarms[0].AlarmName // empty')"
+          try_import 'aws_cloudwatch_metric_alarm.edge_status[0]' "$alarm_name"
 
       - name: terraform plan
         working-directory: ${{ env.TF_ROOT }}
