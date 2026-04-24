@@ -31,8 +31,9 @@ pub use agent_feed_security::{SecurityConfig, validate_bind};
 pub use agent_feed_store::InMemoryStore;
 pub use agent_feed_story::{CompiledStory, StoryCompiler, StoryCompilerConfig, compile_events};
 pub use agent_feed_summarize::{
-    FeedSummary, FeedSummaryMode, ImageConfig, ImageDecisionMode, ImageProcessor,
-    ImageProcessorConfig, SummaryBudget, SummaryConfig, SummaryGuardrails, SummaryProcessor,
-    SummaryProcessorConfig, summarize_feed, summarize_feed_with_processor,
+    DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
+    ImageConfig, ImageDecisionMode, ImageProcessor, ImageProcessorConfig, SummaryBudget,
+    SummaryConfig, SummaryGuardrails, SummaryProcessor, SummaryProcessorConfig,
+    SummaryPromptConfig, summarize_feed, summarize_feed_with_processor,
     summarize_feed_with_processors,
 };

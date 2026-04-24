@@ -150,9 +150,11 @@ agent-feed p2p share --feed-name release --visibility github_org --github-org ab
 agent-feed p2p share --feed-name release --visibility github_team --github-org aberration-technology --github-team release
 agent-feed p2p publish --dry-run --agents codex,claude --sessions 2
 agent-feed p2p publish --dry-run --feed-name gpu-vm --sessions 2 --per-story
-agent-feed p2p publish --dry-run --summarizer codex-exec
+agent-feed p2p publish --dry-run --summary-style "austere technical broadcast; release-room concise"
 agent-feed p2p publish --dry-run --summarizer claude-code
+agent-feed p2p publish --dry-run --summarizer deterministic
 agent-feed p2p publish --dry-run --images --image-processor codex-exec
+agent-feed p2p publish --dry-run --images --image-style "black field; off-white type; thin rules"
 agent-feed p2p publish --dry-run --images --image-processor process --image-command ./summarize-image
 agent-feed p2p publish --dry-run --images --image-processor http-endpoint --image-endpoint http://127.0.0.1:8787/summarize-image
 agent-feed hook --source claude --event PreToolUse
@@ -215,7 +217,7 @@ event -> story window -> settled story -> bulletin
 
 low-context token streams, shell polling, session starts, and file reads are stored but
 not shown. a story settles on changed files, failed tools, failed turns, permission
-events, test signals, plan updates, or a final flush. summaries are deterministic and
+events, test signals, plan updates, or a final flush. summaries are display-safe and
 do not copy raw prompts, command output, or diffs.
 
 ## p2p
@@ -261,9 +263,11 @@ subscribing to `aberration-technology/*` means all visible settled story feeds
 for that org; it does not subscribe a fabric peer automatically.
 
 summarization is publisher-side. subscribers receive already-summarized capsules and do
-not spend tokens or run external processors. the default p2p publisher uses a deterministic
-feed rollup, so a noisy window becomes one small recap capsule. `--per-story` keeps one
-capsule per settled story when an operator wants more detail.
+not spend tokens or run external processors. the cli publisher defaults to the codex-backed
+aesthetic headline path with a strict redacted prompt style, so a noisy window becomes one
+small contextual capsule. use `--summarizer deterministic` for offline or zero-token
+publishing. `--per-story` keeps one capsule per settled story when an operator wants more
+detail.
 
 publish decisions also happen before signing. the local publisher keeps a short
 memory of recent summaries and suppresses duplicates when the headline and deck
@@ -271,12 +275,12 @@ have not meaningfully changed. codex, claude, process, or HTTP summarizers may
 also return `publish=false` with a reason; severe stories still bypass duplicate
 suppression so failures and permission events do not disappear.
 
-external summarizers are opt-in and still pass through the same guardrails before signing:
+summary processors still pass through the same guardrails before signing:
 
 ```text
-deterministic
 codex-exec
 claude-code
+deterministic
 process
 http-endpoint
 ```
@@ -474,7 +478,9 @@ per_feed_max_capsules_per_min = 4
 
 [summarize]
 mode = "feed_rollup"          # feed_rollup | per_story
-processor = "deterministic"   # deterministic | codex-exec | claude-code | process | http-endpoint
+processor = "codex-exec"      # codex-exec | claude-code | deterministic | process | http-endpoint
+style = "austere technical broadcast; terse contextual headline; strong verb/object/outcome"
+max_prompt_chars = 3000
 max_capsule_chars = 720
 max_feed_rollup_stories = 32
 
@@ -490,6 +496,8 @@ severe_score_bypass = 90
 enabled = false
 processor = "disabled"        # disabled | codex-exec | claude-code | process | http-endpoint
 decision = "best_judgement"   # best_judgement | always_ask | never
+style = "black field; off-white type; thin rules; no readable code"
+max_prompt_chars = 1800
 allow_remote_urls = false
 allowed_uri_prefixes = ["/assets/headlines/", "/media/headlines/"]
 
@@ -538,7 +546,9 @@ enabled = false
 feed_name = "workstation"
 summary_only = true
 raw_events = false
-summarizer = "deterministic"
+summarizer = "codex-exec"
+summary_style = "austere technical broadcast; terse contextual headline; strong verb/object/outcome"
+summary_prompt_max_chars = 3000
 images = false
 
 [p2p.publish.github]

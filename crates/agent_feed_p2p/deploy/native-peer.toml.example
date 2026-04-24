@@ -19,6 +19,9 @@ story_only = true
 settled_only = true
 raw_events = false
 min_score = 75
+summarizer = "codex-exec"
+summary_style = "austere technical broadcast; terse contextual headline; strong verb/object/outcome"
+summary_prompt_max_chars = 3000
 
 [p2p.publish.github]
 required_org = ""

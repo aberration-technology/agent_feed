@@ -177,7 +177,13 @@ const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
     r"(?i)\bredacted story facts\b[\s.,;:]*",
     r"(?i)\breturn one json object\b[^.]*[.\s]*",
     r"(?i)\bdo not include\b[^.]*[.\s]*",
+    r"(?i)\b(?:style guide|summary style|write with this style)\b[^.]*[.\s]*",
+    r"(?i)\baustere technical broadcast\b[^.]*[.\s]*",
+    r"(?i)\bno policy or omission text\b[\s.,;:]*",
 ];
+
+pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; terse contextual headline; strong verb/object/outcome; no dashboard copy; no policy or omission text; no raw logs";
+pub const DEFAULT_SUMMARY_PROMPT_MAX_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -265,6 +271,21 @@ impl Default for ImageConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryPromptConfig {
+    pub style: String,
+    pub max_prompt_chars: usize,
+}
+
+impl Default for SummaryPromptConfig {
+    fn default() -> Self {
+        Self {
+            style: DEFAULT_SUMMARY_PROMPT_STYLE.to_string(),
+            max_prompt_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+        }
+    }
+}
+
 impl SummaryProcessorConfig {
     #[must_use]
     pub fn name(&self) -> &'static str {
@@ -302,6 +323,8 @@ impl SummaryProcessorConfig {
 pub struct SummaryConfig {
     pub mode: FeedSummaryMode,
     pub processor: SummaryProcessorConfig,
+    #[serde(default)]
+    pub prompt: SummaryPromptConfig,
     pub image: ImageConfig,
     pub publish: PublishDecisionConfig,
     pub budget: SummaryBudget,
@@ -320,6 +343,7 @@ impl SummaryConfig {
         Self {
             mode: FeedSummaryMode::FeedRollup,
             processor: SummaryProcessorConfig::Deterministic,
+            prompt: SummaryPromptConfig::default(),
             image: ImageConfig::default(),
             publish: PublishDecisionConfig::default(),
             budget: SummaryBudget::default(),
@@ -385,6 +409,10 @@ pub struct SummaryRequest {
     pub stories: Vec<CompiledStory>,
     #[serde(default)]
     pub recent_summaries: Vec<RecentSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_prompt_chars: Option<usize>,
     pub branch: Option<String>,
     pub session_hint: Option<String>,
 }
@@ -401,6 +429,8 @@ impl SummaryRequest {
             mode,
             stories,
             recent_summaries: Vec::new(),
+            prompt_style: None,
+            max_prompt_chars: None,
             branch: None,
             session_hint: None,
         }
@@ -920,6 +950,8 @@ fn request_for_external_processor(
     config: &SummaryConfig,
 ) -> Result<SummaryRequest, SummaryError> {
     let mut redacted = request.clone();
+    redacted.prompt_style = Some(clamp_chars(&config.prompt.style, 512));
+    redacted.max_prompt_chars = Some(config.prompt.max_prompt_chars.max(512));
     redacted.branch = request.branch.as_ref().map(|_| "[redacted]".to_string());
     redacted.session_hint = request
         .session_hint
@@ -1603,6 +1635,16 @@ fn is_similarity_stopword(word: &str) -> bool {
 }
 
 fn processor_prompt(request: &SummaryRequest) -> String {
+    let style = request
+        .prompt_style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+        .unwrap_or(DEFAULT_SUMMARY_PROMPT_STYLE);
+    let max_prompt_chars = request
+        .max_prompt_chars
+        .unwrap_or(DEFAULT_SUMMARY_PROMPT_MAX_CHARS)
+        .max(512);
     let stories = request
         .stories
         .iter()
@@ -1630,10 +1672,11 @@ fn processor_prompt(request: &SummaryRequest) -> String {
     } else {
         format!("recent_published:\n{recent}")
     };
-    format!(
-        "Return one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, or personal data.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
+    let prompt = format!(
+        "Return one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries. Write with this style: {style}. Favor a projection-safe headline with clear actor, action, object, and outcome. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
         request.feed_id, request.mode, recent, stories
-    )
+    );
+    clamp_chars(&prompt, max_prompt_chars)
 }
 
 fn image_processor_prompt(request: &ImageRequest) -> String {
@@ -1964,6 +2007,30 @@ mod tests {
         assert!(matches!(claude, SummaryProcessorConfig::Process { .. }));
     }
 
+    #[test]
+    fn external_processor_request_carries_summary_prompt_policy() {
+        let mut config = SummaryConfig::p2p_default();
+        config.prompt.style = "late-night signal room; cinematic but terse".to_string();
+        config.prompt.max_prompt_chars = 900;
+        let request = SummaryRequest::new(
+            "local:workstation",
+            FeedSummaryMode::FeedRollup,
+            vec![story("codex changed secret_repo", 78)],
+        );
+
+        let redacted = request_for_external_processor(&request, &config).expect("request redacts");
+        assert_eq!(
+            redacted.prompt_style.as_deref(),
+            Some("late-night signal room; cinematic but terse")
+        );
+        assert_eq!(redacted.max_prompt_chars, Some(900));
+
+        let prompt = processor_prompt(&redacted);
+        assert!(prompt.contains("late-night signal room"));
+        assert!(prompt.len() <= 900);
+        assert!(!prompt.contains("secret_repo"));
+    }
+
     struct EndpointLikeProcessor;
 
     impl SummaryProcessor for EndpointLikeProcessor {
@@ -2091,6 +2158,8 @@ mod tests {
                 story_family: StoryFamily::FileChange,
                 score: 78,
             }],
+            prompt_style: None,
+            max_prompt_chars: None,
             branch: None,
             session_hint: None,
         };

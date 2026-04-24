@@ -16,8 +16,9 @@ use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve};
 use agent_feed_story::{CompiledStory, compile_events};
 use agent_feed_summarize::{
-    FeedSummaryMode, GuardrailPattern, ImageDecisionMode, ImageProcessorConfig, SummaryConfig,
-    SummaryError, SummaryProcessorConfig, summarize_feed,
+    DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummaryMode,
+    GuardrailPattern, ImageDecisionMode, ImageProcessorConfig, SummaryConfig, SummaryError,
+    SummaryProcessorConfig, summarize_feed,
 };
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -256,8 +257,16 @@ enum P2pCommand {
         sessions_dir: Option<PathBuf>,
         #[arg(long)]
         claude_projects_dir: Option<PathBuf>,
-        #[arg(long, default_value = "deterministic")]
+        #[arg(long, default_value = "codex-exec")]
         summarizer: String,
+        #[arg(
+            long,
+            visible_alias = "headline-style",
+            default_value = DEFAULT_SUMMARY_PROMPT_STYLE
+        )]
+        summary_style: String,
+        #[arg(long, default_value_t = DEFAULT_SUMMARY_PROMPT_MAX_CHARS)]
+        summary_prompt_max_chars: usize,
         #[arg(long)]
         per_story: bool,
         #[arg(long)]
@@ -274,6 +283,10 @@ enum P2pCommand {
         image_command: Option<String>,
         #[arg(long = "image-arg")]
         image_args: Vec<String>,
+        #[arg(long)]
+        image_style: Option<String>,
+        #[arg(long)]
+        image_prompt_max_chars: Option<usize>,
         #[arg(long)]
         allow_remote_image_urls: bool,
     },
@@ -695,6 +708,8 @@ async fn main() -> Result<(), CliError> {
                 sessions_dir,
                 claude_projects_dir,
                 summarizer,
+                summary_style,
+                summary_prompt_max_chars,
                 per_story,
                 allow_project_names,
                 guardrail_pattern,
@@ -703,6 +718,8 @@ async fn main() -> Result<(), CliError> {
                 image_endpoint,
                 image_command,
                 image_args,
+                image_style,
+                image_prompt_max_chars,
                 allow_remote_image_urls,
             } => {
                 if !dry_run {
@@ -730,6 +747,8 @@ async fn main() -> Result<(), CliError> {
                 }
                 let summary_config = summary_config(SummaryCliOptions {
                     summarizer: &summarizer,
+                    summary_style: &summary_style,
+                    summary_prompt_max_chars,
                     per_story,
                     allow_project_names,
                     guardrail_patterns: &guardrail_pattern,
@@ -738,6 +757,8 @@ async fn main() -> Result<(), CliError> {
                     image_endpoint: image_endpoint.as_deref(),
                     image_command: image_command.as_deref(),
                     image_args: &image_args,
+                    image_style: image_style.as_deref(),
+                    image_prompt_max_chars,
                     allow_remote_image_urls,
                 })?;
                 let capsules = signed_capsules(&feed, &stories, &summary_config)?;
@@ -841,6 +862,28 @@ mod tests {
             panic!("expected p2p publish command");
         };
         assert_eq!(feed, "gpu-vm");
+    }
+
+    #[test]
+    fn p2p_publish_defaults_to_aesthetic_headline_summarizer() {
+        let cli = Cli::try_parse_from(["agent-feed", "p2p", "publish", "--dry-run"])
+            .expect("publish command parses");
+
+        let Commands::P2p {
+            command:
+                P2pCommand::Publish {
+                    summarizer,
+                    summary_style,
+                    summary_prompt_max_chars,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected p2p publish command");
+        };
+        assert_eq!(summarizer, "codex-exec");
+        assert_eq!(summary_style, DEFAULT_SUMMARY_PROMPT_STYLE);
+        assert_eq!(summary_prompt_max_chars, DEFAULT_SUMMARY_PROMPT_MAX_CHARS);
     }
 
     #[test]
@@ -1053,6 +1096,8 @@ fn signed_capsules(
 
 struct SummaryCliOptions<'a> {
     summarizer: &'a str,
+    summary_style: &'a str,
+    summary_prompt_max_chars: usize,
     per_story: bool,
     allow_project_names: bool,
     guardrail_patterns: &'a [String],
@@ -1061,6 +1106,8 @@ struct SummaryCliOptions<'a> {
     image_endpoint: Option<&'a str>,
     image_command: Option<&'a str>,
     image_args: &'a [String],
+    image_style: Option<&'a str>,
+    image_prompt_max_chars: Option<usize>,
     allow_remote_image_urls: bool,
 }
 
@@ -1071,13 +1118,15 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
     } else {
         FeedSummaryMode::FeedRollup
     };
+    config.prompt.style = options.summary_style.to_string();
+    config.prompt.max_prompt_chars = options.summary_prompt_max_chars.max(512);
     config.processor = match options.summarizer {
-        "deterministic" => SummaryProcessorConfig::Deterministic,
-        "codex" | "codex-exec" => SummaryProcessorConfig::CodexExec,
+        "deterministic" | "offline" => SummaryProcessorConfig::Deterministic,
+        "aesthetic" | "codex" | "codex-exec" => SummaryProcessorConfig::CodexExec,
         "claude" | "claude-code" | "claude-code-exec" => SummaryProcessorConfig::ClaudeCodeExec,
         other => {
             return Err(CliError::Http(format!(
-                "unknown summarizer {other}; use deterministic, codex-exec, or claude-code"
+                "unknown summarizer {other}; use aesthetic, codex-exec, claude-code, or deterministic"
             )));
         }
     };
@@ -1085,6 +1134,12 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
     config.image.enabled = options.images;
     config.image.allow_remote_urls = options.allow_remote_image_urls;
     config.image.decision = ImageDecisionMode::BestJudgement;
+    if let Some(style) = options.image_style {
+        config.image.prompt_style = style.to_string();
+    }
+    if let Some(max_prompt_chars) = options.image_prompt_max_chars {
+        config.image.max_prompt_chars = max_prompt_chars.max(512);
+    }
     config.image.processor = if options.images {
         parse_image_processor(
             options.image_processor,
