@@ -90,13 +90,52 @@ jobs:
             --output json | tee "$artifact_dir/edge-instance.json"
 
           if [ "$RESTART_EDGE_SERVICES" = "true" ]; then
-            aws ssm send-command \
+            restart_command_id="$(aws ssm send-command \
               --region "$AWS_REGION" \
               --instance-ids "$instance_id" \
               --document-name AWS-RunShellScript \
               --parameters commands='["sudo systemctl restart caddy agent-feed-edge","sudo systemctl --no-pager status caddy agent-feed-edge"]' \
-              --output json | tee "$artifact_dir/restart-command.json"
+              --query Command.CommandId \
+              --output text)"
+            printf '{"command_id":"%s"}\n' "$restart_command_id" | tee "$artifact_dir/restart-command.json"
+            aws ssm wait command-executed \
+              --region "$AWS_REGION" \
+              --instance-id "$instance_id" \
+              --command-id "$restart_command_id" || true
+            aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --instance-id "$instance_id" \
+              --command-id "$restart_command_id" \
+              --output json | tee "$artifact_dir/restart-invocation.json" || true
           fi
+
+          diagnostics_command_id="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$instance_id" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=[
+              "set -euxo pipefail",
+              "sudo systemctl --no-pager status caddy agent-feed-edge || true",
+              "sudo caddy validate --config /etc/caddy/Caddyfile || true",
+              "sudo ss -lntup || true",
+              "sudo sed -n '\''1,140p'\'' /etc/caddy/Caddyfile || true",
+              "sudo journalctl -u caddy -n 220 --no-pager || true",
+              "sudo journalctl -u agent-feed-edge -n 220 --no-pager || true",
+              "curl -v --connect-timeout 5 --max-time 15 http://127.0.0.1:7778/healthz || true",
+              "curl -vk --resolve edge.feed.aberration.technology:443:127.0.0.1 --connect-timeout 5 --max-time 15 https://edge.feed.aberration.technology/healthz || true"
+            ]' \
+            --query Command.CommandId \
+            --output text)"
+          printf '{"command_id":"%s"}\n' "$diagnostics_command_id" | tee "$artifact_dir/diagnostics-command.json"
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --command-id "$diagnostics_command_id" || true
+          aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --command-id "$diagnostics_command_id" \
+            --output json | tee "$artifact_dir/diagnostics-invocation.json" || true
 
       - name: upload inspect artifact
         uses: actions/upload-artifact@v4
