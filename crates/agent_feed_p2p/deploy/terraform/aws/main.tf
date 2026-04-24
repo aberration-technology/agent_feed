@@ -60,6 +60,11 @@ locals {
       TerraformWorkspace = terraform.workspace
     },
   )
+  binary_s3_object_arn = (
+    trimspace(var.agent_feed_binary_s3_bucket) == "" || trimspace(var.agent_feed_binary_s3_key) == ""
+    ? ""
+    : "arn:${data.aws_partition.current.partition}:s3:::${var.agent_feed_binary_s3_bucket}/${var.agent_feed_binary_s3_key}"
+  )
 
   edge_env = templatefile("${path.module}/templates/edge.env.tftpl", {
     browser_app_base_url                = local.browser_app_base_url
@@ -93,6 +98,7 @@ locals {
     edge_loopback_port = var.edge_loopback_port
   })
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
+    agent_feed_binary_s3_uri   = var.agent_feed_binary_s3_uri
     agent_feed_crate_version   = var.agent_feed_crate_version
     agent_feed_git_ref         = var.agent_feed_git_ref
     agent_feed_git_repository  = var.agent_feed_git_repository
@@ -290,6 +296,15 @@ resource "aws_iam_role_policy" "edge_ssm" {
           "kms:Encrypt",
         ]
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+        ]
+        Resource = compact([
+          local.binary_s3_object_arn,
+        ])
       },
     ]
   })

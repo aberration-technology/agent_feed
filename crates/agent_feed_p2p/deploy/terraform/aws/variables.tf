@@ -88,14 +88,32 @@ variable "edge_loopback_port" {
 }
 
 variable "agent_feed_install_source" {
-  description = "How the edge host installs agent-feed. Supported values: git or crate."
+  description = "How the edge host installs agent-feed. Supported values: s3, git, or crate."
   type        = string
-  default     = "git"
+  default     = "s3"
 
   validation {
-    condition     = contains(["git", "crate"], lower(trimspace(var.agent_feed_install_source)))
-    error_message = "agent_feed_install_source must be git or crate."
+    condition     = contains(["s3", "git", "crate"], lower(trimspace(var.agent_feed_install_source)))
+    error_message = "agent_feed_install_source must be s3, git, or crate."
   }
+}
+
+variable "agent_feed_binary_s3_uri" {
+  description = "S3 URI for a prebuilt agent-feed binary when agent_feed_install_source = s3."
+  type        = string
+  default     = ""
+}
+
+variable "agent_feed_binary_s3_bucket" {
+  description = "S3 bucket containing the prebuilt agent-feed binary."
+  type        = string
+  default     = ""
+}
+
+variable "agent_feed_binary_s3_key" {
+  description = "S3 object key containing the prebuilt agent-feed binary."
+  type        = string
+  default     = ""
 }
 
 variable "agent_feed_git_repository" {

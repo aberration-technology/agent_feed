@@ -67,6 +67,7 @@ jobs:
           VAR_ALLOW_ROUTE53_ZONE_APEX_RECORDS: ${{ vars.AGENT_FEED_P2P_ALLOW_ROUTE53_ZONE_APEX_RECORDS }}
           VAR_TERRAFORM_STATE_BUCKET: ${{ vars.AGENT_FEED_P2P_TERRAFORM_STATE_BUCKET }}
           VAR_TERRAFORM_STATE_KEY: ${{ vars.AGENT_FEED_P2P_TERRAFORM_STATE_KEY }}
+          VAR_BINARY_S3_KEY: ${{ vars.AGENT_FEED_P2P_BINARY_S3_KEY }}
         run: |
           set -euo pipefail
           secret_parameter_prefix="${VAR_SECRET_PARAMETER_PREFIX:-/agent-feed-p2p/mainnet/edge}"
@@ -75,6 +76,8 @@ jobs:
           aws_role_arn="${VAR_AWS_ROLE_ARN:-}"
           stack_name="${VAR_STACK_NAME:-agent-feed-p2p-production}"
           aws_account_id="$(cut -d: -f5 <<<"$aws_role_arn")"
+          state_bucket="${VAR_TERRAFORM_STATE_BUCKET:-agent-feed-p2p-tfstate-${aws_account_id}-${aws_region}}"
+          binary_s3_key="${VAR_BINARY_S3_KEY:-releases/${GITHUB_SHA}/agent-feed}"
           environment_name="$DEPLOY_ENVIRONMENT"
           environment_name="${environment_name#agent-real-p2p-}"
           environment_name="${environment_name#agent-feed-p2p-}"
@@ -86,11 +89,16 @@ jobs:
             echo "AWS_REGION=$aws_region"
             echo "AWS_ROLE_ARN=$aws_role_arn"
             echo "AWS_ACCOUNT_ID=$aws_account_id"
-            echo "TF_STATE_BUCKET=${VAR_TERRAFORM_STATE_BUCKET:-agent-feed-p2p-tfstate-${aws_account_id}-${aws_region}}"
+            echo "TF_STATE_BUCKET=$state_bucket"
             echo "TF_STATE_KEY=${VAR_TERRAFORM_STATE_KEY:-${stack_name}/${TF_WORKSPACE_NAME}/terraform.tfstate}"
+            echo "AGENT_FEED_BINARY_S3_KEY=$binary_s3_key"
             echo "TF_VAR_aws_region=$aws_region"
             echo "TF_VAR_environment_name=$environment_name"
             echo "TF_VAR_stack_name=$stack_name"
+            echo "TF_VAR_agent_feed_install_source=s3"
+            echo "TF_VAR_agent_feed_binary_s3_uri=s3://${state_bucket}/${binary_s3_key}"
+            echo "TF_VAR_agent_feed_binary_s3_bucket=$state_bucket"
+            echo "TF_VAR_agent_feed_binary_s3_key=$binary_s3_key"
             echo "TF_VAR_edge_domain_name=${VAR_EDGE_DOMAIN_NAME:-edge.feed.aberration.technology}"
             echo "TF_VAR_browser_app_base_url=${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}"
             echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
@@ -183,6 +191,17 @@ jobs:
           aws s3api put-bucket-versioning \
             --bucket "$TF_STATE_BUCKET" \
             --versioning-configuration Status=Enabled
+
+      - name: setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: build edge binary
+        shell: bash
+        run: cargo build --locked --release -p agent_feed_cli --bin agent-feed
+
+      - name: upload edge binary
+        shell: bash
+        run: aws s3 cp target/release/agent-feed "s3://${TF_STATE_BUCKET}/${AGENT_FEED_BINARY_S3_KEY}"
 
       - name: setup terraform
         uses: hashicorp/setup-terraform@v3

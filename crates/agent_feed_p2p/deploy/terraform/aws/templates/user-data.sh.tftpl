@@ -58,7 +58,10 @@ cat >/etc/systemd/system/agent-feed-edge.service <<'EOF_SERVICE'
 ${edge_service_unit}
 EOF_SERVICE
 
-if [ "${agent_feed_install_source}" = "crate" ]; then
+if [ "${agent_feed_install_source}" = "s3" ]; then
+  aws s3 cp "${agent_feed_binary_s3_uri}" /usr/local/bin/agent-feed
+  chmod 0755 /usr/local/bin/agent-feed
+elif [ "${agent_feed_install_source}" = "crate" ]; then
   if [ ! -x /root/.cargo/bin/cargo ]; then
     curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
   fi
@@ -84,8 +87,9 @@ else
     --bin agent-feed \
     agent_feed_cli
 fi
-
-ln -sf /root/.cargo/bin/agent-feed /usr/local/bin/agent-feed
+if [ "${agent_feed_install_source}" != "s3" ]; then
+  ln -sf /root/.cargo/bin/agent-feed /usr/local/bin/agent-feed
+fi
 
 systemctl daemon-reload
 systemctl enable caddy
