@@ -114,7 +114,7 @@ jobs:
             --instance-ids "$instance_id" \
             --document-name AWS-RunShellScript \
             --parameters 'commands=[
-              "set -euxo pipefail",
+              "set -eux",
               "sudo systemctl --no-pager status caddy agent-feed-edge || true",
               "sudo caddy validate --config /etc/caddy/Caddyfile || true",
               "sudo ss -lntup || true",
