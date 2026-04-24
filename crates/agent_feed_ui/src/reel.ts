@@ -307,7 +307,7 @@ function renderP2pDisabled(route) {
   hideModeSwitcher();
   document.body.dataset.mode = "dispatch";
   setText(liveState, "LOCAL");
-  setText(eyebrow, "FEED / LOCAL / P2P DISABLED");
+  setText(eyebrow, "P2P DISABLED");
   setText(headline, "local feed only");
   setText(
     deck,
@@ -316,7 +316,7 @@ function renderP2pDisabled(route) {
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   clearAuthAction();
-  renderChips(["local", "no-p2p", "redacted"]);
+  renderChips(["p2p off", "privacy on"]);
   renderTicker(["start with --p2p or use the hosted p2p browser shell"]);
   stopStageProgress();
 }

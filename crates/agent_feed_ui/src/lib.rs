@@ -38,6 +38,20 @@ mod tests {
     }
 
     #[test]
+    fn idle_state_avoids_redundant_local_status_chips() {
+        let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
+
+        assert!(html.contains("id=\"eyebrow\">LOCAL FEED</div>"));
+        assert!(html.contains("<span>privacy on</span>"));
+        assert!(!html.contains("LOCAL / QUIET / IDLE"));
+        assert!(!html.contains(
+            "<span>local</span>\n          <span>redacted</span>\n          <span>idle</span>"
+        ));
+        assert!(html.contains("setText(eyebrow, \"P2P DISABLED\");"));
+        assert!(html.contains("renderChips([\"p2p off\", \"privacy on\"]);"));
+    }
+
+    #[test]
     fn remote_states_stop_dwell_progress() {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
         let remote_state = html
