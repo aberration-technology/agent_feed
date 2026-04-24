@@ -95,12 +95,7 @@ fn mode_for(kind: EventKind) -> BulletinMode {
 
 fn eyebrow(event: &AgentEvent) -> String {
     let project = event.project.as_deref().unwrap_or("local");
-    format!(
-        "{} / {} / {}",
-        event.agent.to_ascii_uppercase(),
-        project.to_ascii_uppercase(),
-        event.kind.as_str().to_ascii_uppercase()
-    )
+    format!("{} / {} / {}", event.agent, project, event.kind.as_str())
 }
 
 fn deck_fallback(event: &AgentEvent) -> &'static str {
@@ -190,6 +185,6 @@ mod tests {
 
         assert_eq!(bulletin.mode, BulletinMode::Breaking);
         assert!(bulletin.priority >= 90);
-        assert!(bulletin.eyebrow.contains("CODEX / AGENT_FEED"));
+        assert!(bulletin.eyebrow.contains("codex / agent_feed"));
     }
 }

@@ -218,10 +218,10 @@ impl CompiledStory {
     fn eyebrow(&self) -> String {
         let project = self.project.as_deref().unwrap_or("local");
         format!(
-            "{} / {} / {:?}",
-            self.agent.to_ascii_uppercase(),
-            project.to_ascii_uppercase(),
-            self.family
+            "{} / {} / {}",
+            self.agent,
+            project,
+            story_family_label(self.family)
         )
     }
 }
@@ -713,6 +713,12 @@ mod tests {
         assert_eq!(stories.len(), 1);
         assert!(stories[0].headline.contains("codex changed"));
         assert!(stories[0].deck.contains("changed files"));
+        assert!(
+            stories[0]
+                .to_bulletin()
+                .eyebrow
+                .contains("codex / agent_feed / file-change")
+        );
         assert!(!stories[0].deck.contains("raw detail omitted"));
         assert!(!stories[0].deck.contains("cargo test --all"));
     }

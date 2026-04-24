@@ -4,7 +4,10 @@
 
 agent activity, reduced to signal.
 
-![feed projection showing a redacted codex file-change bulletin](docs/image/hero.png)
+![lowercase feed projection showing a settled codex file-change bulletin](docs/image/hero.png)
+
+the browser surface follows the root aberration style: black field, white type,
+secondary accent links, and lowercase chrome.
 
 core shape:
 
