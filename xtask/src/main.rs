@@ -104,9 +104,10 @@ fn build_browser_site(args: Vec<String>) -> Result<()> {
     }
 
     fs::create_dir_all(&out_dir).map_err(XtaskError::Io)?;
-    let index = render_browser_shell(&edge_url, &site_base_url, &network_id)?;
+    let (index, favicon) = render_browser_shell(&edge_url, &site_base_url, &network_id)?;
     fs::write(out_dir.join("index.html"), &index).map_err(XtaskError::Io)?;
     fs::write(out_dir.join("404.html"), &index).map_err(XtaskError::Io)?;
+    fs::write(out_dir.join("favicon.svg"), favicon).map_err(XtaskError::Io)?;
     fs::write(
         out_dir.join("feed-config.json"),
         format!(
@@ -129,7 +130,11 @@ fn next_arg(iter: &mut impl Iterator<Item = String>, name: &str) -> Result<Strin
         .ok_or_else(|| XtaskError::InvalidArgs(format!("{name} requires a value")))
 }
 
-fn render_browser_shell(edge_url: &str, site_base_url: &str, network_id: &str) -> Result<String> {
+fn render_browser_shell(
+    edge_url: &str,
+    site_base_url: &str,
+    network_id: &str,
+) -> Result<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| {
@@ -139,13 +144,14 @@ fn render_browser_shell(edge_url: &str, site_base_url: &str, network_id: &str) -
     let index = fs::read_to_string(ui_dir.join("index.html")).map_err(XtaskError::Io)?;
     let css = fs::read_to_string(ui_dir.join("reel.css")).map_err(XtaskError::Io)?;
     let js = fs::read_to_string(ui_dir.join("reel.ts")).map_err(XtaskError::Io)?;
+    let favicon = fs::read_to_string(ui_dir.join("favicon.svg")).map_err(XtaskError::Io)?;
     let config = format!(
         "window.FEED_P2P_ENABLED = true;\nwindow.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.AGENT_FEED_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
         js_string(edge_url),
         js_string(site_base_url),
         js_string(network_id),
     );
-    Ok(index
+    let rendered = index
         .replace("/*__REEL_CSS__*/", &css)
         .replace("/*__REEL_JS__*/", &js)
         .replace("/*__FEED_CONFIG__*/", "")
@@ -153,7 +159,8 @@ fn render_browser_shell(edge_url: &str, site_base_url: &str, network_id: &str) -
         .replace(
             "<script type=\"module\">",
             &format!("<script>\n{config}\n    </script>\n    <script type=\"module\">"),
-        ))
+        );
+    Ok((rendered, favicon))
 }
 
 fn js_string(value: &str) -> String {

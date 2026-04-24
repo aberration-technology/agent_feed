@@ -1,6 +1,7 @@
 const INDEX_HTML: &str = include_str!("index.html");
 const REEL_CSS: &str = include_str!("reel.css");
 const REEL_JS: &str = include_str!("reel.ts");
+pub const FAVICON_SVG: &str = include_str!("favicon.svg");
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiConfig {
@@ -35,6 +36,16 @@ mod tests {
 
         assert!(html.contains("id=\"stage-progress\""));
         assert!(html.contains("aria-hidden=\"true\" hidden"));
+    }
+
+    #[test]
+    fn favicon_matches_feed_mark() {
+        let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
+
+        assert!(html.contains("href=\"./favicon.svg\" type=\"image/svg+xml\""));
+        assert!(super::FAVICON_SVG.contains("rx=\"12\" fill=\"#000000\""));
+        assert!(super::FAVICON_SVG.contains("fill=\"#d87c7c\""));
+        assert!(super::FAVICON_SVG.contains("V30h-7v-8h7v-3"));
     }
 
     #[test]

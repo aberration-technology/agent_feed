@@ -12,7 +12,7 @@ use agent_feed_views::{
     SseBulletin,
 };
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -92,6 +92,7 @@ pub fn app_with_config(bind: SocketAddr, p2p_enabled: bool) -> Router {
     Router::new()
         .route("/reel", get(reel_index))
         .route("/reel/{view}", get(reel_view))
+        .route("/favicon.svg", get(favicon_svg))
         .route("/network", get(network_index))
         .route("/callback/github", get(github_callback_shell))
         .route("/events.sse", get(events_sse))
@@ -128,6 +129,13 @@ async fn network_index(State(state): State<Arc<AppState>>) -> Html<String> {
 
 async fn github_callback_shell(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(render_ui(Some("network"), state.p2p_enabled))
+}
+
+async fn favicon_svg() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        agent_feed_ui::FAVICON_SVG,
+    )
 }
 
 async fn remote_user_shell(
@@ -444,6 +452,27 @@ mod tests {
             story: Mutex::new(StoryCompiler::default()),
             metrics: Metrics::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn favicon_svg_route_is_embedded() {
+        let response = favicon_svg().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(
+                &"image/svg+xml; charset=utf-8"
+                    .parse()
+                    .expect("valid header")
+            )
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("favicon body");
+        let body = std::str::from_utf8(&body).expect("favicon is utf-8");
+        assert!(body.contains("fill=\"#d87c7c\""));
+        assert!(body.contains("V30h-7v-8h7v-3"));
     }
 
     #[tokio::test]
