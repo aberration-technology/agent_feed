@@ -98,6 +98,7 @@ mod tests {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
 
         assert!(html.contains("feedLink(route.login, \"*\", \"all feeds\""));
+        assert!(html.contains("feed.publisher_avatar ||"));
         assert!(html.contains("meta.textContent = feedLabel;"));
         assert!(html.contains("interactive timeline · ${routeStreamLabel(route)}"));
         assert!(!html.contains("feedLink(route.login, \"*\", `${route.login}/*`"));

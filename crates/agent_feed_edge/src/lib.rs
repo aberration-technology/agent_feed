@@ -12,7 +12,7 @@ use agent_feed_p2p_proto::{
     github_provider_key, github_team_provider_key, github_team_topic, github_user_topic,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -74,6 +74,11 @@ impl EdgeConfig {
         } else {
             value.trim_end_matches('/').to_string()
         }
+    }
+
+    #[must_use]
+    pub fn github_avatar_url(&self, github_user_id: u64) -> String {
+        github_avatar_url(&self.edge_domain, github_user_id)
     }
 }
 
@@ -325,27 +330,28 @@ pub struct ResolveFeedView {
 
 impl From<&GithubDiscoveryTicket> for ResolveGithubResponse {
     fn from(ticket: &GithubDiscoveryTicket) -> Self {
+        Self::from_ticket(ticket, &EdgeConfig::mainnet())
+    }
+}
+
+impl ResolveGithubResponse {
+    #[must_use]
+    pub fn from_ticket(ticket: &GithubDiscoveryTicket, config: &EdgeConfig) -> Self {
         Self {
             state: "resolved".to_string(),
             network_id: ticket.network_id.clone(),
             compatibility: ticket.compatibility.clone(),
             requested_login: ticket.requested_login.to_string(),
             github_user_id: ticket.resolved_github_id.get(),
-            profile: ticket.profile.clone(),
+            profile: normalized_profile_view(
+                &ticket.profile,
+                config,
+                ticket.resolved_github_id.get(),
+            ),
             feeds: ticket
                 .candidate_feeds
                 .iter()
-                .map(|feed| ResolveFeedView {
-                    feed_id: feed.feed_id.clone(),
-                    label: feed.feed_label.clone(),
-                    compatibility: feed.compatibility.clone(),
-                    visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
-                    publisher_login: feed.owner.current_login.clone(),
-                    publisher_display_name: feed.owner.display_name.clone(),
-                    publisher_avatar: feed.owner.avatar.clone(),
-                    publisher_verified: true,
-                    last_seen_at: feed.last_seen_at,
-                })
+                .map(|feed| resolve_feed_view(feed, config))
                 .collect(),
             browser_seed_url: "/browser-seed".to_string(),
             expires_at: ticket.expires_at,
@@ -370,6 +376,13 @@ pub struct ResolveOrgResponse {
 
 impl From<&OrgDiscoveryTicket> for ResolveOrgResponse {
     fn from(ticket: &OrgDiscoveryTicket) -> Self {
+        Self::from_ticket(ticket, &EdgeConfig::mainnet())
+    }
+}
+
+impl ResolveOrgResponse {
+    #[must_use]
+    pub fn from_ticket(ticket: &OrgDiscoveryTicket, config: &EdgeConfig) -> Self {
         Self {
             state: "resolved".to_string(),
             network_id: ticket.network_id.clone(),
@@ -379,23 +392,51 @@ impl From<&OrgDiscoveryTicket> for ResolveOrgResponse {
             feeds: ticket
                 .candidate_feeds
                 .iter()
-                .map(|feed| ResolveFeedView {
-                    feed_id: feed.feed_id.clone(),
-                    label: feed.feed_label.clone(),
-                    compatibility: feed.compatibility.clone(),
-                    visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
-                    publisher_login: feed.owner.current_login.clone(),
-                    publisher_display_name: feed.owner.display_name.clone(),
-                    publisher_avatar: feed.owner.avatar.clone(),
-                    publisher_verified: true,
-                    last_seen_at: feed.last_seen_at,
-                })
+                .map(|feed| resolve_feed_view(feed, config))
                 .collect(),
             browser_seed_url: "/browser-seed".to_string(),
             expires_at: ticket.expires_at,
             signature: ticket.signature.digest.clone(),
         }
     }
+}
+
+fn resolve_feed_view(
+    feed: &agent_feed_directory::FeedDirectoryEntry,
+    config: &EdgeConfig,
+) -> ResolveFeedView {
+    ResolveFeedView {
+        feed_id: feed.feed_id.clone(),
+        label: feed.feed_label.clone(),
+        compatibility: feed.compatibility.clone(),
+        visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
+        publisher_login: feed.owner.current_login.clone(),
+        publisher_display_name: feed.owner.display_name.clone(),
+        publisher_avatar: Some(config.github_avatar_url(feed.owner.github_user_id.get())),
+        publisher_verified: true,
+        last_seen_at: feed.last_seen_at,
+    }
+}
+
+fn normalized_profile_view(
+    profile: &GithubProfileView,
+    config: &EdgeConfig,
+    github_user_id: u64,
+) -> GithubProfileView {
+    GithubProfileView {
+        login: profile.login.clone(),
+        name: profile.name.clone(),
+        avatar: Some(config.github_avatar_url(github_user_id)),
+    }
+}
+
+fn github_avatar_url(edge_domain: &str, github_user_id: u64) -> String {
+    let edge_domain = edge_domain.trim_end_matches('/');
+    format!("{edge_domain}/avatar/github/{github_user_id}")
+}
+
+fn github_avatar_upstream_url(github_user_id: u64) -> String {
+    format!("https://avatars.githubusercontent.com/u/{github_user_id}?v=4&s=192")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,6 +553,7 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
             "/resolve/github-org/{org}/teams/{team}",
             get(resolve_github_team),
         )
+        .route("/avatar/github/{github_user_id}", get(avatar_github))
         .route("/browser-seed", get(browser_seed))
         .route("/network/snapshot", get(network_snapshot))
         .with_state(state);
@@ -774,6 +816,7 @@ async fn callback_github(
     };
     let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
     let github_user_id = profile.id.get().to_string();
+    let avatar_url = state.config.github_avatar_url(profile.id.get());
     let expires_at = expires_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
@@ -785,7 +828,7 @@ async fn callback_github(
             ("github_user_id", github_user_id.as_str()),
             ("login", profile.login.as_str()),
             ("name", profile.name.as_deref().unwrap_or("")),
-            ("avatar_url", profile.avatar_url.as_deref().unwrap_or("")),
+            ("avatar_url", avatar_url.as_str()),
             ("session", session.as_str()),
             ("expires_at", expires_at.as_str()),
             ("return_to", payload.return_to.as_str()),
@@ -815,7 +858,9 @@ async fn resolve_github(
         DirectoryStore::new(),
     );
     match resolver.resolve_github_user(&route) {
-        Ok(ticket) => Json(ResolveGithubResponse::from(&ticket)).into_response(),
+        Ok(ticket) => {
+            Json(ResolveGithubResponse::from_ticket(&ticket, &state.config)).into_response()
+        }
         Err(EdgeError::Github(GithubResolveError::NotFound(_))) => {
             edge_error(StatusCode::NOT_FOUND, "github user not found")
         }
@@ -875,9 +920,23 @@ fn resolve_org_like(
         DirectoryStore::new(),
     );
     match resolver.resolve_github_org(&org, team.as_ref(), &filter) {
-        Ok(ticket) => Json(ResolveOrgResponse::from(&ticket)).into_response(),
+        Ok(ticket) => Json(ResolveOrgResponse::from_ticket(&ticket, &state.config)).into_response(),
         Err(err) => edge_error(StatusCode::BAD_GATEWAY, err.to_string()),
     }
+}
+
+async fn avatar_github(Path(github_user_id): Path<u64>) -> impl IntoResponse {
+    if github_user_id == 0 {
+        return edge_error(StatusCode::BAD_REQUEST, "invalid github user id");
+    }
+    (
+        [(
+            header::CACHE_CONTROL,
+            "public, max-age=86400, stale-while-revalidate=604800",
+        )],
+        Redirect::temporary(&github_avatar_upstream_url(github_user_id)),
+    )
+        .into_response()
 }
 
 async fn browser_seed(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
@@ -1263,7 +1322,7 @@ mod tests {
             id: GithubUserId::new(123),
             login: GithubLogin::parse("mosure").expect("login parses"),
             name: Some("mosure".to_string()),
-            avatar_url: Some("/avatar/github/123".to_string()),
+            avatar_url: Some("https://avatars.githubusercontent.com/u/123?v=4".to_string()),
         }
     }
 
@@ -1345,7 +1404,7 @@ mod tests {
         let ticket = edge
             .resolve_github_route("/@mosure", Some("streams=workstation"))
             .expect("route resolves");
-        let response = ResolveGithubResponse::from(&ticket);
+        let response = ResolveGithubResponse::from_ticket(&ticket, &config());
 
         assert_eq!(response.state, "resolved");
         assert_eq!(response.requested_login, "mosure");
@@ -1353,13 +1412,31 @@ mod tests {
         assert_eq!(response.compatibility.protocol_version, 1);
         assert_eq!(response.compatibility.model_version, 1);
         assert_eq!(response.browser_seed_url, "/browser-seed");
+        assert_eq!(
+            response.profile.avatar.as_deref(),
+            Some("https://api.feed.aberration.technology/avatar/github/123")
+        );
         assert_eq!(response.feeds[0].publisher_login, "mosure");
         assert_eq!(response.feeds[0].compatibility.protocol_version, 1);
         assert_eq!(
             response.feeds[0].publisher_avatar.as_deref(),
-            Some("/avatar/github/123")
+            Some("https://api.feed.aberration.technology/avatar/github/123")
         );
         assert!(response.feeds[0].publisher_verified);
+    }
+
+    #[test]
+    fn avatar_endpoint_urls_are_edge_safe() {
+        let config = config();
+
+        assert_eq!(
+            config.github_avatar_url(123),
+            "https://api.feed.aberration.technology/avatar/github/123"
+        );
+        assert_eq!(
+            github_avatar_upstream_url(123),
+            "https://avatars.githubusercontent.com/u/123?v=4&s=192"
+        );
     }
 
     #[test]

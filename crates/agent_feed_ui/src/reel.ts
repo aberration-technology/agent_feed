@@ -1214,7 +1214,11 @@ function timelinePublisher(feed, ticket) {
   img.decoding = "async";
   img.referrerPolicy = "no-referrer";
   const avatar = safeAvatarUrl(
-    feed.avatar || feed.owner?.avatar?.url || feed.owner?.avatar_url || ticket.profile?.avatar,
+    feed.publisher_avatar ||
+      feed.avatar ||
+      feed.owner?.avatar?.url ||
+      feed.owner?.avatar_url ||
+      ticket.profile?.avatar,
   );
   if (avatar) {
     img.src = avatar;
