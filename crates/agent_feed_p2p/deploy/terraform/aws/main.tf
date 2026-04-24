@@ -41,7 +41,6 @@ locals {
   )[0]
   browser_app_hostname_normalized   = trimsuffix(lower(local.browser_app_hostname), ".")
   browser_app_pages_domain_target   = trimsuffix(trimspace(var.browser_app_pages_domain_target), ".")
-  browser_app_pages_base_path       = trimsuffix(trimspace(var.browser_app_pages_base_path), "/")
   github_callback_url               = trimspace(var.github_callback_url) == "" ? "${local.browser_app_base_url}/callback/github" : trimspace(var.github_callback_url)
   claiming_edge_apex                = local.edge_domain_name_normalized == local.route53_zone_apex
   claiming_browser_apex             = local.browser_app_hostname_normalized == local.route53_zone_apex
@@ -94,13 +93,9 @@ locals {
     github_required_teams = var.github_required_teams
   })
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
-    browser_app_base_url      = local.browser_app_base_url
-    browser_app_hostname      = local.browser_app_hostname_normalized
-    browser_app_origin        = local.browser_app_base_url
-    browser_pages_base_path   = local.browser_app_pages_base_path
-    browser_pages_origin_host = local.browser_app_pages_domain_target
-    edge_domain_name          = var.edge_domain_name
-    edge_loopback_port        = var.edge_loopback_port
+    browser_app_origin = local.browser_app_base_url
+    edge_domain_name   = var.edge_domain_name
+    edge_loopback_port = var.edge_loopback_port
   })
   edge_service_unit = templatefile("${path.module}/templates/agent-feed-edge.service.tftpl", {
     edge_loopback_port  = var.edge_loopback_port
@@ -368,19 +363,21 @@ resource "aws_eip_association" "edge" {
 }
 
 resource "aws_route53_record" "edge" {
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = local.edge_domain_name_normalized
-  type    = "A"
-  ttl     = 60
-  records = [aws_eip.edge.public_ip]
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = local.edge_domain_name_normalized
+  type            = "A"
+  ttl             = 60
+  records         = [aws_eip.edge.public_ip]
+  allow_overwrite = true
 }
 
 resource "aws_route53_record" "browser" {
-  zone_id = data.aws_route53_zone.selected.zone_id
-  name    = local.browser_app_hostname_normalized
-  type    = "A"
-  ttl     = 60
-  records = [aws_eip.edge.public_ip]
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = local.browser_app_hostname_normalized
+  type            = "CNAME"
+  ttl             = 300
+  records         = [local.browser_app_pages_domain_target]
+  allow_overwrite = true
 }
 
 resource "aws_cloudwatch_metric_alarm" "edge_status" {

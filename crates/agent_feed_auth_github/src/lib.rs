@@ -51,7 +51,7 @@ pub struct GithubCliAuthConfig {
 impl Default for GithubCliAuthConfig {
     fn default() -> Self {
         Self {
-            edge_base_url: "https://edge.feed.aberration.technology".to_string(),
+            edge_base_url: "https://api.feed.aberration.technology".to_string(),
             callback_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             callback_path: "/callback/github".to_string(),
             requested_scopes: vec!["read:user".to_string()],

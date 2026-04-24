@@ -700,7 +700,7 @@ function edgeBaseUrl() {
     return window.AGENT_FEED_EDGE_BASE_URL;
   }
   if (window.location.hostname === "feed.aberration.technology") {
-    return "https://edge.feed.aberration.technology";
+    return "https://api.feed.aberration.technology";
   }
   return "";
 }

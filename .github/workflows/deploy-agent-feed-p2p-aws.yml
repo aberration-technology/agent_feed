@@ -101,7 +101,7 @@ jobs:
             echo "TF_VAR_agent_feed_binary_s3_uri=s3://${state_bucket}/${binary_s3_key}"
             echo "TF_VAR_agent_feed_binary_s3_bucket=$state_bucket"
             echo "TF_VAR_agent_feed_binary_s3_key=$binary_s3_key"
-            echo "TF_VAR_edge_domain_name=${VAR_EDGE_DOMAIN_NAME:-edge.feed.aberration.technology}"
+            echo "TF_VAR_edge_domain_name=${VAR_EDGE_DOMAIN_NAME:-api.feed.aberration.technology}"
             echo "TF_VAR_browser_app_base_url=$browser_app_base_url"
             echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
             echo "TF_VAR_github_callback_url=$github_callback_url"
@@ -302,7 +302,7 @@ jobs:
             browser_host="${browser_host#http://}"
             browser_host="${browser_host%%/*}"
             try_import aws_route53_record.edge "${zone_id}_${TF_VAR_edge_domain_name}_A"
-            try_import aws_route53_record.browser "${zone_id}_${browser_host}_A"
+            try_import aws_route53_record.browser "${zone_id}_${browser_host}_CNAME"
           fi
 
           alarm_name="$(aws cloudwatch describe-alarms --alarm-names "${stack}-edge-status-check" | jq -r '.MetricAlarms[0].AlarmName // empty')"

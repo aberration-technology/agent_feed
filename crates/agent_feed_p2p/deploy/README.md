@@ -6,7 +6,7 @@ production uses the same split-host shape as the burn_dragon p2p deployment:
 feed.aberration.technology
   public browser shell and username deep links through the edge
 
-edge.feed.aberration.technology
+api.feed.aberration.technology
   github resolver, browser seeds, directory, rendezvous/bootstrap edge
 ```
 
@@ -65,8 +65,8 @@ recommended variables:
 ```text
 AGENT_FEED_P2P_AWS_REGION=us-east-2
 AGENT_FEED_P2P_STACK_NAME=agent-feed-p2p-production
-AGENT_FEED_P2P_EDGE_DOMAIN_NAME=edge.feed.aberration.technology
-AGENT_FEED_P2P_EDGE_BASE_URL=https://edge.feed.aberration.technology
+AGENT_FEED_P2P_EDGE_DOMAIN_NAME=api.feed.aberration.technology
+AGENT_FEED_P2P_EDGE_BASE_URL=https://api.feed.aberration.technology
 AGENT_FEED_P2P_BROWSER_APP_BASE_URL=https://feed.aberration.technology
 AGENT_FEED_P2P_GITHUB_CALLBACK_URL=https://feed.aberration.technology/callback/github
 AGENT_FEED_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET=aberration-technology.github.io
@@ -112,11 +112,9 @@ the stack manages:
 one ec2 edge host
 one elastic ip
 one small public vpc/subnet
-route53 A record for edge.feed.aberration.technology
-route53 A record for feed.aberration.technology -> edge host
-caddy tls termination on the host
-caddy proxy to the github pages static shell
-caddy routes github oauth code callbacks on feed.aberration.technology to the edge
+route53 A record for api.feed.aberration.technology
+route53 CNAME for feed.aberration.technology -> github pages
+caddy tls termination for the edge host
 tcp/udp p2p fabric probes on 7747
 udp browser handoff probe on 443
 ssm-enabled instance role
@@ -139,9 +137,9 @@ deploy is not considered green until these pass:
 ```text
 https://feed.aberration.technology/{canary_github_login}?all loads the static shell
 https://feed.aberration.technology/callback/github is the github oauth callback URL
-https://edge.feed.aberration.technology/healthz returns ok
-edge.feed.aberration.technology:7747 accepts tcp p2p fabric probes
-edge.feed.aberration.technology:7747 answers udp p2p fabric probes
+https://api.feed.aberration.technology/healthz returns ok
+api.feed.aberration.technology:7747 accepts tcp p2p fabric probes
+api.feed.aberration.technology:7747 answers udp p2p fabric probes
 ```
 
 resolver and feed-discovery checks can be tightened as live publisher directory

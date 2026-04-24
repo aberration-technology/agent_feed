@@ -8,17 +8,10 @@ http://${edge_domain_name} {
     redir https://${edge_domain_name}{uri} 308
 }
 
-http://${browser_app_hostname} {
-    redir https://${browser_app_hostname}{uri} 308
-}
-
-https://${browser_app_hostname}, https://${edge_domain_name} {
+https://${edge_domain_name} {
     encode gzip zstd
 
-    @edgePreflight {
-        host ${edge_domain_name}
-        method OPTIONS
-    }
+    @edgePreflight method OPTIONS
     handle @edgePreflight {
         header Access-Control-Allow-Origin "${browser_app_origin}"
         header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
@@ -29,53 +22,19 @@ https://${browser_app_hostname}, https://${edge_domain_name} {
         respond "" 204
     }
 
-    @edgeHealth {
-        host ${edge_domain_name}
-        path /healthz
+    handle /healthz {
+        respond "ok" 200
     }
-    respond @edgeHealth "ok" 200
 
-    @edgeReady {
-        host ${edge_domain_name}
-        path /readyz
+    handle /readyz {
+        respond "ready" 200
     }
-    respond @edgeReady "ready" 200
 
-    @edgeHost host ${edge_domain_name}
-    handle @edgeHost {
+    handle {
         header Access-Control-Allow-Origin "${browser_app_origin}"
         header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
         header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
         header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
         reverse_proxy 127.0.0.1:${edge_loopback_port}
-    }
-
-    @githubAuth {
-        path /auth/github
-    }
-    handle @githubAuth {
-        reverse_proxy 127.0.0.1:${edge_loopback_port}
-    }
-
-    @githubOauthCallback {
-        path /callback/github
-        query code=*
-    }
-    handle @githubOauthCallback {
-        reverse_proxy 127.0.0.1:${edge_loopback_port}
-    }
-
-    handle /feed-config.json {
-        rewrite * ${browser_pages_base_path}/feed-config.json
-        reverse_proxy https://${browser_pages_origin_host} {
-            header_up Host ${browser_pages_origin_host}
-        }
-    }
-
-    handle {
-        rewrite * ${browser_pages_base_path}/index.html
-        reverse_proxy https://${browser_pages_origin_host} {
-            header_up Host ${browser_pages_origin_host}
-        }
     }
 }

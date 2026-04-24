@@ -68,7 +68,7 @@ fn reserved_lane(name: &str) -> Result<()> {
 
 fn build_browser_site(args: Vec<String>) -> Result<()> {
     let mut out_dir = PathBuf::from("target/feed-site");
-    let mut edge_url = "https://edge.feed.aberration.technology".to_string();
+    let mut edge_url = "https://api.feed.aberration.technology".to_string();
     let mut site_base_url = "https://feed.aberration.technology".to_string();
     let mut network_id = "agent-feed-mainnet".to_string();
     let mut cname = None;

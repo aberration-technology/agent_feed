@@ -122,7 +122,7 @@ jobs:
               "sudo journalctl -u caddy -n 220 --no-pager || true",
               "sudo journalctl -u agent-feed-edge -n 220 --no-pager || true",
               "curl -v --connect-timeout 5 --max-time 15 http://127.0.0.1:7778/healthz || true",
-              "curl -vk --resolve edge.feed.aberration.technology:443:127.0.0.1 --connect-timeout 5 --max-time 15 https://edge.feed.aberration.technology/healthz || true"
+              "curl -vk --resolve api.feed.aberration.technology:443:127.0.0.1 --connect-timeout 5 --max-time 15 https://api.feed.aberration.technology/healthz || true"
             ]' \
             --query Command.CommandId \
             --output text)"

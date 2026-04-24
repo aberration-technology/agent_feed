@@ -40,13 +40,13 @@ impl EdgeConfig {
     pub fn mainnet() -> Self {
         Self {
             network_id: "agent-feed-mainnet".to_string(),
-            edge_domain: "https://edge.feed.aberration.technology".to_string(),
+            edge_domain: "https://api.feed.aberration.technology".to_string(),
             browser_app_base_url: "https://feed.aberration.technology".to_string(),
             github_callback_url: "https://feed.aberration.technology/callback/github".to_string(),
             bootstrap_peers: vec![
-                "/dns4/edge.feed.aberration.technology/tcp/7747".to_string(),
-                "/dns4/edge.feed.aberration.technology/udp/7747/quic-v1".to_string(),
-                "/dns4/edge.feed.aberration.technology/udp/443/webrtc-direct".to_string(),
+                "/dns4/api.feed.aberration.technology/tcp/7747".to_string(),
+                "/dns4/api.feed.aberration.technology/udp/7747/quic-v1".to_string(),
+                "/dns4/api.feed.aberration.technology/udp/443/webrtc-direct".to_string(),
             ],
             authority_id: "edge.feed".to_string(),
             org_policy: OrgDeploymentPolicy::from_env(),
@@ -1372,7 +1372,7 @@ mod tests {
         );
         assert_ne!(
             config.github_callback_url(),
-            "https://edge.feed.aberration.technology/callback/github"
+            "https://api.feed.aberration.technology/callback/github"
         );
     }
 

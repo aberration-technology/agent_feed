@@ -36,19 +36,13 @@ variable "browser_app_base_url" {
 variable "edge_domain_name" {
   description = "Public HTTPS hostname for the feed edge."
   type        = string
-  default     = "edge.feed.aberration.technology"
+  default     = "api.feed.aberration.technology"
 }
 
 variable "browser_app_pages_domain_target" {
   description = "GitHub Pages origin host used by the edge to fetch the browser shell."
   type        = string
   default     = "aberration-technology.github.io"
-}
-
-variable "browser_app_pages_base_path" {
-  description = "Path prefix for the GitHub Pages browser shell origin."
-  type        = string
-  default     = "/agent_feed"
 }
 
 variable "github_callback_url" {

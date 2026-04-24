@@ -127,7 +127,7 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Github {
-        #[arg(long, default_value = "https://edge.feed.aberration.technology")]
+        #[arg(long, default_value = "https://api.feed.aberration.technology")]
         edge: String,
         #[arg(long, default_value = "127.0.0.1:0")]
         callback_bind: SocketAddr,
@@ -317,7 +317,7 @@ enum EdgeCommand {
         bind: SocketAddr,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long, default_value = "https://edge.feed.aberration.technology")]
+        #[arg(long, default_value = "https://api.feed.aberration.technology")]
         edge_base_url: String,
         #[arg(long, default_value = "https://feed.aberration.technology")]
         browser_app_base_url: String,
