@@ -20,15 +20,16 @@ use agent_feed_summarize::{
     GuardrailPattern, ImageDecisionMode, ImageProcessorConfig, SummaryConfig, SummaryError,
     SummaryProcessorConfig, summarize_feed,
 };
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
@@ -37,8 +38,25 @@ const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
 #[command(name = "agent-feed")]
 #[command(about = "agent activity, reduced to signal")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        visible_alias = "log-filter",
+        default_value = "agent_feed=info,agent_feed_cli=info,tower_http=warn",
+        help = "tracing filter or level, for example debug or agent_feed=trace"
+    )]
+    log_level: String,
+    #[arg(long, global = true, value_enum, default_value = "compact")]
+    log_format: LogFormat,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum LogFormat {
+    Compact,
+    Pretty,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -340,12 +358,27 @@ enum CliError {
 
 #[tokio::main]
 async fn main() -> Result<(), CliError> {
-    tracing_subscriber::fmt()
-        .with_env_filter("agent_feed=info,tower_http=warn")
-        .init();
-
     let cli = Cli::parse();
-    match cli.command {
+    init_tracing(&cli.log_level, cli.log_format);
+
+    let command = command_name(&cli.command);
+    info!(
+        %command,
+        log_filter = %cli.log_level,
+        log_format = ?cli.log_format,
+        "cli command started"
+    );
+    let result = run_command(cli.command).await;
+    if let Err(err) = &result {
+        error!(%command, error = %err, "cli command failed");
+    } else {
+        debug!(%command, "cli command completed");
+    }
+    result
+}
+
+async fn run_command(command: Commands) -> Result<(), CliError> {
+    match command {
         Commands::Doctor => {
             let report = doctor_report();
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -376,6 +409,14 @@ async fn main() -> Result<(), CliError> {
                 ..SecurityConfig::default()
             };
             let p2p_enabled = p2p && !no_p2p;
+            info!(
+                %bind,
+                p2p_enabled,
+                p2p_requested = p2p,
+                no_p2p,
+                display_token_configured = security.display_token.is_some(),
+                "serving local feed"
+            );
             println!("serving http://{bind}/reel");
             if p2p_enabled {
                 println!("p2p browser discovery ux enabled");
@@ -387,6 +428,7 @@ async fn main() -> Result<(), CliError> {
             .await?;
         }
         Commands::Open { url } => {
+            info!(%url, "opening feed url");
             open_url(&url)?;
             println!("{url}");
         }
@@ -394,8 +436,18 @@ async fn main() -> Result<(), CliError> {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input)?;
             let path = endpoint_for_source(&source);
-            for payload in payloads_from_input(&input)? {
-                println!("{}", post_json(&server, path, &payload)?);
+            let payloads = payloads_from_input(&input)?;
+            info!(
+                %source,
+                %server,
+                endpoint = path,
+                payloads = payloads.len(),
+                bytes = input.len(),
+                "ingest forwarding payload batch"
+            );
+            for (index, payload) in payloads.iter().enumerate() {
+                debug!(%source, endpoint = path, index, bytes = payload.len(), "ingest payload outgoing");
+                println!("{}", post_json(&server, path, payload)?);
             }
         }
         Commands::Hook {
@@ -406,7 +458,18 @@ async fn main() -> Result<(), CliError> {
             let mut input = String::new();
             std::io::stdin().read_to_string(&mut input)?;
             let payload = hook_payload(&source, &event, &input);
-            let _ = post_json(&server, endpoint_for_source(&source), &payload);
+            let endpoint = endpoint_for_source(&source);
+            info!(
+                %source,
+                %event,
+                %server,
+                endpoint,
+                bytes = input.len(),
+                "hook forwarding event"
+            );
+            if let Err(err) = post_json(&server, endpoint, &payload) {
+                warn!(%source, %event, %server, endpoint, error = %err, "hook telemetry failed open");
+            }
         }
         Commands::Auth { command } => match command {
             AuthCommand::Github {
@@ -424,16 +487,26 @@ async fn main() -> Result<(), CliError> {
                         "github auth callback must bind to loopback".to_string(),
                     ));
                 }
+                info!(
+                    edge = %edge,
+                    callback_bind = %bind,
+                    timeout_secs,
+                    no_browser,
+                    print_url,
+                    "github cli auth starting"
+                );
                 let config = GithubCliAuthConfig {
                     edge_base_url: edge.clone(),
                     callback_bind,
                     ..GithubCliAuthConfig::default()
                 };
                 let start = begin_cli_login(&config, bind)?;
+                debug!(authorize_url = %start.authorize_url, callback_url = %start.callback_url, "github auth url prepared");
                 if print_url || no_browser {
                     println!("{}", start.authorize_url);
                 }
                 if !no_browser && let Err(err) = open_url(&start.authorize_url) {
+                    warn!(error = %err, "failed to open browser for github auth");
                     eprintln!("agent-feed: failed to open browser: {err}");
                     eprintln!("agent-feed: open this URL manually:");
                     eprintln!("{}", start.authorize_url);
@@ -459,6 +532,12 @@ async fn main() -> Result<(), CliError> {
                 };
                 let store = GithubSessionStore::new(auth_store_path(store));
                 store.save(&session)?;
+                info!(
+                    github_login = %session.login,
+                    github_user_id = session.github_user_id,
+                    expires_at = %session.expires_at,
+                    "github cli auth completed"
+                );
                 println!(
                     "github auth: @{} github:{} expires {}",
                     session.login, session.github_user_id, session.expires_at
@@ -468,6 +547,12 @@ async fn main() -> Result<(), CliError> {
                 let store = GithubSessionStore::new(auth_store_path(store));
                 match store.load()? {
                     Some(session) => {
+                        info!(
+                            github_login = %session.login,
+                            github_user_id = session.github_user_id,
+                            expired = session.is_expired_at(time::OffsetDateTime::now_utc()),
+                            "github auth status loaded"
+                        );
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&json!({
@@ -483,6 +568,7 @@ async fn main() -> Result<(), CliError> {
                         );
                     }
                     None => {
+                        info!("github auth status signed out");
                         println!("github auth: signed out");
                     }
                 }
@@ -490,8 +576,10 @@ async fn main() -> Result<(), CliError> {
             AuthCommand::Logout { store } => {
                 let store = GithubSessionStore::new(auth_store_path(store));
                 if store.delete()? {
+                    info!("github auth session deleted");
                     println!("github auth: signed out");
                 } else {
+                    info!("github auth logout requested while signed out");
                     println!("github auth: already signed out");
                 }
             }
@@ -508,6 +596,16 @@ async fn main() -> Result<(), CliError> {
                 let history = history.unwrap_or_else(default_codex_history);
                 let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
                 let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
+                info!(
+                    sessions_requested = sessions,
+                    sessions_found = paths.len(),
+                    %server,
+                    watch,
+                    poll_ms,
+                    history = %history.display(),
+                    sessions_dir = %sessions_dir.display(),
+                    "codex active session capture starting"
+                );
                 if watch {
                     watch_codex_sessions(&server, &paths, poll_ms)?;
                 } else {
@@ -515,6 +613,7 @@ async fn main() -> Result<(), CliError> {
                 }
             }
             CodexCommand::Import { paths, server } => {
+                info!(sessions = paths.len(), %server, "codex transcript import starting");
                 import_codex_sessions(&server, &paths)?;
             }
             CodexCommand::Stories {
@@ -525,6 +624,11 @@ async fn main() -> Result<(), CliError> {
                 let history = history.unwrap_or_else(default_codex_history);
                 let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
                 let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
+                info!(
+                    sessions_requested = sessions,
+                    sessions_found = paths.len(),
+                    "codex story compilation starting"
+                );
                 let stories = compile_codex_stories(&paths)?;
                 print_stories("codex", &paths, &stories)?;
             }
@@ -539,6 +643,15 @@ async fn main() -> Result<(), CliError> {
             } => {
                 let projects_dir = projects_dir.unwrap_or_else(default_claude_projects_dir);
                 let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                info!(
+                    sessions_requested = sessions,
+                    sessions_found = paths.len(),
+                    %server,
+                    watch,
+                    poll_ms,
+                    projects_dir = %projects_dir.display(),
+                    "claude active session capture starting"
+                );
                 if watch {
                     watch_claude_sessions(&server, &paths, poll_ms)?;
                 } else {
@@ -546,11 +659,13 @@ async fn main() -> Result<(), CliError> {
                 }
             }
             ClaudeCommand::Import { paths, server } => {
+                info!(sessions = paths.len(), %server, "claude stream import starting");
                 import_claude_sessions(&server, &paths)?;
             }
             ClaudeCommand::Stream { server } => {
                 let mut input = String::new();
                 std::io::stdin().read_to_string(&mut input)?;
+                info!(%server, bytes = input.len(), "claude stream stdin import starting");
                 let imported = import_claude_stream_input(&server, Path::new("<stdin>"), &input);
                 println!("claude stream imported: {imported} events from stdin");
             }
@@ -560,12 +675,18 @@ async fn main() -> Result<(), CliError> {
             } => {
                 let projects_dir = projects_dir.unwrap_or_else(default_claude_projects_dir);
                 let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                info!(
+                    sessions_requested = sessions,
+                    sessions_found = paths.len(),
+                    "claude story compilation starting"
+                );
                 let stories = compile_claude_stories(&paths)?;
                 print_stories("claude", &paths, &stories)?;
             }
         },
         Commands::P2p { command } => match command {
             P2pCommand::Init => {
+                info!("p2p config init requested");
                 println!("p2p config initialized: p2p.enabled=false, publish.enabled=false");
             }
             P2pCommand::Join {
@@ -580,18 +701,28 @@ async fn main() -> Result<(), CliError> {
                         "agent-feed-custom".to_string()
                     }
                 });
+                info!(
+                    %network,
+                    %network_id,
+                    bootstrap_peers = bootstrap.len(),
+                    "p2p join staged"
+                );
                 println!("p2p join staged: network={network} network_id={network_id}");
                 for peer in bootstrap {
+                    debug!(bootstrap_peer = %peer, "p2p bootstrap peer configured");
                     println!("bootstrap {peer}");
                 }
             }
             P2pCommand::Status => {
+                info!("p2p status requested");
                 println!("p2p disabled; local reel is authoritative until agent-feed serve --p2p");
             }
             P2pCommand::Peers => {
+                info!("p2p peers requested");
                 println!("no native p2p runtime is running in this process");
             }
             P2pCommand::Doctor => {
+                info!("p2p doctor requested");
                 println!("p2p doctor: story capsule protocol ok; native transport not started");
             }
             P2pCommand::Discover {
@@ -603,6 +734,15 @@ async fn main() -> Result<(), CliError> {
                 explain,
             } => {
                 let query = discover_query(all, streams.as_deref());
+                info!(
+                    %provider,
+                    %target,
+                    all,
+                    streams = streams.as_deref().unwrap_or(""),
+                    team = team.as_deref().unwrap_or(""),
+                    explain,
+                    "p2p discovery query compiled"
+                );
                 match provider.as_str() {
                     "github" => {
                         let route = RemoteUserRoute::parse(&format!("/{target}"), Some(&query))?;
@@ -684,6 +824,13 @@ async fn main() -> Result<(), CliError> {
                 github_team,
             } => {
                 let visibility = parse_visibility(&visibility);
+                info!(
+                    feed_name = %feed,
+                    visibility = ?visibility,
+                    github_org = github_org.as_deref().unwrap_or(""),
+                    github_team = github_team.as_deref().unwrap_or(""),
+                    "p2p share staged"
+                );
                 println!("p2p share staged: feed_name={feed} visibility={visibility:?}");
                 if let Some(org) = github_org {
                     println!("github_org={org}");
@@ -694,9 +841,11 @@ async fn main() -> Result<(), CliError> {
                 println!("raw_events=false summary_only=true encrypt_private_feeds=true");
             }
             P2pCommand::Pause => {
+                info!("p2p publish pause requested");
                 println!("p2p publish paused");
             }
             P2pCommand::Resume => {
+                info!("p2p publish resume requested");
                 println!("p2p publish resumed");
             }
             P2pCommand::Publish {
@@ -723,12 +872,23 @@ async fn main() -> Result<(), CliError> {
                 allow_remote_image_urls,
             } => {
                 if !dry_run {
+                    warn!(feed_name = %feed, "p2p publish rejected because dry-run is required");
                     return Err(CliError::Http(
                         "p2p publish requires --dry-run until a native runtime is configured"
                             .to_string(),
                     ));
                 }
                 let selected_agents = parse_agent_list(&agents);
+                info!(
+                    feed_name = %feed,
+                    agents = %agents,
+                    selected_agents = ?selected_agents,
+                    sessions,
+                    summarizer = %summarizer,
+                    per_story,
+                    images,
+                    "p2p publish dry-run capture starting"
+                );
                 let mut captured_paths = Vec::new();
                 let mut stories = Vec::new();
                 if selected_agents.contains("codex") {
@@ -762,6 +922,15 @@ async fn main() -> Result<(), CliError> {
                     allow_remote_image_urls,
                 })?;
                 let capsules = signed_capsules(&feed, &stories, &summary_config)?;
+                info!(
+                    feed_name = %feed,
+                    capsules = capsules.len(),
+                    stories = stories.len(),
+                    local_agent_sessions = captured_paths.len(),
+                    processor = ?summary_config.processor,
+                    image_enabled = summary_config.image.enabled,
+                    "p2p publish dry-run summarized"
+                );
                 println!(
                     "p2p publish dry-run: feed_name={} capsules={} stories={} local_agent_sessions={}",
                     feed,
@@ -771,6 +940,14 @@ async fn main() -> Result<(), CliError> {
                 );
                 println!("logical feed bundle: all selected agent sessions publish under {feed}");
                 for capsule in capsules.iter().take(8) {
+                    debug!(
+                        feed_id = %capsule.value.feed_id,
+                        capsule_id = %capsule.value.capsule_id,
+                        seq = capsule.value.seq,
+                        score = capsule.value.score,
+                        story_kind = ?capsule.value.story_kind,
+                        "p2p capsule outgoing dry-run"
+                    );
                     println!("{}", serde_json::to_string(capsule)?);
                 }
             }
@@ -788,6 +965,14 @@ async fn main() -> Result<(), CliError> {
                     .trim_start_matches("https://")
                     .trim_start_matches("http://")
                     .trim_end_matches('/');
+                info!(
+                    %bind,
+                    edge_base_url = %edge_base_url,
+                    browser_app_base_url = %browser_app_base_url,
+                    github_callback_url = %github_callback_url,
+                    network_id = %network_id,
+                    "edge server starting"
+                );
                 let edge = EdgeConfig {
                     network_id,
                     edge_domain: edge_base_url.clone(),
@@ -809,10 +994,12 @@ async fn main() -> Result<(), CliError> {
                 .await?;
             }
             EdgeCommand::Health => {
+                info!("edge health command requested");
                 println!("feed edge: healthz=/healthz readyz=/readyz");
             }
         },
         Commands::Uninstall { restore_hooks } => {
+            info!(restore_hooks, "uninstall requested");
             if restore_hooks {
                 println!("restore-hooks requested; no installed hook manifest exists yet");
             } else {
@@ -821,6 +1008,87 @@ async fn main() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn init_tracing(filter: &str, format: LogFormat) {
+    let ansi = std::io::stderr().is_terminal();
+    match format {
+        LogFormat::Compact => tracing_subscriber::fmt()
+            .compact()
+            .with_ansi(ansi)
+            .with_target(true)
+            .with_env_filter(log_filter(filter))
+            .init(),
+        LogFormat::Pretty => tracing_subscriber::fmt()
+            .pretty()
+            .with_ansi(ansi)
+            .with_target(true)
+            .with_env_filter(log_filter(filter))
+            .init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_ansi(false)
+            .with_current_span(false)
+            .with_env_filter(log_filter(filter))
+            .init(),
+    }
+}
+
+fn log_filter(filter: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_new(filter)
+        .or_else(|_| {
+            tracing_subscriber::EnvFilter::try_new(format!("agent_feed={filter},tower_http=warn"))
+        })
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new(
+                "agent_feed=info,agent_feed_cli=info,tower_http=warn",
+            )
+        })
+}
+
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Doctor => "doctor",
+        Commands::Init { .. } => "init",
+        Commands::Serve { .. } => "serve",
+        Commands::Open { .. } => "open",
+        Commands::Ingest { .. } => "ingest",
+        Commands::Hook { .. } => "hook",
+        Commands::Auth { command } => match command {
+            AuthCommand::Github { .. } => "auth.github",
+            AuthCommand::Status { .. } => "auth.status",
+            AuthCommand::Logout { .. } => "auth.logout",
+        },
+        Commands::Codex { command } => match command {
+            CodexCommand::Active { .. } => "codex.active",
+            CodexCommand::Import { .. } => "codex.import",
+            CodexCommand::Stories { .. } => "codex.stories",
+        },
+        Commands::Claude { command } => match command {
+            ClaudeCommand::Active { .. } => "claude.active",
+            ClaudeCommand::Import { .. } => "claude.import",
+            ClaudeCommand::Stream { .. } => "claude.stream",
+            ClaudeCommand::Stories { .. } => "claude.stories",
+        },
+        Commands::P2p { command } => match command {
+            P2pCommand::Init => "p2p.init",
+            P2pCommand::Join { .. } => "p2p.join",
+            P2pCommand::Status => "p2p.status",
+            P2pCommand::Peers => "p2p.peers",
+            P2pCommand::Doctor => "p2p.doctor",
+            P2pCommand::Discover { .. } => "p2p.discover",
+            P2pCommand::Share { .. } => "p2p.share",
+            P2pCommand::Pause => "p2p.pause",
+            P2pCommand::Resume => "p2p.resume",
+            P2pCommand::Publish { .. } => "p2p.publish",
+        },
+        Commands::Edge { command } => match command {
+            EdgeCommand::Serve { .. } => "edge.serve",
+            EdgeCommand::Health => "edge.health",
+        },
+        Commands::Uninstall { .. } => "uninstall",
+    }
 }
 
 fn discover_query(all: bool, streams: Option<&str>) -> String {
@@ -893,6 +1161,23 @@ mod tests {
 
         assert!(error.to_string().contains("invalid feed label"));
     }
+
+    #[test]
+    fn global_logging_options_parse_for_subcommands() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "--log-level",
+            "debug",
+            "--log-format",
+            "json",
+            "p2p",
+            "status",
+        ])
+        .expect("logging flags parse");
+
+        assert_eq!(cli.log_level, "debug");
+        assert_eq!(cli.log_format, LogFormat::Json);
+    }
 }
 
 fn endpoint_for_source(source: &str) -> &'static str {
@@ -953,6 +1238,12 @@ fn import_codex_sessions(server: &str, paths: &[PathBuf]) -> Result<(), CliError
         let mut state = TranscriptState::default();
         let file_events = import_codex_chunk(server, path, &input, &mut state);
         imported += file_events;
+        info!(
+            path = %path.display(),
+            events = file_events,
+            total_events = imported,
+            "codex transcript imported"
+        );
         println!(
             "codex transcript imported: {} events from {}",
             file_events,
@@ -982,6 +1273,12 @@ fn import_claude_sessions(server: &str, paths: &[PathBuf]) -> Result<(), CliErro
         let input = fs::read_to_string(path)?;
         let file_events = import_claude_stream_input(server, path, &input);
         imported += file_events;
+        info!(
+            path = %path.display(),
+            events = file_events,
+            total_events = imported,
+            "claude stream imported"
+        );
         println!(
             "claude stream imported: {} events from {}",
             file_events,
@@ -1013,6 +1310,12 @@ fn collect_codex_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
         let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "codex transcript parse failed"
+                );
                 eprintln!(
                     "agent-feed: failed to parse codex transcript line {} in {}: {err}",
                     index + 1,
@@ -1041,6 +1344,12 @@ fn collect_claude_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
         let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "claude stream parse failed"
+                );
                 eprintln!(
                     "agent-feed: failed to parse claude stream line {} in {}: {err}",
                     index + 1,
@@ -1066,6 +1375,12 @@ fn print_stories(
         stories.len(),
         paths.len()
     );
+    info!(
+        %agent,
+        stories = stories.len(),
+        sessions = paths.len(),
+        "stories compiled"
+    );
     for story in stories {
         println!("{}", serde_json::to_string(story)?);
     }
@@ -1079,6 +1394,12 @@ fn signed_capsules(
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
     let feed_id = format!("local:{feed}");
     let summaries = summarize_feed(&feed_id, stories, summary_config)?;
+    info!(
+        %feed_id,
+        stories = stories.len(),
+        summaries = summaries.len(),
+        "feed stories summarized"
+    );
     summaries
         .iter()
         .enumerate()
@@ -1209,6 +1530,13 @@ fn watch_codex_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Result
         let mut state = TranscriptState::default();
         let imported = import_codex_chunk(server, path, &input, &mut state);
         let offset = fs::metadata(path)?.len();
+        info!(
+            path = %path.display(),
+            initial_events = imported,
+            offset,
+            poll_ms,
+            "codex transcript watcher started"
+        );
         println!(
             "codex transcript watching: {} ({} initial events)",
             path.display(),
@@ -1238,6 +1566,12 @@ fn watch_codex_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Result
             let complete = split_complete_jsonl(&mut watcher.pending);
             let imported = import_codex_chunk(server, &watcher.path, &complete, &mut watcher.state);
             if imported > 0 {
+                info!(
+                    path = %watcher.path.display(),
+                    events = imported,
+                    offset = watcher.offset,
+                    "codex transcript appended events imported"
+                );
                 println!(
                     "codex transcript imported: {} appended events from {}",
                     imported,
@@ -1264,6 +1598,12 @@ fn import_codex_chunk(
         let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "codex transcript parse failed during import"
+                );
                 eprintln!(
                     "agent-feed: failed to parse codex transcript line {} in {}: {err}",
                     index + 1,
@@ -1279,6 +1619,11 @@ fn import_codex_chunk(
         let body = match serde_json::to_string(&event) {
             Ok(body) => body,
             Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "codex event encode failed"
+                );
                 eprintln!(
                     "agent-feed: failed to encode codex event from {}: {err}",
                     path.display()
@@ -1287,12 +1632,26 @@ fn import_codex_chunk(
             }
         };
         if let Err(err) = post_json(server, "/ingest/codex/jsonl", &body) {
+            warn!(
+                path = %path.display(),
+                %server,
+                error = %err,
+                "codex event post failed"
+            );
             eprintln!(
                 "agent-feed: failed to post codex event from {}: {err}",
                 path.display()
             );
             continue;
         }
+        debug!(
+            path = %path.display(),
+            index,
+            event_id = %event.id,
+            kind = ?event.kind,
+            severity = ?event.severity,
+            "codex event outgoing"
+        );
         imported += 1;
     }
     imported
@@ -1305,6 +1664,13 @@ fn watch_claude_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Resul
         let mut state = ClaudeState::default();
         let imported = import_claude_chunk(server, path, &input, &mut state);
         let offset = fs::metadata(path)?.len();
+        info!(
+            path = %path.display(),
+            initial_events = imported,
+            offset,
+            poll_ms,
+            "claude stream watcher started"
+        );
         println!(
             "claude stream watching: {} ({} initial events)",
             path.display(),
@@ -1335,6 +1701,12 @@ fn watch_claude_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Resul
             let imported =
                 import_claude_chunk(server, &watcher.path, &complete, &mut watcher.state);
             if imported > 0 {
+                info!(
+                    path = %watcher.path.display(),
+                    events = imported,
+                    offset = watcher.offset,
+                    "claude stream appended events imported"
+                );
                 println!(
                     "claude stream imported: {} appended events from {}",
                     imported,
@@ -1361,6 +1733,12 @@ fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut Claud
         let value = match serde_json::from_str::<Value>(line) {
             Ok(value) => value,
             Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "claude stream parse failed during import"
+                );
                 eprintln!(
                     "agent-feed: failed to parse claude stream line {} in {}: {err}",
                     index + 1,
@@ -1376,6 +1754,11 @@ fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut Claud
         let body = match serde_json::to_string(&event) {
             Ok(body) => body,
             Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "claude event encode failed"
+                );
                 eprintln!(
                     "agent-feed: failed to encode claude event from {}: {err}",
                     path.display()
@@ -1384,12 +1767,26 @@ fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut Claud
             }
         };
         if let Err(err) = post_json(server, "/ingest/claude/stream-json", &body) {
+            warn!(
+                path = %path.display(),
+                %server,
+                error = %err,
+                "claude event post failed"
+            );
             eprintln!(
                 "agent-feed: failed to post claude event from {}: {err}",
                 path.display()
             );
             continue;
         }
+        debug!(
+            path = %path.display(),
+            index,
+            event_id = %event.id,
+            kind = ?event.kind,
+            severity = ?event.severity,
+            "claude event outgoing"
+        );
         imported += 1;
     }
     imported

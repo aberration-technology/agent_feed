@@ -48,4 +48,14 @@ mod tests {
         assert!(remote_state.contains("stopStageProgress();"));
         assert!(!remote_state.contains("restartStageProgress"));
     }
+
+    #[test]
+    fn browser_console_logs_feed_lifecycle_events() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("function logEvent"));
+        assert!(html.contains("feed.remote.route.start"));
+        assert!(html.contains("feed.resolver.response"));
+        assert!(html.contains("feed.sse.bulletin.incoming"));
+    }
 }

@@ -27,12 +27,55 @@ let controlsTimer = undefined;
 const githubAuthCallback = parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
 
+function logEvent(level, event, detail = {}) {
+  const payload = {
+    event,
+    ts: new Date().toISOString(),
+    ...normalizeLogDetail(detail),
+  };
+  const logger = console[level] || console.info;
+  logger.call(console, `[feed] ${event}`, payload);
+}
+
+function normalizeLogDetail(detail) {
+  if (!detail) {
+    return {};
+  }
+  if (detail instanceof Error) {
+    return {
+      error_name: detail.name,
+      error_message: detail.message,
+      error_stack: detail.stack,
+    };
+  }
+  if (detail instanceof Event) {
+    const target = detail.target || {};
+    return {
+      event_type: detail.type,
+      target_type: target.constructor?.name,
+      ready_state: target.readyState,
+    };
+  }
+  if (typeof detail === "object") {
+    return detail;
+  }
+  return { value: String(detail) };
+}
+
+function logDebug(event, detail) {
+  logEvent("debug", event, detail);
+}
+
+function logInfo(event, detail) {
+  logEvent("info", event, detail);
+}
+
 function logError(context, error) {
-  console.error(`[feed] ${context}`, error);
+  logEvent("error", context, error);
 }
 
 function logWarn(context, detail) {
-  console.warn(`[feed] ${context}`, detail || "");
+  logEvent("warn", context, detail);
 }
 
 function setText(node, value) {
@@ -96,6 +139,13 @@ function renderBulletin(bulletin) {
     return;
   }
 
+  logInfo("feed.bulletin.render", {
+    bulletin_id: bulletin.id,
+    mode: bulletin.mode,
+    priority: bulletin.priority,
+    dwell_ms: bulletin.dwell_ms || bulletin.dwellMs,
+    publisher: bulletin.publisher?.github_login || bulletin.feed_publisher?.github_login,
+  });
   showStage();
   document.body.dataset.mode = bulletin.mode || "dispatch";
   stage?.classList.add("is-changing");
@@ -217,6 +267,14 @@ function imagesEnabled() {
 }
 
 function renderRemoteState(route, state, lines = [], nextPublisher = undefined) {
+  logInfo("feed.remote.state", {
+    state,
+    login: route.login,
+    selection: route.selection,
+    feed_mode: route.feedMode,
+    network: route.network,
+    lines,
+  });
   showStage();
   document.body.dataset.mode = state === "failed" ? "breaking" : "dispatch";
   setText(liveState, state === "live" ? "LIVE" : "WAIT");
@@ -239,6 +297,12 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
 }
 
 function renderP2pDisabled(route) {
+  logInfo("feed.p2p.disabled", {
+    login: route.login,
+    selection: route.selection,
+    feed_mode: route.feedMode,
+    network: route.network,
+  });
   showStage();
   hideModeSwitcher();
   document.body.dataset.mode = "dispatch";
@@ -335,11 +399,13 @@ function applySnapshot(snapshot) {
 
 async function hydrate() {
   try {
+    logInfo("feed.snapshot.request", { url: "/api/reel/snapshot" });
     const response = await fetch("/api/reel/snapshot", { cache: "no-store" });
     if (!response.ok) {
       throw new Error(`snapshot failed: ${response.status}`);
     }
     applySnapshot(await response.json());
+    logInfo("feed.snapshot.applied", { bulletins: bulletins.length });
   } catch (error) {
     setText(liveState, "WAIT");
     stopStageProgress();
@@ -680,7 +746,7 @@ function handleGithubAuthCallback(callback) {
   window.localStorage.removeItem("feed.github.auth_state");
   window.localStorage.removeItem("agent_feed.github.auth_state");
   setText(deck, `signed in as @${callback.login}. returning to network.`);
-  console.info("[feed] github browser sign-in complete", {
+  logInfo("feed.github.signin.complete", {
     login: callback.login,
     github_user_id: callback.github_user_id,
   });
@@ -692,6 +758,11 @@ function handleGithubAuthCallback(callback) {
 function startNetworkView() {
   showStage();
   const session = storedGithubSession();
+  logInfo("feed.network.view", {
+    signed_in: Boolean(session),
+    login: session?.login,
+    edge_base_url: edgeBaseUrl(),
+  });
   document.body.dataset.mode = "dispatch";
   setText(liveState, session ? "AUTH" : "WAIT");
   setText(eyebrow, "FEED / NETWORK / GITHUB");
@@ -719,6 +790,14 @@ function startNetworkView() {
 }
 
 async function startRemoteRoute(route) {
+  logInfo("feed.remote.route.start", {
+    login: route.login,
+    selection: route.selection,
+    feed_mode: route.feedMode,
+    network: route.network,
+    interactive: route.interactive,
+    p2p_enabled: p2pEnabled(),
+  });
   if (!p2pEnabled()) {
     renderP2pDisabled(route);
     return;
@@ -740,9 +819,19 @@ async function startDiscoveryRoute(route) {
   ]);
   const endpoint = `${edgeBaseUrl()}/resolve/github/${encodeURIComponent(route.login)}${resolverQuery(route)}`;
   try {
+    logInfo("feed.resolver.request", {
+      login: route.login,
+      selection: route.selection,
+      endpoint,
+    });
     const response = await fetch(endpoint, {
       cache: "no-store",
       headers: githubAuthHeaders(),
+    });
+    logInfo("feed.resolver.response", {
+      login: route.login,
+      status: response.status,
+      ok: response.ok,
     });
     if (response.status === 404) {
       renderRemoteState(route, "not-found", ["github user not found"]);
@@ -750,7 +839,7 @@ async function startDiscoveryRoute(route) {
     }
     if (response.status === 401 || response.status === 403) {
       renderAuthRequired(route);
-      console.info("[feed] remote route requires github sign-in", {
+      logInfo("feed.remote.auth_required", {
         login: route.login,
         status: response.status,
       });
@@ -761,16 +850,26 @@ async function startDiscoveryRoute(route) {
     }
     const ticket = await response.json();
     const feedCount = ticket.feeds?.length || ticket.candidate_feeds?.length || 0;
+    logInfo("feed.discovery.ticket", {
+      login: ticket.profile?.login || route.login,
+      github_user_id: ticket.github_user_id || ticket.resolved_github_id,
+      feeds: feedCount,
+      expires_at: ticket.expires_at,
+    });
     if (feedCount === 0) {
       renderRemoteState(route, "no-feeds", [
         "github identity found",
         "no visible settled story streams",
       ], ticket.profile);
+      logInfo("feed.discovery.no_visible_streams", {
+        login: ticket.profile?.login || route.login,
+        github_user_id: ticket.github_user_id || ticket.resolved_github_id,
+      });
       return;
     }
     if (route.interactive) {
       renderTimeline(route, ticket);
-      console.info("[feed] remote timeline ready", {
+      logInfo("feed.timeline.ready", {
         selection: route.selection,
         feeds: feedCount,
       });
@@ -781,11 +880,6 @@ async function startDiscoveryRoute(route) {
       "searching mainnet",
       "connected · waiting for first story",
     ], ticket.profile);
-    console.info("[feed] remote discovery ticket", {
-      login: ticket.profile?.login || route.login,
-      github_user_id: ticket.github_user_id || ticket.resolved_github_id,
-      feeds: feedCount,
-    });
   } catch (error) {
     renderRemoteState(route, "failed", [
       "edge snapshot mode unavailable",
@@ -820,7 +914,7 @@ function startSubscribedRoute(route) {
   } else {
     stopStageProgress();
   }
-  console.info("[feed] subscribed mode selected", {
+  logInfo("feed.subscribed.selected", {
     network: route.network,
     subscriptions: targets,
   });
@@ -844,6 +938,13 @@ function renderTimeline(route, ticket) {
     renderRemoteState(route, "failed", ["timeline surface unavailable"]);
     return;
   }
+  const feeds = ticket.feeds || ticket.candidate_feeds || [];
+  logInfo("feed.timeline.render", {
+    login: ticket.profile?.login || route.login,
+    selection: route.selection,
+    feeds: feeds.length,
+    wildcard: route.feed === "*" || !route.feed,
+  });
   if (stage) {
     stage.hidden = true;
   }
@@ -855,7 +956,6 @@ function renderTimeline(route, ticket) {
   updateSourceCountFromFeeds(ticket.feeds || ticket.candidate_feeds || []);
   timeline.replaceChildren();
 
-  const feeds = ticket.feeds || ticket.candidate_feeds || [];
   const toolbar = document.createElement("div");
   toolbar.className = "timeline-toolbar";
   const label = document.createElement("span");
@@ -915,6 +1015,10 @@ function renderSubscribedTimeline(route, targets) {
     renderRemoteState(route, "failed", ["timeline surface unavailable"]);
     return;
   }
+  logInfo("feed.subscribed.timeline.render", {
+    network: route.network,
+    subscriptions: targets,
+  });
   if (stage) {
     stage.hidden = true;
   }
@@ -1052,10 +1156,11 @@ function updateSourceCountFromFeeds(feeds) {
 }
 
 function connectSse() {
+  logInfo("feed.sse.connecting", { url: "/events.sse" });
   const source = new EventSource("/events.sse");
   source.addEventListener("open", () => {
     setText(liveState, "LIVE");
-    console.info("[feed] sse connected");
+    logInfo("feed.sse.open", { ready_state: source.readyState });
   });
   source.addEventListener("error", (event) => {
     setText(liveState, "RETRY");
@@ -1068,6 +1173,13 @@ function connectSse() {
       if (!bulletin || !bulletin.id) {
         logWarn("sse bulletin missing id", envelope);
       }
+      logInfo("feed.sse.bulletin.incoming", {
+        bulletin_id: bulletin.id,
+        mode: bulletin.mode,
+        priority: bulletin.priority,
+        dwell_ms: bulletin.dwell_ms,
+        publisher: bulletin.publisher?.github_login || bulletin.feed_publisher?.github_login,
+      });
       bulletins.push(bulletin);
       bulletins = bulletins.slice(-12);
       activeIndex = bulletins.length - 1;

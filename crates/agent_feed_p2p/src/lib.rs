@@ -119,10 +119,18 @@ impl PeerNode {
             .or_insert_with(|| PeerParticipation::new(self));
         participation.roles.insert(PeerRole::Fabric);
         participation.roles.extend(roles);
+        let roles = participation.roles.clone();
         state
             .inboxes
             .entry(self.peer_id.clone())
             .or_insert_with(VecDeque::new);
+        tracing::info!(
+            network_id = %self.network_id,
+            peer_id = %self.peer_id,
+            principal = %self.principal,
+            roles = ?roles,
+            "p2p peer joined fabric"
+        );
         Ok(())
     }
 
@@ -142,23 +150,31 @@ impl PeerNode {
         participation.roles.insert(PeerRole::Fabric);
         participation.roles.insert(PeerRole::BrowserHandoff);
         participation.browser_handoff_addrs = addrs.into_iter().collect();
+        let addrs_len = participation.browser_handoff_addrs.len();
         state
             .inboxes
             .entry(self.peer_id.clone())
             .or_insert_with(VecDeque::new);
+        tracing::info!(
+            network_id = %self.network_id,
+            peer_id = %self.peer_id,
+            browser_handoff_addrs = addrs_len,
+            "p2p browser handoff registered"
+        );
         Ok(())
     }
 
     pub fn announce_feed(&self, profile: FeedProfile) -> Result<(), P2pError> {
+        let feed_id = profile.feed_id.clone();
+        let network_id = profile.network_id.clone();
+        let visibility = profile.visibility;
+        let topic = feed_topic(&profile.network_id, &profile.feed_id);
         let mut state = self
             .network
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
-        state.topics.insert(
-            profile.feed_id.clone(),
-            feed_topic(&profile.network_id, &profile.feed_id),
-        );
+        state.topics.insert(profile.feed_id.clone(), topic.clone());
         state.feeds.insert(profile.feed_id.clone(), profile);
         state
             .participants
@@ -170,6 +186,14 @@ impl PeerNode {
             .inboxes
             .entry(self.peer_id.clone())
             .or_insert_with(VecDeque::new);
+        tracing::info!(
+            network_id = %network_id,
+            peer_id = %self.peer_id,
+            %feed_id,
+            topic = %topic,
+            visibility = ?visibility,
+            "p2p feed announced"
+        );
         Ok(())
     }
 
@@ -181,8 +205,17 @@ impl PeerNode {
             return Err(P2pError::Directory(DirectoryError::AccessPolicyMismatch));
         }
         if entry.peer_id != self.peer_id {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                entry_peer_id = %entry.peer_id,
+                feed_id = %entry.feed_id,
+                "p2p directory announce rejected for mismatched peer"
+            );
             return Err(P2pError::SubscriptionDenied(entry.feed_id));
         }
+        let feed_id = entry.feed_id.clone();
+        let github_user_id = entry.owner.github_user_id;
+        let feed_label = entry.feed_label.clone();
         let mut state = self
             .network
             .state
@@ -195,6 +228,13 @@ impl PeerNode {
             .or_insert_with(|| PeerParticipation::new(self))
             .roles
             .insert(PeerRole::KadProvider);
+        tracing::info!(
+            peer_id = %self.peer_id,
+            %feed_id,
+            %feed_label,
+            github_user_id = ?github_user_id,
+            "p2p directory entry announced"
+        );
         Ok(())
     }
 
@@ -205,6 +245,8 @@ impl PeerNode {
         if !entry.access_matches_visibility() {
             return Err(P2pError::Directory(DirectoryError::AccessPolicyMismatch));
         }
+        let feed_id = entry.feed_id.clone();
+        let github_user_id = entry.owner.github_user_id;
         let mut state = self
             .network
             .state
@@ -221,6 +263,12 @@ impl PeerNode {
             .inboxes
             .entry(self.peer_id.clone())
             .or_insert_with(VecDeque::new);
+        tracing::debug!(
+            peer_id = %self.peer_id,
+            %feed_id,
+            github_user_id = ?github_user_id,
+            "p2p directory entry cached"
+        );
         Ok(())
     }
 
@@ -240,6 +288,14 @@ impl PeerNode {
                 teams: teams.into_iter().collect(),
             },
         );
+        if let Some(access) = state.org_access.get(&self.peer_id) {
+            tracing::info!(
+                peer_id = %self.peer_id,
+                org = %access.org,
+                teams = ?access.teams,
+                "p2p github org access certified"
+            );
+        }
         Ok(())
     }
 
@@ -252,11 +308,18 @@ impl PeerNode {
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
-        Ok(state
+        let entries: Vec<_> = state
             .directory
             .get(&github_user_id)
             .map(|entries| entries.values().cloned().collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        tracing::debug!(
+            peer_id = %self.peer_id,
+            github_user_id = ?github_user_id,
+            feeds = entries.len(),
+            "p2p github user discovery completed"
+        );
+        Ok(entries)
     }
 
     pub fn discover_github_org(
@@ -268,11 +331,18 @@ impl PeerNode {
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
-        Ok(state
+        let entries: Vec<_> = state
             .org_directory
             .get(org)
             .map(|entries| entries.values().cloned().collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        tracing::debug!(
+            peer_id = %self.peer_id,
+            org = %org,
+            feeds = entries.len(),
+            "p2p github org discovery completed"
+        );
+        Ok(entries)
     }
 
     pub fn discover_github_team(
@@ -285,11 +355,19 @@ impl PeerNode {
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
-        Ok(state
+        let entries: Vec<_> = state
             .team_directory
             .get(&(org.clone(), team.clone()))
             .map(|entries| entries.values().cloned().collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        tracing::debug!(
+            peer_id = %self.peer_id,
+            org = %org,
+            team = %team,
+            feeds = entries.len(),
+            "p2p github team discovery completed"
+        );
+        Ok(entries)
     }
 
     pub fn follow(&self, feed_id: &str) -> Result<(), P2pError> {
@@ -304,8 +382,15 @@ impl PeerNode {
             .ok_or_else(|| P2pError::FeedNotFound(feed_id.to_string()))?;
         let allowed = state.can_follow(self, feed_id, profile.visibility);
         if !allowed {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                %feed_id,
+                visibility = ?profile.visibility,
+                "p2p follow denied"
+            );
             return Err(P2pError::SubscriptionDenied(feed_id.to_string()));
         }
+        let visibility = profile.visibility;
         state
             .subscriptions
             .entry(feed_id.to_string())
@@ -321,6 +406,12 @@ impl PeerNode {
             .inboxes
             .entry(self.peer_id.clone())
             .or_insert_with(VecDeque::new);
+        tracing::info!(
+            peer_id = %self.peer_id,
+            %feed_id,
+            visibility = ?visibility,
+            "p2p feed followed"
+        );
         Ok(())
     }
 
@@ -335,16 +426,34 @@ impl PeerNode {
             .get(feed_id)
             .ok_or_else(|| P2pError::FeedNotFound(feed_id.to_string()))?;
         if profile.peer_id != self.peer_id {
+            tracing::warn!(
+                publisher_peer_id = %self.peer_id,
+                feed_owner_peer_id = %profile.peer_id,
+                %feed_id,
+                "p2p subscription grant denied for non-owner"
+            );
             return Err(P2pError::SubscriptionDenied(feed_id.to_string()));
         }
         state
             .grants
             .insert((feed_id.to_string(), subscriber.peer_id.clone()));
+        tracing::info!(
+            publisher_peer_id = %self.peer_id,
+            subscriber_peer_id = %subscriber.peer_id,
+            %feed_id,
+            "p2p subscription granted"
+        );
         Ok(())
     }
 
     pub fn publish_capsule(&self, signed: Signed<StoryCapsule>) -> Result<usize, P2pError> {
         if !signed.verify_capsule()? {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                feed_id = %signed.value.feed_id,
+                capsule_id = %signed.value.capsule_id,
+                "p2p capsule signature rejected"
+            );
             return Err(P2pError::InvalidSignature);
         }
         let mut state = self
@@ -357,13 +466,33 @@ impl PeerNode {
             .get(&signed.value.feed_id)
             .ok_or_else(|| P2pError::FeedNotFound(signed.value.feed_id.clone()))?;
         if profile.peer_id != self.peer_id {
+            tracing::warn!(
+                publisher_peer_id = %self.peer_id,
+                feed_owner_peer_id = %profile.peer_id,
+                feed_id = %signed.value.feed_id,
+                capsule_id = %signed.value.capsule_id,
+                "p2p capsule publish denied for non-owner"
+            );
             return Err(P2pError::SubscriptionDenied(signed.value.feed_id.clone()));
         }
         let visibility = profile.visibility;
         let feed_id = signed.value.feed_id.clone();
+        let capsule_id = signed.value.capsule_id.clone();
+        let seq = signed.value.seq;
+        let score = signed.value.score;
+        let story_kind = signed.value.story_kind;
         let history_capacity = state.history_capacity;
         let history = state.history.entry(feed_id.clone()).or_default();
         if capsule_is_duplicate(history, &signed.value) {
+            tracing::debug!(
+                publisher_peer_id = %self.peer_id,
+                %feed_id,
+                %capsule_id,
+                seq,
+                score,
+                story_kind = ?story_kind,
+                "p2p capsule suppressed as duplicate"
+            );
             return Ok(0);
         }
         history.push_back(signed.clone());
@@ -387,6 +516,17 @@ impl PeerNode {
                 .push_back(signed.clone());
             delivered += 1;
         }
+        tracing::info!(
+            publisher_peer_id = %self.peer_id,
+            %feed_id,
+            %capsule_id,
+            seq,
+            score,
+            story_kind = ?story_kind,
+            delivered,
+            visibility = ?visibility,
+            "p2p capsule published"
+        );
         Ok(delivered)
     }
 
@@ -401,11 +541,19 @@ impl PeerNode {
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
         if !state.feeds.contains_key(feed_id) {
+            tracing::warn!(peer_id = %self.peer_id, %feed_id, "p2p snapshot requested for unknown feed");
             return Err(P2pError::FeedNotFound(feed_id.to_string()));
         }
         let history = state.history.get(feed_id).cloned().unwrap_or_default();
         let keep = limit.min(history.len());
         let skip = history.len().saturating_sub(keep);
+        tracing::debug!(
+            peer_id = %self.peer_id,
+            %feed_id,
+            requested_limit = limit,
+            returned = keep,
+            "p2p feed snapshot served"
+        );
         Ok(history.into_iter().skip(skip).collect())
     }
 
@@ -419,7 +567,13 @@ impl PeerNode {
             .inboxes
             .entry(self.peer_id.clone())
             .or_insert_with(VecDeque::new);
-        Ok(inbox.drain(..).collect())
+        let drained: Vec<_> = inbox.drain(..).collect();
+        tracing::debug!(
+            peer_id = %self.peer_id,
+            capsules = drained.len(),
+            "p2p inbox drained"
+        );
+        Ok(drained)
     }
 
     pub fn known_peers(&self) -> Result<Vec<PeerIdString>, P2pError> {
