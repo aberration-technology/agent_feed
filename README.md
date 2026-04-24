@@ -28,22 +28,26 @@ raw prompt/output/diff display.
 
 ```sh
 cargo install agent_feed_cli --locked
-agent-feed init --auto
 agent-feed serve
-agent-feed open
 ```
 
-the local feed is served at:
+the package is `agent_feed_cli`. the installed binary is `agent-feed`.
+
+`serve` starts the local daemon and prints the display URL:
 
 ```text
 http://127.0.0.1:7777/reel
 ```
 
-for active local sessions:
+that is the happy path. `agent-feed init --auto` is optional setup for hooks,
+shims, and future sessions. `agent-feed open` only opens the display URL in a
+browser.
+
+to attach active local sessions, run one of these in another shell:
 
 ```sh
-agent-feed codex active --sessions 2 --watch
-agent-feed claude active --sessions 2 --watch
+agent-feed codex active --watch --workspace .
+agent-feed claude active --watch --workspace .
 ```
 
 to opt in only one workspace, add `--workspace /path/to/repo` to the codex,
@@ -57,8 +61,8 @@ agent-feed codex import path/to/codex-session.jsonl
 agent-feed claude import path/to/claude-stream.jsonl
 ```
 
-that is enough for the normal local loop: start the daemon, attach future or
-active agent activity, and leave the browser feed open.
+the normal local loop is: start the daemon, attach agent activity when you want
+capture, and leave the browser feed open.
 
 ## safety boundary
 
