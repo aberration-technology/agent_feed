@@ -5,7 +5,7 @@ use agent_feed_auth_github::{
     parse_cli_callback_request,
 };
 use agent_feed_core::AgentEvent;
-use agent_feed_directory::RemoteUserRoute;
+use agent_feed_directory::{RemoteUserRoute, validate_logical_feed_label};
 use agent_feed_edge::{
     EdgeConfig, EdgeFabricConfig, EdgeServerConfig, OrgDeploymentPolicy, serve_http,
 };
@@ -220,7 +220,12 @@ enum P2pCommand {
         explain: bool,
     },
     Share {
-        #[arg(long, default_value = "workstation")]
+        #[arg(
+            long,
+            visible_aliases = ["feed-name", "feed-label"],
+            default_value = "workstation",
+            value_parser = parse_feed_arg,
+        )]
         feed: String,
         #[arg(long, default_value = "private")]
         visibility: String,
@@ -234,7 +239,12 @@ enum P2pCommand {
     Publish {
         #[arg(long)]
         dry_run: bool,
-        #[arg(long, default_value = "workstation")]
+        #[arg(
+            long,
+            visible_aliases = ["feed-name", "feed-label"],
+            default_value = "workstation",
+            value_parser = parse_feed_arg,
+        )]
         feed: String,
         #[arg(long, default_value_t = 2)]
         sessions: usize,
@@ -661,7 +671,7 @@ async fn main() -> Result<(), CliError> {
                 github_team,
             } => {
                 let visibility = parse_visibility(&visibility);
-                println!("p2p share staged: feed={feed} visibility={visibility:?}");
+                println!("p2p share staged: feed_name={feed} visibility={visibility:?}");
                 if let Some(org) = github_org {
                     println!("github_org={org}");
                 }
@@ -732,11 +742,13 @@ async fn main() -> Result<(), CliError> {
                 })?;
                 let capsules = signed_capsules(&feed, &stories, &summary_config)?;
                 println!(
-                    "p2p publish dry-run: {} summarized capsules from {} stories and {} local agent sessions",
+                    "p2p publish dry-run: feed_name={} capsules={} stories={} local_agent_sessions={}",
+                    feed,
                     capsules.len(),
                     stories.len(),
                     captured_paths.len()
                 );
+                println!("logical feed bundle: all selected agent sessions publish under {feed}");
                 for capsule in capsules.iter().take(8) {
                     println!("{}", serde_json::to_string(capsule)?);
                 }
@@ -797,6 +809,46 @@ fn discover_query(all: bool, streams: Option<&str>) -> String {
         format!("streams={streams}")
     } else {
         String::new()
+    }
+}
+
+fn parse_feed_arg(value: &str) -> Result<String, String> {
+    validate_logical_feed_label(value)
+        .map(|()| value.to_string())
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p2p_publish_accepts_feed_name_alias() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "p2p",
+            "publish",
+            "--dry-run",
+            "--feed-name",
+            "gpu-vm",
+        ])
+        .expect("feed-name alias parses");
+
+        let Commands::P2p {
+            command: P2pCommand::Publish { feed, .. },
+        } = cli.command
+        else {
+            panic!("expected p2p publish command");
+        };
+        assert_eq!(feed, "gpu-vm");
+    }
+
+    #[test]
+    fn p2p_share_rejects_invalid_feed_name_alias() {
+        let error = Cli::try_parse_from(["agent-feed", "p2p", "share", "--feed-name", ".env"])
+            .expect_err("invalid feed label is rejected");
+
+        assert!(error.to_string().contains("invalid feed label"));
     }
 }
 

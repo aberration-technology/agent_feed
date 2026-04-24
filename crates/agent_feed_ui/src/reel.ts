@@ -224,7 +224,6 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   clearAuthAction();
   renderChips([
     route.feedMode === "subscribed" ? "subscribed" : "discovery",
-    "story-only",
     route.network,
     "redacted",
   ]);
@@ -246,7 +245,7 @@ function renderP2pDisabled(route) {
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   clearAuthAction();
-  renderChips(["local", "no-p2p", "story-only", "redacted"]);
+  renderChips(["local", "no-p2p", "redacted"]);
   renderTicker(["start with --p2p or use the hosted p2p browser shell"]);
   restartStageProgress(30000);
 }
@@ -264,11 +263,24 @@ function renderChips(nextChips) {
     return;
   }
   chips.replaceChildren();
-  nextChips.slice(0, 5).forEach((chip) => {
-    const item = document.createElement("span");
-    item.textContent = typeof chip === "string" ? chip : chip.label;
-    chips.appendChild(item);
-  });
+  const seen = new Set();
+  nextChips
+    .map((chip) => (typeof chip === "string" ? chip : chip.label))
+    .filter(Boolean)
+    .filter((label) => {
+      const key = String(label).toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 4)
+    .forEach((label) => {
+      const item = document.createElement("span");
+      item.textContent = label;
+      chips.appendChild(item);
+    });
 }
 
 function renderTicker(items) {
@@ -790,7 +802,7 @@ function startSubscribedRoute(route) {
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   clearAuthAction();
-  renderChips(["subscribed", "explicit", "story-only", route.network, "redacted"]);
+  renderChips(["subscribed", "explicit", route.network, "redacted"]);
   renderTicker(targets.map((target) => `follow ${target}`));
   if (route.interactive) {
     renderSubscribedTimeline(route, targets);
@@ -867,14 +879,7 @@ function renderTimeline(route, ticket) {
     const copy = document.createElement("p");
     copy.textContent =
       "settled story capsules will appear here as a vertical feed. raw events remain unavailable.";
-    const chipsRow = document.createElement("div");
-    chipsRow.className = "chips";
-    for (const chip of ["story-only", "settled", "redacted", route.network]) {
-      const item = document.createElement("span");
-      item.textContent = chip;
-      chipsRow.appendChild(item);
-    }
-    card.append(meta, title, copy, timelineStatus(feed, route), chipsRow);
+    card.append(meta, title, copy, timelineStatus(feed, route));
     timeline.appendChild(card);
   }
   if (timeline.children.length === 1) {
@@ -938,17 +943,10 @@ function renderSubscribedTimeline(route, targets) {
     const copy = document.createElement("p");
     copy.textContent =
       "only explicitly subscribed settled story capsules appear here. discovery results are not mixed in.";
-    const chipsRow = document.createElement("div");
-    chipsRow.className = "chips";
-    for (const chip of ["subscribed", "explicit", "redacted", route.network]) {
-      const item = document.createElement("span");
-      item.textContent = chip;
-      chipsRow.appendChild(item);
-    }
     const status = document.createElement("div");
     status.className = "timeline-status";
     status.append(statusItem("target", target), statusItem("mode", "subscribed only"));
-    card.append(meta, title, copy, status, chipsRow);
+    card.append(meta, title, copy, status);
     timeline.appendChild(card);
   }
   renderTicker(["interactive subscribed timeline", "move mouse for mode switcher"]);

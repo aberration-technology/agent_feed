@@ -1287,7 +1287,7 @@ fn split_stream_labels(value: &str) -> Result<Vec<String>, DirectoryError> {
     Ok(labels)
 }
 
-fn validate_logical_feed_label(value: &str) -> Result<(), DirectoryError> {
+pub fn validate_logical_feed_label(value: &str) -> Result<(), DirectoryError> {
     if is_valid_logical_feed_label(value) {
         Ok(())
     } else {

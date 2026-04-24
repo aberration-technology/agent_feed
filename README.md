@@ -145,11 +145,11 @@ agent-feed p2p join mainnet
 agent-feed p2p discover github mosure --all --explain
 agent-feed p2p discover github-org aberration-technology --all --explain
 agent-feed p2p discover github-team aberration-technology --team release --all --explain
-agent-feed p2p share --feed workstation --visibility private
-agent-feed p2p share --feed release --visibility github_org --github-org aberration-technology
-agent-feed p2p share --feed release --visibility github_team --github-org aberration-technology --github-team release
+agent-feed p2p share --feed-name workstation --visibility private
+agent-feed p2p share --feed-name release --visibility github_org --github-org aberration-technology
+agent-feed p2p share --feed-name release --visibility github_team --github-org aberration-technology --github-team release
 agent-feed p2p publish --dry-run --agents codex,claude --sessions 2
-agent-feed p2p publish --dry-run --sessions 2 --per-story
+agent-feed p2p publish --dry-run --feed-name gpu-vm --sessions 2 --per-story
 agent-feed p2p publish --dry-run --summarizer codex-exec
 agent-feed p2p publish --dry-run --summarizer claude-code
 agent-feed p2p publish --dry-run --images --image-processor codex-exec
@@ -329,6 +329,16 @@ mosure/workstation
 mosure/release
 mosure/*
 ```
+
+the cli can name the local publisher bundle:
+
+```text
+agent-feed p2p publish --dry-run --feed-name gpu-vm --agents codex,claude
+```
+
+`--feed`, `--feed-name`, and `--feed-label` are aliases. all selected local
+agent sessions in that cli run publish under the same logical feed label, which
+keeps multiple workspaces, vms, and compute boxes easy to separate.
 
 `mosure/*` means all visible settled story streams for that github identity. it
 does not mean raw stream access.
@@ -525,6 +535,7 @@ peer_score = true
 
 [p2p.publish]
 enabled = false
+feed_name = "workstation"
 summary_only = true
 raw_events = false
 summarizer = "deterministic"
