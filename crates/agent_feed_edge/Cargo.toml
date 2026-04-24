@@ -26,7 +26,6 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["serde", "formatting"] }
 tokio = { workspace = true, features = ["net"] }
-tower-http = { workspace = true, features = ["cors"] }
 tracing = { workspace = true }
 
 [lints]

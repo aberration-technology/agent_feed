@@ -13,7 +13,7 @@ use agent_feed_p2p_proto::{
     github_user_topic,
 };
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -26,7 +26,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
-use tower_http::cors::{Any, CorsLayer};
 
 const SNAPSHOT_HEADLINE_LIMIT: usize = 64;
 type HmacSha256 = Hmac<Sha256>;
@@ -598,13 +597,7 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
         .route("/browser-seed", get(browser_seed))
         .route("/network/snapshot", get(network_snapshot))
         .route("/network/publish", post(network_publish))
-        .with_state(state)
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
-        );
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, "feed edge serving");
     axum::serve(listener, app).await?;
