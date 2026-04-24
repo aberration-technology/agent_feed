@@ -69,6 +69,25 @@ agent-feed claude import path/to/claude-stream.jsonl
 the normal local loop is: start the daemon, attach agent activity when you want
 capture, and leave the browser feed open.
 
+## p2p publishing
+
+p2p is opt-in. `serve --p2p` publishes settled, redacted story capsules to your
+github-backed feed, so it requires an edge-issued github session:
+
+```sh
+agent-feed serve --p2p --feed workstation
+```
+
+if you are not signed in, the CLI opens the github sign-in flow and waits for
+the loopback callback before publishing. if you are already signed in, it reuses
+the stored session.
+
+to join the p2p UX without publishing local stories:
+
+```sh
+agent-feed serve --p2p --no-publish
+```
+
 ## safety boundary
 
 raw prompts, secrets, absolute home paths, command output, and file diffs are

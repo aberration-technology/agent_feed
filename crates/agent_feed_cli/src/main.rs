@@ -80,6 +80,24 @@ enum Commands {
         p2p: bool,
         #[arg(long)]
         no_p2p: bool,
+        #[arg(long, default_value = "https://api.feed.aberration.technology")]
+        edge: String,
+        #[arg(long)]
+        auth_store: Option<PathBuf>,
+        #[arg(
+            long,
+            visible_aliases = ["feed-name", "feed-label"],
+            default_value = "workstation",
+            value_parser = parse_feed_arg,
+        )]
+        feed: String,
+        #[arg(
+            long,
+            help = "enable p2p discovery UI without publishing local stories"
+        )]
+        no_publish: bool,
+        #[arg(long, default_value_t = 30)]
+        publish_interval_secs: u64,
         #[arg(long, default_value = "codex,claude")]
         agents: String,
         #[arg(long, default_value_t = 4)]
@@ -473,6 +491,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             display_token_file,
             p2p,
             no_p2p,
+            edge,
+            auth_store,
+            feed,
+            no_publish,
+            publish_interval_secs,
             agents,
             sessions,
             workspace,
@@ -502,26 +525,53 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 display_token_configured = security.display_token.is_some(),
                 "serving local feed"
             );
+            let p2p_session = if p2p_enabled && !no_publish {
+                Some(ensure_publish_session(auth_store, &edge)?)
+            } else {
+                None
+            };
+            let serve_agents = agents.clone();
+            let workspace_filter = if all_workspaces {
+                info!("serve agent capture scanning all workspaces");
+                None
+            } else {
+                WorkspaceFilter::from_cli(workspace)?
+            };
             let capture = if no_agent_capture {
                 info!("agent transcript capture disabled for serve");
                 None
             } else {
-                let workspace_filter = if all_workspaces {
-                    info!("serve agent capture scanning all workspaces");
-                    None
-                } else {
-                    WorkspaceFilter::from_cli(workspace)?
-                };
                 Some(ServeAgentCapture {
                     agents,
                     sessions,
-                    workspace: workspace_filter,
+                    workspace: workspace_filter.clone(),
                     poll_ms,
                     codex_history,
                     codex_sessions_dir,
                     claude_projects_dir,
                 })
             };
+            let publisher = p2p_session.map(|session| ServeP2pPublisher {
+                edge,
+                session,
+                feed,
+                agents: capture
+                    .as_ref()
+                    .map(|capture| capture.agents.clone())
+                    .unwrap_or_else(|| serve_agents.clone()),
+                sessions,
+                workspace: workspace_filter,
+                codex_history: capture
+                    .as_ref()
+                    .and_then(|capture| capture.codex_history.clone()),
+                codex_sessions_dir: capture
+                    .as_ref()
+                    .and_then(|capture| capture.codex_sessions_dir.clone()),
+                claude_projects_dir: capture
+                    .as_ref()
+                    .and_then(|capture| capture.claude_projects_dir.clone()),
+                interval_secs: publish_interval_secs,
+            });
             serve_with_ready(
                 ServerConfig {
                     security,
@@ -530,12 +580,19 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 move |bind| {
                     println!("serving http://{bind}/reel");
                     if p2p_enabled {
-                        println!("p2p browser discovery ux enabled");
+                        if no_publish {
+                            println!("p2p browser discovery ux enabled; local feed publishing disabled");
+                        } else {
+                            println!("p2p publishing enabled; authenticated github feed publisher active");
+                        }
                     }
                     if let Some(capture) = capture {
                         start_serve_agent_capture(bind, capture);
                     } else {
                         println!("agent capture disabled; use `agent-feed codex active --watch` to attach manually");
+                    }
+                    if let Some(publisher) = publisher {
+                        start_serve_p2p_publisher(publisher);
                     }
                 },
             )
@@ -594,64 +651,15 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 print_url,
                 store,
             } => {
-                let listener = TcpListener::bind(callback_bind)?;
-                let bind = listener.local_addr()?;
-                if !bind.ip().is_loopback() {
-                    return Err(CliError::Http(
-                        "github auth callback must bind to loopback".to_string(),
-                    ));
-                }
-                info!(
-                    edge = %edge,
-                    callback_bind = %bind,
+                let session = run_github_login(GithubLoginOptions {
+                    edge,
+                    callback_bind,
                     timeout_secs,
                     no_browser,
                     print_url,
-                    "github cli auth starting"
-                );
-                let config = GithubCliAuthConfig {
-                    edge_base_url: edge.clone(),
-                    callback_bind,
-                    ..GithubCliAuthConfig::default()
-                };
-                let start = begin_cli_login(&config, bind)?;
-                debug!(authorize_url = %start.authorize_url, callback_url = %start.callback_url, "github auth url prepared");
-                if print_url || no_browser {
-                    println!("{}", start.authorize_url);
-                }
-                if !no_browser && let Err(err) = open_url(&start.authorize_url) {
-                    warn!(error = %err, "failed to open browser for github auth");
-                    eprintln!("agent-feed: failed to open browser: {err}");
-                    eprintln!("agent-feed: open this URL manually:");
-                    eprintln!("{}", start.authorize_url);
-                }
-                println!("waiting for github callback on {}", start.callback_url);
-                let (target, mut stream) =
-                    wait_for_github_callback(&listener, Duration::from_secs(timeout_secs))?;
-                let session = match parse_cli_callback_request(&target)
-                    .and_then(|callback| complete_cli_login(&start, callback, edge.clone()))
-                {
-                    Ok(session) => {
-                        write_auth_callback_response(&mut stream, true, "github sign-in complete")?;
-                        session
-                    }
-                    Err(err) => {
-                        let _ = write_auth_callback_response(
-                            &mut stream,
-                            false,
-                            "github sign-in failed",
-                        );
-                        return Err(CliError::Auth(err));
-                    }
-                };
-                let store = GithubSessionStore::new(auth_store_path(store));
-                store.save(&session)?;
-                info!(
-                    github_login = %session.login,
-                    github_user_id = session.github_user_id,
-                    expires_at = %session.expires_at,
-                    "github cli auth completed"
-                );
+                    store,
+                    reason: "github cli auth",
+                })?;
                 println!(
                     "github auth: @{} github:{} expires {}",
                     session.login, session.github_user_id, session.expires_at
@@ -1382,6 +1390,27 @@ struct ServeAgentCapture {
     claude_projects_dir: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+struct ServeP2pPublisher {
+    edge: String,
+    session: GithubAuthSession,
+    feed: String,
+    agents: String,
+    sessions: usize,
+    workspace: Option<WorkspaceFilter>,
+    codex_history: Option<PathBuf>,
+    codex_sessions_dir: Option<PathBuf>,
+    claude_projects_dir: Option<PathBuf>,
+    interval_secs: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ServePublishStats {
+    capsules: usize,
+    stories: usize,
+    sessions: usize,
+}
+
 fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
     let selected_agents = parse_agent_list(&capture.agents);
     let capture_codex = selected_agents.contains("codex");
@@ -1478,6 +1507,163 @@ where
         warn!(%agent, error = %err, "serve agent capture thread failed to start");
         eprintln!("agent-feed: failed to start {agent} capture: {err}");
     }
+}
+
+fn start_serve_p2p_publisher(publisher: ServeP2pPublisher) {
+    let result = std::thread::Builder::new()
+        .name("agent-feed-p2p-publish".to_string())
+        .spawn(move || {
+            let interval = Duration::from_secs(publisher.interval_secs.max(10));
+            let mut last_fingerprint = String::new();
+            loop {
+                match collect_serve_publish_capsules(&publisher) {
+                    Ok((capsules, stats)) if capsules.is_empty() => {
+                        debug!(
+                            feed_name = %publisher.feed,
+                            stories = stats.stories,
+                            local_agent_sessions = stats.sessions,
+                            "serve p2p publish skipped empty story set"
+                        );
+                    }
+                    Ok((capsules, stats)) => {
+                        let fingerprint = capsule_fingerprint(&capsules);
+                        if fingerprint == last_fingerprint {
+                            debug!(
+                                feed_name = %publisher.feed,
+                                capsules = capsules.len(),
+                                "serve p2p publish skipped unchanged capsule set"
+                            );
+                        } else {
+                            match publish_capsules_to_edge(
+                                &publisher.edge,
+                                &publisher.feed,
+                                capsules,
+                                &publisher.session,
+                            ) {
+                                Ok(()) => {
+                                    last_fingerprint = fingerprint;
+                                    info!(
+                                        feed_name = %publisher.feed,
+                                        capsules = stats.capsules,
+                                        stories = stats.stories,
+                                        local_agent_sessions = stats.sessions,
+                                        "serve p2p capsules published"
+                                    );
+                                    println!(
+                                        "p2p publish: feed_name={} capsules={} stories={} local_agent_sessions={}",
+                                        publisher.feed, stats.capsules, stats.stories, stats.sessions
+                                    );
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        feed_name = %publisher.feed,
+                                        error = %err,
+                                        "serve p2p publish failed"
+                                    );
+                                    eprintln!("agent-feed: p2p publish failed: {err}");
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            feed_name = %publisher.feed,
+                            error = %err,
+                            "serve p2p publish collection failed"
+                        );
+                        eprintln!("agent-feed: p2p publish collection failed: {err}");
+                    }
+                }
+                std::thread::sleep(interval);
+            }
+        });
+    if let Err(err) = result {
+        warn!(error = %err, "serve p2p publish thread failed to start");
+        eprintln!("agent-feed: failed to start p2p publisher: {err}");
+    }
+}
+
+fn collect_serve_publish_capsules(
+    publisher: &ServeP2pPublisher,
+) -> Result<(Vec<Signed<StoryCapsule>>, ServePublishStats), CliError> {
+    let selected_agents = parse_agent_list(&publisher.agents);
+    let mut captured_paths = Vec::new();
+    let mut stories = Vec::new();
+    if selected_agents.contains("codex") {
+        let history = publisher
+            .codex_history
+            .clone()
+            .unwrap_or_else(default_codex_history);
+        let sessions_dir = publisher
+            .codex_sessions_dir
+            .clone()
+            .unwrap_or_else(default_codex_sessions_dir);
+        let paths = active_codex_session_paths(
+            &history,
+            &sessions_dir,
+            publisher.sessions,
+            publisher.workspace.as_ref(),
+        )?;
+        stories.extend(compile_codex_stories(&paths, publisher.workspace.as_ref())?);
+        captured_paths.extend(paths);
+    }
+    if selected_agents.contains("claude") {
+        let projects_dir = publisher
+            .claude_projects_dir
+            .clone()
+            .unwrap_or_else(default_claude_projects_dir);
+        let paths = active_claude_session_paths(
+            &projects_dir,
+            publisher.sessions,
+            publisher.workspace.as_ref(),
+        )?;
+        stories.extend(compile_claude_stories(
+            &paths,
+            publisher.workspace.as_ref(),
+        )?);
+        captured_paths.extend(paths);
+    }
+    let summary_config = SummaryConfig::p2p_default();
+    let publisher_identity = PublisherIdentity::github(
+        publisher.session.github_user_id,
+        publisher.session.login.clone(),
+        publisher.session.name.clone(),
+        publisher.session.avatar_url.clone(),
+    );
+    let capsules = signed_capsules(
+        &publisher.feed,
+        &stories,
+        &summary_config,
+        Some(&publisher_identity),
+    )?;
+    let stats = ServePublishStats {
+        capsules: capsules.len(),
+        stories: stories.len(),
+        sessions: captured_paths.len(),
+    };
+    Ok((capsules, stats))
+}
+
+fn publish_capsules_to_edge(
+    edge: &str,
+    feed: &str,
+    capsules: Vec<Signed<StoryCapsule>>,
+    session: &GithubAuthSession,
+) -> Result<(), CliError> {
+    let body = serde_json::to_string(&json!({
+        "feed_name": feed,
+        "capsules": capsules,
+    }))?;
+    post_edge_json_with_bearer(edge, "/network/publish", &body, session)?;
+    Ok(())
+}
+
+fn capsule_fingerprint(capsules: &[Signed<StoryCapsule>]) -> String {
+    capsules
+        .iter()
+        .map(|capsule| capsule.value.content_hash.0.as_str())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 fn capture_scope_message(workspace: Option<&WorkspaceFilter>) -> String {
@@ -1797,6 +1983,9 @@ mod tests {
             agents,
             sessions,
             no_agent_capture,
+            no_publish,
+            publish_interval_secs,
+            feed,
             workspace,
             all_workspaces,
             ..
@@ -1808,6 +1997,9 @@ mod tests {
         assert_eq!(agents, "codex,claude");
         assert_eq!(sessions, 4);
         assert!(!no_agent_capture);
+        assert!(!no_publish);
+        assert_eq!(publish_interval_secs, 30);
+        assert_eq!(feed, "workstation");
         assert_eq!(workspace, Some(PathBuf::from(".")));
         assert!(!all_workspaces);
     }
@@ -1845,6 +2037,62 @@ mod tests {
         assert!(no_agent_capture);
         assert_eq!(workspace, Some(PathBuf::from("/tmp/agent-feed-workspace")));
         assert!(all_workspaces);
+    }
+
+    #[test]
+    fn serve_p2p_defaults_to_authenticated_publish() {
+        let cli = Cli::try_parse_from(["agent-feed", "serve", "--p2p"]).expect("serve p2p parses");
+
+        let Commands::Serve {
+            p2p,
+            no_p2p,
+            no_publish,
+            edge,
+            auth_store,
+            feed,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert!(p2p);
+        assert!(!no_p2p);
+        assert!(!no_publish);
+        assert_eq!(edge, "https://api.feed.aberration.technology");
+        assert_eq!(auth_store, None);
+        assert_eq!(feed, "workstation");
+    }
+
+    #[test]
+    fn serve_p2p_can_disable_publishing() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "serve",
+            "--p2p",
+            "--no-publish",
+            "--feed-name",
+            "release",
+            "--edge",
+            "https://edge.example",
+        ])
+        .expect("serve p2p no-publish parses");
+
+        let Commands::Serve {
+            p2p,
+            no_publish,
+            edge,
+            feed,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert!(p2p);
+        assert!(no_publish);
+        assert_eq!(edge, "https://edge.example");
+        assert_eq!(feed, "release");
     }
 
     #[test]
@@ -3059,6 +3307,115 @@ fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {
     }
 
     Err(CliError::Http(response))
+}
+
+struct GithubLoginOptions<'a> {
+    edge: String,
+    callback_bind: SocketAddr,
+    timeout_secs: u64,
+    no_browser: bool,
+    print_url: bool,
+    store: Option<PathBuf>,
+    reason: &'a str,
+}
+
+fn ensure_publish_session(
+    auth_store: Option<PathBuf>,
+    edge: &str,
+) -> Result<GithubAuthSession, CliError> {
+    match load_publish_session(auth_store.clone(), edge) {
+        Ok(session) => {
+            info!(
+                github_login = %session.login,
+                github_user_id = session.github_user_id,
+                edge = %edge,
+                "github publish auth session loaded"
+            );
+            println!(
+                "github auth: signed in as @{} github:{}",
+                session.login, session.github_user_id
+            );
+            Ok(session)
+        }
+        Err(err) => {
+            warn!(
+                edge = %edge,
+                error = %err,
+                "github publish auth required for p2p serve"
+            );
+            println!("github sign-in required for p2p publishing");
+            run_github_login(GithubLoginOptions {
+                edge: edge.to_string(),
+                callback_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                timeout_secs: 120,
+                no_browser: false,
+                print_url: false,
+                store: auth_store,
+                reason: "github auth required for p2p publishing",
+            })
+        }
+    }
+}
+
+fn run_github_login(options: GithubLoginOptions<'_>) -> Result<GithubAuthSession, CliError> {
+    let listener = TcpListener::bind(options.callback_bind)?;
+    let bind = listener.local_addr()?;
+    if !bind.ip().is_loopback() {
+        return Err(CliError::Http(
+            "github auth callback must bind to loopback".to_string(),
+        ));
+    }
+    info!(
+        edge = %options.edge,
+        callback_bind = %bind,
+        timeout_secs = options.timeout_secs,
+        no_browser = options.no_browser,
+        print_url = options.print_url,
+        reason = options.reason,
+        "github cli auth starting"
+    );
+    let config = GithubCliAuthConfig {
+        edge_base_url: options.edge.clone(),
+        callback_bind: options.callback_bind,
+        ..GithubCliAuthConfig::default()
+    };
+    let start = begin_cli_login(&config, bind)?;
+    debug!(authorize_url = %start.authorize_url, callback_url = %start.callback_url, "github auth url prepared");
+    if options.print_url || options.no_browser {
+        println!("{}", start.authorize_url);
+    }
+    if !options.no_browser
+        && let Err(err) = open_url(&start.authorize_url)
+    {
+        warn!(error = %err, "failed to open browser for github auth");
+        eprintln!("agent-feed: failed to open browser: {err}");
+        eprintln!("agent-feed: open this URL manually:");
+        eprintln!("{}", start.authorize_url);
+    }
+    println!("waiting for github callback on {}", start.callback_url);
+    let (target, mut stream) =
+        wait_for_github_callback(&listener, Duration::from_secs(options.timeout_secs))?;
+    let session = match parse_cli_callback_request(&target)
+        .and_then(|callback| complete_cli_login(&start, callback, options.edge.clone()))
+    {
+        Ok(session) => {
+            write_auth_callback_response(&mut stream, true, "github sign-in complete")?;
+            session
+        }
+        Err(err) => {
+            let _ = write_auth_callback_response(&mut stream, false, "github sign-in failed");
+            return Err(CliError::Auth(err));
+        }
+    };
+    let store = GithubSessionStore::new(auth_store_path(options.store));
+    store.save(&session)?;
+    info!(
+        github_login = %session.login,
+        github_user_id = session.github_user_id,
+        expires_at = %session.expires_at,
+        "github cli auth completed"
+    );
+    Ok(session)
 }
 
 fn load_publish_session(
