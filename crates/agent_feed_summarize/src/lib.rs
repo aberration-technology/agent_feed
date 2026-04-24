@@ -168,6 +168,17 @@ pub struct GuardrailViolation {
     pub action: GuardrailAction,
 }
 
+const PROMPT_LEAKAGE_VIOLATION: &str = "prompt-leakage";
+
+const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
+    r"(?i)\braw\s+prompts?,\s*command output,\s*diffs?,\s*paths?,\s*(?:and\s+)?repo names?\s+omitted\b[\s.,;:]*",
+    r"(?i)\braw\s+(?:detail|details|diff|diffs|prompt|prompts|output|logs?|tool output|command output)\s+(?:is\s+|are\s+)?omitted\b[\s.,;:]*",
+    r"(?i)\buse only the redacted story facts\b[\s.,;:]*",
+    r"(?i)\bredacted story facts\b[\s.,;:]*",
+    r"(?i)\breturn one json object\b[^.]*[.\s]*",
+    r"(?i)\bdo not include\b[^.]*[.\s]*",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeedSummaryMode {
@@ -1080,11 +1091,6 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
     }
 
     let input_count = request.stories.len();
-    let agents = request
-        .stories
-        .iter()
-        .map(|story| story.agent.clone())
-        .collect::<BTreeSet<_>>();
     let max_score = request
         .stories
         .iter()
@@ -1112,15 +1118,7 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
         .filter(|story| story.family == StoryFamily::Test)
         .count();
 
-    let agent_label = if agents.len() == 1 {
-        agents
-            .iter()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "agents".to_string())
-    } else {
-        format!("{} agents", agents.len())
-    };
+    let agent_label = agent_label(&request.stories);
     let mut facts = vec![format!("{input_count} settled stories")];
     if incidents > 0 {
         facts.push(format!("{incidents} incidents"));
@@ -1131,10 +1129,9 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
     if tests > 0 {
         facts.push(format!("{tests} test signals"));
     }
-    facts.push("raw prompts, command output, diffs, paths, and repo names omitted".to_string());
 
     ProcessorSummary {
-        headline: format!("{agent_label} feed activity settled"),
+        headline: fallback_headline(request),
         deck: format!("{}.", facts.join(". ")),
         lower_third: Some(format!(
             "{agent_label} · feed-rollup · score {max_score} · redacted"
@@ -1160,15 +1157,38 @@ fn build_summary(
     let guardrails = &config.guardrails;
     let processor_publish = processor_output.publish;
     let processor_publish_reason = processor_output.publish_reason.clone();
-    let (headline, mut violations) = clean_and_clamp(
+    let (mut headline, mut violations) = clean_and_clamp(
         &processor_output.headline,
         budget.max_headline_chars,
         guardrails,
     )?;
-    let (deck, deck_violations) =
+    if headline.is_empty() {
+        let (fallback, fallback_violations) = clean_and_clamp(
+            &fallback_headline(request),
+            budget.max_headline_chars,
+            guardrails,
+        )?;
+        headline = fallback;
+        violations.extend(fallback_violations);
+    }
+    if headline.is_empty() {
+        headline = "feed activity settled".to_string();
+    }
+
+    let (mut deck, deck_violations) =
         clean_and_clamp(&processor_output.deck, budget.max_deck_chars, guardrails)?;
     violations.extend(deck_violations);
-    let (lower_third, lower_violations) = clean_and_clamp(
+    if deck.is_empty() {
+        let (fallback, fallback_violations) =
+            clean_and_clamp(&fallback_deck(request), budget.max_deck_chars, guardrails)?;
+        deck = fallback;
+        violations.extend(fallback_violations);
+    }
+    if deck.is_empty() {
+        deck = "settled story activity reached the feed.".to_string();
+    }
+
+    let (mut lower_third, lower_violations) = clean_and_clamp(
         processor_output
             .lower_third
             .as_deref()
@@ -1177,6 +1197,9 @@ fn build_summary(
         guardrails,
     )?;
     violations.extend(lower_violations);
+    if lower_third.is_empty() {
+        lower_third = "feed · redacted".to_string();
+    }
 
     let mut chips = Vec::new();
     for chip in processor_output.chips.into_iter().take(budget.max_chips) {
@@ -1287,7 +1310,9 @@ fn clean_and_clamp(
     if !guardrails.allow_command_text {
         input = mask_command_like_terms(&input);
     }
-    let (cleaned, violations) = guardrails.clean_text(&input)?;
+    let (input, mut violations) = strip_prompt_leakage(&input)?;
+    let (cleaned, guardrail_violations) = guardrails.clean_text(&input)?;
+    violations.extend(guardrail_violations);
     Ok((clamp_chars(&cleaned, max_chars), violations))
 }
 
@@ -1304,10 +1329,115 @@ fn fit_capsule_budget(
         }
         summary.deck = clamp_chars(&summary.deck, summary.deck.len().saturating_sub(24));
     }
-    let (deck, violations) = guardrails.clean_text(&summary.deck)?;
+    let (deck, violations) = clean_and_clamp(&summary.deck, budget.max_deck_chars, guardrails)?;
     summary.metadata.violations.extend(violations);
     summary.deck = deck;
+    if summary.deck.is_empty() {
+        summary.deck = "settled story activity reached the feed.".to_string();
+    }
     Ok(())
+}
+
+fn strip_prompt_leakage(input: &str) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
+    let mut output = input.to_string();
+    let mut changed = false;
+    for pattern in PROMPT_LEAKAGE_PATTERNS {
+        let regex = Regex::new(pattern).map_err(|err| {
+            SummaryError::Processor(format!("invalid prompt-leakage pattern: {err}"))
+        })?;
+        if regex.is_match(&output) {
+            output = regex.replace_all(&output, " ").to_string();
+            changed = true;
+        }
+    }
+    output = tidy_display_text(&output);
+    let violations = changed
+        .then(|| GuardrailViolation {
+            name: PROMPT_LEAKAGE_VIOLATION.to_string(),
+            action: GuardrailAction::Mask,
+        })
+        .into_iter()
+        .collect();
+    Ok((output, violations))
+}
+
+fn tidy_display_text(input: &str) -> String {
+    let mut output = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (from, to) in [
+        (" .", "."),
+        (" ,", ","),
+        (" ;", ";"),
+        (" :", ":"),
+        ("..", "."),
+        (". .", "."),
+        ("· ·", "·"),
+    ] {
+        while output.contains(from) {
+            output = output.replace(from, to);
+        }
+    }
+    output = output
+        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, '·' | '-' | ',' | ';' | ':'))
+        .to_string();
+    if output.chars().any(|ch| ch.is_alphanumeric()) {
+        output
+    } else {
+        String::new()
+    }
+}
+
+fn fallback_headline(request: &SummaryRequest) -> String {
+    if request.stories.len() == 1 {
+        let story = &request.stories[0];
+        format!("{} {} settled", story.agent, family_display(story.family))
+    } else {
+        format!("{} feed activity settled", agent_label(&request.stories))
+    }
+}
+
+fn fallback_deck(request: &SummaryRequest) -> String {
+    if request.stories.len() == 1 {
+        let story = &request.stories[0];
+        format!(
+            "one {} story reached the feed.",
+            family_display(story.family)
+        )
+    } else {
+        format!(
+            "{} settled stories reached the feed.",
+            request.stories.len()
+        )
+    }
+}
+
+fn agent_label(stories: &[CompiledStory]) -> String {
+    let agents = stories
+        .iter()
+        .map(|story| story.agent.clone())
+        .collect::<BTreeSet<_>>();
+    if agents.len() == 1 {
+        agents
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "agents".to_string())
+    } else {
+        format!("{} agents", agents.len())
+    }
+}
+
+fn family_display(family: StoryFamily) -> &'static str {
+    match family {
+        StoryFamily::Turn => "turn",
+        StoryFamily::Plan => "plan",
+        StoryFamily::Test => "test",
+        StoryFamily::Permission => "permission",
+        StoryFamily::Command => "command",
+        StoryFamily::FileChange => "file-change",
+        StoryFamily::Mcp => "mcp",
+        StoryFamily::Incident => "incident",
+        StoryFamily::IdleRecap => "recap",
+    }
 }
 
 fn apply_publish_decision(
@@ -1727,6 +1857,29 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_rollup_does_not_emit_omission_copy() {
+        let stories = (0..3)
+            .map(|index| story(&format!("codex changed secret_repo {index}"), 78))
+            .collect::<Vec<_>>();
+        let summaries =
+            summarize_feed("local:workstation", &stories, &SummaryConfig::p2p_default())
+                .expect("summary compiles");
+
+        let display = format!(
+            "{} {} {} {}",
+            summaries[0].headline,
+            summaries[0].deck,
+            summaries[0].lower_third,
+            summaries[0].chips.join(" ")
+        )
+        .to_ascii_lowercase();
+        assert!(!display.contains("raw detail omitted"));
+        assert!(!display.contains("raw prompts"));
+        assert!(!display.contains("command output"));
+        assert!(!display.contains("repo names omitted"));
+    }
+
+    #[test]
     fn per_story_publish_skips_duplicate_headlines() {
         let mut config = SummaryConfig::p2p_default();
         config.mode = FeedSummaryMode::PerStory;
@@ -1846,6 +1999,62 @@ mod tests {
         assert!(!summaries[0].headline.contains("alice@example.com"));
         assert!(!summaries[0].headline.contains("secret_repo"));
         assert!(!summaries[0].chips.iter().any(|chip| chip.contains('@')));
+    }
+
+    struct LeakyPromptProcessor;
+
+    impl SummaryProcessor for LeakyPromptProcessor {
+        fn name(&self) -> &str {
+            "leaky-prompt"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "raw detail omitted.".to_string(),
+                deck: "tests passed. raw detail omitted. Do not include raw prompts.".to_string(),
+                lower_third: Some(
+                    "raw prompts, command output, diffs, paths, and repo names omitted."
+                        .to_string(),
+                ),
+                chips: vec!["raw detail omitted".to_string(), "codex".to_string()],
+                publish: None,
+                publish_reason: None,
+            })
+        }
+    }
+
+    #[test]
+    fn processor_prompt_leakage_is_removed_from_summary_output() {
+        let stories = vec![story("codex changed secret_repo", 78)];
+        let summaries = summarize_feed_with_processor(
+            "local:workstation",
+            &stories,
+            &SummaryConfig::p2p_default(),
+            &LeakyPromptProcessor,
+        )
+        .expect("leaky processor output is sanitized");
+
+        let summary = &summaries[0];
+        let display = format!(
+            "{} {} {} {}",
+            summary.headline,
+            summary.deck,
+            summary.lower_third,
+            summary.chips.join(" ")
+        )
+        .to_ascii_lowercase();
+        assert!(!summary.headline.is_empty());
+        assert!(!display.contains("raw detail omitted"));
+        assert!(!display.contains("raw prompts"));
+        assert!(!display.contains("command output"));
+        assert!(!display.contains("do not include"));
+        assert!(
+            summary
+                .metadata
+                .violations
+                .iter()
+                .any(|violation| violation.name == PROMPT_LEAKAGE_VIOLATION)
+        );
     }
 
     struct DecliningProcessor;
