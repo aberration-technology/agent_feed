@@ -164,10 +164,11 @@ mod tests {
     }
 
     #[test]
-    fn mode_switcher_preserves_user_scope_and_exposes_local_reel() {
+    fn mode_switcher_preserves_user_scope_without_loopback_link() {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
 
-        assert!(html.contains("id=\"mode-local\" href=\"http://127.0.0.1:7777/reel\""));
+        assert!(!html.contains("id=\"mode-local\""));
+        assert!(!html.contains("http://127.0.0.1:7777/reel"));
         assert!(
             html.contains(
                 "modeDiscovery.textContent = route.kind === \"global\" ? \"discovery\" : `${route.login}/*`;"
@@ -177,8 +178,6 @@ mod tests {
         assert!(
             html.contains("[\"discovery\", \"discover\", \"hero\", \"public\"].includes(explicit)")
         );
-        assert!(html.contains("return \"http://127.0.0.1:7777/reel\";"));
-        assert!(html.contains("function renderLocalLoopbackRoute"));
-        assert!(html.contains("the hosted shell does not read loopback streams by default"));
+        assert!(html.contains("hosted feed pages do not link to loopback reels"));
     }
 }
