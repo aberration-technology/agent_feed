@@ -310,17 +310,36 @@ h1 {
 
 .ticker {
   min-width: 0;
+  gap: clamp(18px, 3vw, 44px);
   border-top: 1px solid var(--line);
-  justify-content: flex-start;
+  justify-content: space-between;
   overflow: hidden;
   white-space: nowrap;
 }
 
-.ticker span {
+.ticker > span {
   display: inline-block;
+  min-width: 0;
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.footer-links {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: clamp(12px, 1.8vw, 24px);
+}
+
+.footer-links a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.footer-links a:hover,
+.footer-links a:focus-visible {
+  color: var(--accent);
+  outline: none;
 }
 
 .timeline {
@@ -501,6 +520,10 @@ body[data-mode="breaking"] .chips span {
   .topbar,
   .ticker {
     padding: 0 28px;
+  }
+
+  .footer-links {
+    gap: 12px;
   }
 
   .status {
