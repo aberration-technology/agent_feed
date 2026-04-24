@@ -39,11 +39,16 @@ the package is `agent_feed_cli`. the installed binary is `agent-feed`.
 http://127.0.0.1:7777/reel
 ```
 
-that is the happy path. `agent-feed init --auto` is optional setup for hooks,
-shims, and future sessions. `agent-feed open` only opens the display URL in a
-browser.
+that is the happy path. `serve` also attaches the latest local codex and claude
+transcripts in the current workspace by default, so active sessions in that tree
+should start producing display-safe stories after the daemon is up. use
+`--workspace /path/to/repo` for another tree, `--all-workspaces` for broad local
+capture, or `--no-agent-capture` if you want to ingest manually.
 
-to attach active local sessions, run one of these in another shell:
+`agent-feed init --auto` is optional setup for hooks, shims, and future
+sessions. `agent-feed open` only opens the display URL in a browser.
+
+to attach active local sessions manually:
 
 ```sh
 agent-feed codex active --watch --workspace .

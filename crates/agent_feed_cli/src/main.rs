@@ -13,7 +13,7 @@ use agent_feed_ingest::source_from_str;
 use agent_feed_install::{doctor_report, init_plan};
 use agent_feed_p2p_proto::{FeedVisibility, PublisherIdentity, Signed, StoryCapsule};
 use agent_feed_security::SecurityConfig;
-use agent_feed_server::{ServerConfig, serve};
+use agent_feed_server::{ServerConfig, serve_with_ready};
 use agent_feed_story::{CompiledStory, compile_events};
 use agent_feed_summarize::{
     DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummaryMode,
@@ -80,6 +80,29 @@ enum Commands {
         p2p: bool,
         #[arg(long)]
         no_p2p: bool,
+        #[arg(long, default_value = "codex,claude")]
+        agents: String,
+        #[arg(long, default_value_t = 4)]
+        sessions: usize,
+        #[arg(
+            long,
+            value_name = "PATH",
+            default_value = ".",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
+        #[arg(long, help = "capture active agent sessions from every workspace")]
+        all_workspaces: bool,
+        #[arg(long, visible_aliases = ["no-agent-watch", "no-capture"])]
+        no_agent_capture: bool,
+        #[arg(long, default_value_t = 1000)]
+        poll_ms: u64,
+        #[arg(long)]
+        codex_history: Option<PathBuf>,
+        #[arg(long)]
+        codex_sessions_dir: Option<PathBuf>,
+        #[arg(long)]
+        claude_projects_dir: Option<PathBuf>,
     },
     Open {
         #[arg(default_value = DEFAULT_URL)]
@@ -450,6 +473,15 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             display_token_file,
             p2p,
             no_p2p,
+            agents,
+            sessions,
+            workspace,
+            all_workspaces,
+            no_agent_capture,
+            poll_ms,
+            codex_history,
+            codex_sessions_dir,
+            claude_projects_dir,
         } => {
             let display_token = display_token_file
                 .map(fs::read_to_string)
@@ -470,14 +502,43 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 display_token_configured = security.display_token.is_some(),
                 "serving local feed"
             );
-            println!("serving http://{bind}/reel");
-            if p2p_enabled {
-                println!("p2p browser discovery ux enabled");
-            }
-            serve(ServerConfig {
-                security,
-                p2p_enabled,
-            })
+            let capture = if no_agent_capture {
+                info!("agent transcript capture disabled for serve");
+                None
+            } else {
+                let workspace_filter = if all_workspaces {
+                    info!("serve agent capture scanning all workspaces");
+                    None
+                } else {
+                    WorkspaceFilter::from_cli(workspace)?
+                };
+                Some(ServeAgentCapture {
+                    agents,
+                    sessions,
+                    workspace: workspace_filter,
+                    poll_ms,
+                    codex_history,
+                    codex_sessions_dir,
+                    claude_projects_dir,
+                })
+            };
+            serve_with_ready(
+                ServerConfig {
+                    security,
+                    p2p_enabled,
+                },
+                move |bind| {
+                    println!("serving http://{bind}/reel");
+                    if p2p_enabled {
+                        println!("p2p browser discovery ux enabled");
+                    }
+                    if let Some(capture) = capture {
+                        start_serve_agent_capture(bind, capture);
+                    } else {
+                        println!("agent capture disabled; use `agent-feed codex active --watch` to attach manually");
+                    }
+                },
+            )
             .await?;
         }
         Commands::Open { url } => {
@@ -1310,6 +1371,121 @@ impl WorkspaceFilterLogValue for Option<WorkspaceFilter> {
     }
 }
 
+#[derive(Debug)]
+struct ServeAgentCapture {
+    agents: String,
+    sessions: usize,
+    workspace: Option<WorkspaceFilter>,
+    poll_ms: u64,
+    codex_history: Option<PathBuf>,
+    codex_sessions_dir: Option<PathBuf>,
+    claude_projects_dir: Option<PathBuf>,
+}
+
+fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
+    let selected_agents = parse_agent_list(&capture.agents);
+    let capture_codex = selected_agents.contains("codex");
+    let capture_claude = selected_agents.contains("claude");
+    if !capture_codex && !capture_claude {
+        warn!(
+            agents = %capture.agents,
+            "serve agent capture disabled because no supported agents were selected"
+        );
+        println!("agent capture disabled; supported agents are codex and claude");
+        return;
+    }
+
+    let server = bind.to_string();
+    if capture_codex {
+        let server = server.clone();
+        let history = capture.codex_history.unwrap_or_else(default_codex_history);
+        let sessions_dir = capture
+            .codex_sessions_dir
+            .unwrap_or_else(default_codex_sessions_dir);
+        let workspace = capture.workspace.clone();
+        let sessions = capture.sessions;
+        let poll_ms = capture.poll_ms;
+        spawn_agent_capture("codex", move || {
+            let paths =
+                active_codex_session_paths(&history, &sessions_dir, sessions, workspace.as_ref())?;
+            info!(
+                sessions_requested = sessions,
+                sessions_found = paths.len(),
+                history = %history.display(),
+                sessions_dir = %sessions_dir.display(),
+                workspace = workspace.log_value(),
+                %server,
+                poll_ms,
+                "serve codex active capture starting"
+            );
+            if paths.is_empty() {
+                println!(
+                    "codex capture: no active sessions found for {}; use --all-workspaces to scan every local codex session",
+                    capture_scope_message(workspace.as_ref())
+                );
+                return Ok(());
+            }
+            println!("codex capture: watching {} active sessions", paths.len());
+            watch_codex_sessions(&server, &paths, poll_ms, workspace.as_ref())
+        });
+    }
+
+    if capture_claude {
+        let server = server.clone();
+        let projects_dir = capture
+            .claude_projects_dir
+            .unwrap_or_else(default_claude_projects_dir);
+        let workspace = capture.workspace;
+        let sessions = capture.sessions;
+        let poll_ms = capture.poll_ms;
+        spawn_agent_capture("claude", move || {
+            let paths = active_claude_session_paths(&projects_dir, sessions, workspace.as_ref())?;
+            info!(
+                sessions_requested = sessions,
+                sessions_found = paths.len(),
+                projects_dir = %projects_dir.display(),
+                workspace = workspace.log_value(),
+                %server,
+                poll_ms,
+                "serve claude active capture starting"
+            );
+            if paths.is_empty() {
+                println!(
+                    "claude capture: no active sessions found for {}; use --all-workspaces to scan every local claude session",
+                    capture_scope_message(workspace.as_ref())
+                );
+                return Ok(());
+            }
+            println!("claude capture: watching {} active sessions", paths.len());
+            watch_claude_sessions(&server, &paths, poll_ms, workspace.as_ref())
+        });
+    }
+}
+
+fn spawn_agent_capture<F>(agent: &'static str, capture: F)
+where
+    F: FnOnce() -> Result<(), CliError> + Send + 'static,
+{
+    let result = std::thread::Builder::new()
+        .name(format!("agent-feed-{agent}-capture"))
+        .spawn(move || {
+            if let Err(err) = capture() {
+                error!(%agent, error = %err, "serve agent capture stopped");
+                eprintln!("agent-feed: {agent} capture stopped: {err}");
+            }
+        });
+    if let Err(err) = result {
+        warn!(%agent, error = %err, "serve agent capture thread failed to start");
+        eprintln!("agent-feed: failed to start {agent} capture: {err}");
+    }
+}
+
+fn capture_scope_message(workspace: Option<&WorkspaceFilter>) -> String {
+    workspace
+        .map(|workspace| format!("workspace {}", workspace.display()))
+        .unwrap_or_else(|| "all workspaces".to_string())
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ImportStats {
     imported: usize,
@@ -1611,6 +1787,64 @@ mod tests {
 
         assert_eq!(cli.log_level, "debug");
         assert_eq!(cli.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn serve_defaults_to_active_agent_capture() {
+        let cli = Cli::try_parse_from(["agent-feed", "serve"]).expect("serve parses");
+
+        let Commands::Serve {
+            agents,
+            sessions,
+            no_agent_capture,
+            workspace,
+            all_workspaces,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(agents, "codex,claude");
+        assert_eq!(sessions, 4);
+        assert!(!no_agent_capture);
+        assert_eq!(workspace, Some(PathBuf::from(".")));
+        assert!(!all_workspaces);
+    }
+
+    #[test]
+    fn serve_can_disable_agent_capture_and_scope_workspace() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "serve",
+            "--no-agent-capture",
+            "--all-workspaces",
+            "--agents",
+            "codex",
+            "--sessions",
+            "8",
+            "--workspace",
+            "/tmp/agent-feed-workspace",
+        ])
+        .expect("serve capture flags parse");
+
+        let Commands::Serve {
+            agents,
+            sessions,
+            no_agent_capture,
+            workspace,
+            all_workspaces,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert_eq!(agents, "codex");
+        assert_eq!(sessions, 8);
+        assert!(no_agent_capture);
+        assert_eq!(workspace, Some(PathBuf::from("/tmp/agent-feed-workspace")));
+        assert!(all_workspaces);
     }
 
     #[test]

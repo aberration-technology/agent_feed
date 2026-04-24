@@ -63,11 +63,19 @@ struct AppState {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+    serve_with_ready(config, |_| {}).await
+}
+
+pub async fn serve_with_ready<F>(config: ServerConfig, ready: F) -> Result<(), ServerError>
+where
+    F: FnOnce(SocketAddr) + Send + 'static,
+{
     validate_bind(&config.security)?;
     let bind = config.bind();
     let listener = TcpListener::bind(bind).await?;
     let app = app_with_config(bind, config.p2p_enabled);
     tracing::info!(%bind, "agent_feed serving");
+    ready(bind);
     axum::serve(listener, app).await?;
     Ok(())
 }
