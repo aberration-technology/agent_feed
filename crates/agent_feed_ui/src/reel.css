@@ -78,6 +78,7 @@ body {
   overflow: hidden;
   border: 1px solid var(--line);
   background: color-mix(in srgb, var(--bg), transparent 10%);
+  backdrop-filter: blur(12px);
   font-family: var(--mono);
   font-size: var(--label);
   opacity: 0;
@@ -116,6 +117,7 @@ body.controls-visible .mode-switcher,
 }
 
 .stage {
+  position: relative;
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -132,6 +134,39 @@ body.controls-visible .mode-switcher,
 
 .stage.is-changing {
   opacity: 0;
+}
+
+.stage-progress {
+  position: absolute;
+  left: var(--pad);
+  right: var(--pad);
+  bottom: clamp(18px, 2.5vh, 34px);
+  height: 1px;
+  overflow: hidden;
+  background: var(--line);
+}
+
+.stage-progress span {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: color-mix(in srgb, var(--accent), transparent 18%);
+  transform: scaleX(0);
+  transform-origin: left center;
+}
+
+.stage-progress.is-running span {
+  animation: feed-stage-progress var(--dwell, 14000ms) linear forwards;
+}
+
+@keyframes feed-stage-progress {
+  from {
+    transform: scaleX(0);
+  }
+
+  to {
+    transform: scaleX(1);
+  }
 }
 
 .eyebrow {
@@ -174,6 +209,10 @@ body.controls-visible .mode-switcher,
   color: var(--fg);
 }
 
+.publisher:has(img:not([src])) img {
+  display: none;
+}
+
 h1 {
   max-width: 14ch;
   margin: 0;
@@ -186,7 +225,9 @@ h1 {
 }
 
 .deck {
+  width: 100%;
   max-width: 38ch;
+  min-width: 0;
   margin: 0;
   color: var(--fg);
   font-size: var(--deck);
@@ -214,6 +255,14 @@ h1 {
   max-height: calc(30vh - 20px);
   object-fit: cover;
   filter: grayscale(1) contrast(1.05);
+}
+
+.headline-image figcaption {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--label);
+  margin-top: 8px;
+  text-transform: uppercase;
 }
 
 .auth-action {
@@ -278,7 +327,11 @@ h1 {
   overflow-y: auto;
   scroll-snap-type: y mandatory;
   scrollbar-width: none;
+  background:
+    linear-gradient(180deg, rgba(244, 241, 234, 0.05), transparent 22vh),
+    var(--bg);
   border-top: 1px solid transparent;
+  scroll-behavior: smooth;
 }
 
 .timeline[hidden] {
@@ -300,6 +353,7 @@ h1 {
   min-height: 56px;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--bg), transparent 4%);
+  backdrop-filter: blur(12px);
   color: var(--muted);
   font-family: var(--mono);
   font-size: var(--label);
@@ -328,6 +382,7 @@ h1 {
 }
 
 .timeline-feeds a:hover,
+.timeline-feeds a[aria-current],
 .timeline-feeds a:focus-visible {
   border-color: var(--fg);
   color: var(--fg);
@@ -335,16 +390,26 @@ h1 {
 }
 
 .timeline-card {
+  min-width: 0;
+  max-width: 100%;
   min-height: calc(100vh - 56px - 48px);
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: clamp(18px, 3vh, 34px);
   scroll-snap-align: start;
+  scroll-snap-stop: always;
   padding: var(--pad);
 }
 
+.timeline-card:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: calc(var(--pad) * -0.5);
+}
+
 .timeline-card h2 {
+  width: 100%;
+  min-width: 0;
   max-width: 14ch;
   margin: 0;
   color: var(--fg);
@@ -364,13 +429,39 @@ h1 {
 }
 
 .timeline-card p {
+  width: 100%;
   max-width: 38ch;
+  min-width: 0;
   margin: 0;
   color: var(--fg);
   font-size: var(--deck);
   font-weight: 360;
   line-height: 1.12;
   overflow-wrap: anywhere;
+}
+
+.timeline-card .publisher {
+  min-height: 0;
+}
+
+.timeline-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: var(--label);
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.timeline-status span {
+  max-width: 32ch;
+  overflow-wrap: anywhere;
+}
+
+.timeline-empty h2 {
+  color: var(--muted);
 }
 
 body[data-mode="breaking"] .eyebrow,
@@ -384,26 +475,87 @@ body[data-mode="breaking"] .chips span {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .stage {
+  .stage,
+  .timeline {
     transition: none;
+    scroll-behavior: auto;
+  }
+
+  .stage-progress.is-running span {
+    animation: none;
+    transform: scaleX(1);
   }
 }
 
 @media (max-width: 720px) {
+  :root {
+    --headline: 52px;
+    --deck: 22px;
+  }
+
   .reel {
     grid-template-rows: 64px 1fr 56px;
   }
 
+  .topbar,
+  .ticker {
+    padding: 0 28px;
+  }
+
   .status {
-    gap: 12px;
+    gap: 10px;
+    justify-content: flex-end;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  #clock {
+    display: none;
+  }
+
+  #source-count {
+    display: none;
   }
 
   h1 {
-    max-width: 11ch;
+    max-width: 100%;
   }
 
   .headline-image {
     width: 100%;
     max-height: 24vh;
+  }
+
+  .timeline-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 116px;
+    padding: 12px 28px;
+  }
+
+  .timeline-feeds {
+    width: 100%;
+  }
+
+  .timeline-card {
+    min-height: calc(100vh - 116px - 56px);
+    padding: 28px;
+  }
+
+  .timeline-card h2,
+  .timeline-card p,
+  .deck {
+    max-width: 100%;
+  }
+
+  .timeline-status {
+    display: grid;
+    gap: 8px;
+    max-width: 100%;
+  }
+
+  .timeline-status span {
+    max-width: 100%;
   }
 }

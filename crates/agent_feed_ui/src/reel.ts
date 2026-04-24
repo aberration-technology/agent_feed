@@ -13,6 +13,7 @@ const publisherLabel = document.querySelector("#publisher-label");
 const authAction = document.querySelector("#auth-action");
 const headlineImage = document.querySelector("#headline-image");
 const headlineImageImg = document.querySelector("#headline-image-img");
+const stageProgress = document.querySelector("#stage-progress");
 const timeline = document.querySelector("#timeline");
 const modeSwitcher = document.querySelector("#mode-switcher");
 const modeDiscovery = document.querySelector("#mode-discovery");
@@ -67,6 +68,25 @@ function showStage() {
   }
 }
 
+function restartStageProgress(dwellMs = 14000) {
+  if (!stageProgress) {
+    return;
+  }
+  const duration = Number.isFinite(Number(dwellMs))
+    ? Math.max(Number(dwellMs), 1000)
+    : 14000;
+  stageProgress.style.setProperty("--dwell", `${duration}ms`);
+  stageProgress.classList.remove("is-running");
+  void stageProgress.offsetWidth;
+  stageProgress.classList.add("is-running");
+}
+
+function stopStageProgress() {
+  if (stageProgress) {
+    stageProgress.classList.remove("is-running");
+  }
+}
+
 function renderBulletin(bulletin) {
   if (!bulletin) {
     logWarn("render skipped empty bulletin");
@@ -86,6 +106,7 @@ function renderBulletin(bulletin) {
     renderChips(bulletin.chips || []);
     renderTicker(bulletin.ticker || []);
     stage?.classList.remove("is-changing");
+    restartStageProgress(bulletin.dwell_ms || bulletin.dwellMs || 14000);
   }, 180);
 }
 
@@ -208,6 +229,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
     "redacted",
   ]);
   renderTicker(lines);
+  restartStageProgress(state === "live" ? 14000 : 30000);
 }
 
 function renderP2pDisabled(route) {
@@ -226,6 +248,7 @@ function renderP2pDisabled(route) {
   clearAuthAction();
   renderChips(["local", "no-p2p", "story-only", "redacted"]);
   renderTicker(["start with --p2p or use the hosted p2p browser shell"]);
+  restartStageProgress(30000);
 }
 
 function renderAuthRequired(route) {
@@ -599,6 +622,7 @@ function handleGithubAuthCallback(callback) {
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   renderChips(["github", "verified", "browser", "session"]);
+  restartStageProgress(30000);
   const expectedState =
     window.localStorage.getItem("feed.github.auth_state") ||
     window.localStorage.getItem("agent_feed.github.auth_state") ||
@@ -668,6 +692,7 @@ function startNetworkView() {
     renderChips(["github", "browser", "private feeds", "redacted"]);
   }
   renderTicker(["auth stays on the edge", "projection remains story-only"]);
+  restartStageProgress(30000);
 }
 
 async function startRemoteRoute(route) {
@@ -769,6 +794,8 @@ function startSubscribedRoute(route) {
   renderTicker(targets.map((target) => `follow ${target}`));
   if (route.interactive) {
     renderSubscribedTimeline(route, targets);
+  } else {
+    restartStageProgress(30000);
   }
   console.info("[feed] subscribed mode selected", {
     network: route.network,
@@ -797,6 +824,7 @@ function renderTimeline(route, ticket) {
   if (stage) {
     stage.hidden = true;
   }
+  stopStageProgress();
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
@@ -812,10 +840,12 @@ function renderTimeline(route, ticket) {
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
-  nav.appendChild(feedLink(route.login, "*", `${route.login}/*`));
+  nav.appendChild(
+    feedLink(route.login, "*", `${route.login}/*`, !route.feed || route.feed === "*"),
+  );
   for (const feed of feeds) {
     const feedLabel = feed.label || feed.feed_label || "feed";
-    nav.appendChild(feedLink(route.login, feedLabel, feedLabel));
+    nav.appendChild(feedLink(route.login, feedLabel, feedLabel, route.feed === feedLabel));
   }
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
@@ -827,6 +857,8 @@ function renderTimeline(route, ticket) {
     }
     const card = document.createElement("article");
     card.className = "timeline-card";
+    card.tabIndex = 0;
+    card.appendChild(timelinePublisher(feed, ticket));
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
     meta.textContent = `${publisherText(feed, ticket)} / ${feedLabel}`;
@@ -842,12 +874,13 @@ function renderTimeline(route, ticket) {
       item.textContent = chip;
       chipsRow.appendChild(item);
     }
-    card.append(meta, title, copy, chipsRow);
+    card.append(meta, title, copy, timelineStatus(feed, route), chipsRow);
     timeline.appendChild(card);
   }
   if (timeline.children.length === 1) {
     const card = document.createElement("article");
-    card.className = "timeline-card";
+    card.className = "timeline-card timeline-empty";
+    card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
     meta.textContent = `@${route.login} / ${route.selection}`;
@@ -869,6 +902,7 @@ function renderSubscribedTimeline(route, targets) {
   if (stage) {
     stage.hidden = true;
   }
+  stopStageProgress();
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
@@ -895,6 +929,7 @@ function renderSubscribedTimeline(route, targets) {
   for (const target of targets) {
     const card = document.createElement("article");
     card.className = "timeline-card";
+    card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
     meta.textContent = `${target} / subscribed`;
@@ -910,7 +945,10 @@ function renderSubscribedTimeline(route, targets) {
       item.textContent = chip;
       chipsRow.appendChild(item);
     }
-    card.append(meta, title, copy, chipsRow);
+    const status = document.createElement("div");
+    status.className = "timeline-status";
+    status.append(statusItem("target", target), statusItem("mode", "subscribed only"));
+    card.append(meta, title, copy, status, chipsRow);
     timeline.appendChild(card);
   }
   renderTicker(["interactive subscribed timeline", "move mouse for mode switcher"]);
@@ -922,11 +960,73 @@ function subscribedTargetUrl(target) {
   return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=subscribed&view=timeline&subscriptions=${encodeURIComponent(target)}`;
 }
 
-function feedLink(login, label, text) {
+function feedLink(login, label, text, current = false) {
   const link = document.createElement("a");
   link.href = `/${encodeURIComponent(login)}/${encodeURIComponent(label)}?view=timeline`;
   link.textContent = text;
+  if (current) {
+    link.setAttribute("aria-current", "page");
+  }
   return link;
+}
+
+function timelinePublisher(feed, ticket) {
+  const node = document.createElement("div");
+  node.className = "publisher";
+  const img = document.createElement("img");
+  img.alt = "";
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.referrerPolicy = "no-referrer";
+  const avatar = safeAvatarUrl(
+    feed.avatar || feed.owner?.avatar?.url || feed.owner?.avatar_url || ticket.profile?.avatar,
+  );
+  if (avatar) {
+    img.src = avatar;
+  }
+  const label = document.createElement("span");
+  label.textContent = publisherText(feed, ticket);
+  node.append(img, label);
+  return node;
+}
+
+function timelineStatus(feed, route) {
+  const status = document.createElement("div");
+  status.className = "timeline-status";
+  const visibility = feed.visibility || "visible";
+  const lastSeen = feed.last_seen_at ? relativeTime(feed.last_seen_at) : "waiting";
+  status.append(
+    statusItem("visibility", visibility),
+    statusItem("last seen", lastSeen),
+    statusItem("network", route.network),
+  );
+  return status;
+}
+
+function statusItem(label, value) {
+  const item = document.createElement("span");
+  item.textContent = `${label}: ${value}`;
+  return item;
+}
+
+function relativeTime(value) {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    return String(value);
+  }
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 60) {
+    return `${seconds}s ago`;
+  }
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ago`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ago`;
+  }
+  return `${Math.round(hours / 24)}d ago`;
 }
 
 function publisherText(feed, ticket) {
