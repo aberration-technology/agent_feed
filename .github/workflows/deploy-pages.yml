@@ -86,14 +86,10 @@ jobs:
           site_base_url="${INPUT_BROWSER_APP_BASE_URL:-${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}}"
           network_id="${INPUT_NETWORK_ID:-${VAR_NETWORK_ID:-agent-feed-mainnet}}"
           canary_login="${INPUT_CANARY_GITHUB_LOGIN:-${VAR_CANARY_GITHUB_LOGIN:-mosure}}"
-          cname="${site_base_url#https://}"
-          cname="${cname#http://}"
-          cname="${cname%%/*}"
           {
             echo "EDGE_BASE_URL=$edge_base_url"
             echo "SITE_BASE_URL=$site_base_url"
             echo "NETWORK_ID=$network_id"
-            echo "SITE_CNAME=$cname"
           } >>"$GITHUB_ENV"
           {
             echo "edge_base_url=$edge_base_url"

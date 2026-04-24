@@ -536,13 +536,13 @@ fn deck(window: &StoryWindow) -> String {
     {
         parts.push(safe_sentence(summary));
     }
+    if parts.is_empty()
+        && let Some(outcome) = outcome_label(window)
+    {
+        parts.push(outcome.to_string());
+    }
     if parts.is_empty() {
-        if let Some(outcome) = outcome_label(window) {
-            parts.push(outcome.to_string());
-        }
-        parts.push("raw prompts, command output, and diffs omitted".to_string());
-    } else {
-        parts.push("raw detail omitted".to_string());
+        parts.push("activity settled".to_string());
     }
     format!("{}.", parts.join(". "))
 }
@@ -712,7 +712,8 @@ mod tests {
 
         assert_eq!(stories.len(), 1);
         assert!(stories[0].headline.contains("codex changed"));
-        assert!(stories[0].deck.contains("raw detail omitted"));
+        assert!(stories[0].deck.contains("changed files"));
+        assert!(!stories[0].deck.contains("raw detail omitted"));
         assert!(!stories[0].deck.contains("cargo test --all"));
     }
 

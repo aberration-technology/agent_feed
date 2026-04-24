@@ -82,7 +82,6 @@ jobs:
           state_bucket="${VAR_TERRAFORM_STATE_BUCKET:-agent-feed-p2p-tfstate-${aws_account_id}-${aws_region}}"
           binary_s3_key="${VAR_BINARY_S3_KEY:-releases/${GITHUB_SHA}/agent-feed}"
           environment_name="$DEPLOY_ENVIRONMENT"
-          environment_name="${environment_name#agent-real-p2p-}"
           environment_name="${environment_name#agent-feed-p2p-}"
           if [ -z "$aws_role_arn" ]; then
             echo "AGENT_FEED_P2P_AWS_ROLE_ARN must be set on the selected GitHub environment" >&2
@@ -303,7 +302,7 @@ jobs:
             browser_host="${browser_host#http://}"
             browser_host="${browser_host%%/*}"
             try_import aws_route53_record.edge "${zone_id}_${TF_VAR_edge_domain_name}_A"
-            try_import aws_route53_record.browser "${zone_id}_${browser_host}_CNAME"
+            try_import aws_route53_record.browser "${zone_id}_${browser_host}_A"
           fi
 
           alarm_name="$(aws cloudwatch describe-alarms --alarm-names "${stack}-edge-status-check" | jq -r '.MetricAlarms[0].AlarmName // empty')"

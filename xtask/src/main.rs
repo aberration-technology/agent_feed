@@ -18,9 +18,9 @@ fn main() -> Result<()> {
         Some("doctor") => doctor(),
         Some("check") => check(args.collect()),
         Some("build-browser-site") => build_browser_site(args.collect()),
-        Some("ui") => placeholder("ui"),
-        Some("e2e") => placeholder("e2e"),
-        Some("stress") => placeholder("stress"),
+        Some("ui") => reserved_lane("ui"),
+        Some("e2e") => reserved_lane("e2e"),
+        Some("stress") => reserved_lane("stress"),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
             std::process::exit(2);
@@ -46,13 +46,23 @@ fn check(extra: Vec<String>) -> Result<()> {
     )?;
     run(cargo(), &["test", "--workspace"])?;
     if extra.iter().any(|arg| arg == "publish") {
-        println!("publish check placeholder: cargo package validation is not wired yet");
+        run(
+            cargo(),
+            &[
+                "package",
+                "--workspace",
+                "--exclude",
+                "xtask",
+                "--allow-dirty",
+                "--no-verify",
+            ],
+        )?;
     }
     Ok(())
 }
 
-fn placeholder(name: &str) -> Result<()> {
-    println!("xtask {name} is reserved for the production lane");
+fn reserved_lane(name: &str) -> Result<()> {
+    println!("xtask {name} is not wired in this checkout");
     Ok(())
 }
 
