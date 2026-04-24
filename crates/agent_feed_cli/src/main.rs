@@ -60,6 +60,7 @@ enum LogFormat {
 }
 
 #[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     Doctor,
     Init {
@@ -159,6 +160,12 @@ enum CodexCommand {
         history: Option<PathBuf>,
         #[arg(long)]
         sessions_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
         #[arg(long, default_value = LOOPBACK_ADDR)]
         server: String,
         #[arg(long)]
@@ -168,6 +175,12 @@ enum CodexCommand {
     },
     Import {
         paths: Vec<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
         #[arg(long, default_value = LOOPBACK_ADDR)]
         server: String,
     },
@@ -178,6 +191,12 @@ enum CodexCommand {
         history: Option<PathBuf>,
         #[arg(long)]
         sessions_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -188,6 +207,12 @@ enum ClaudeCommand {
         sessions: usize,
         #[arg(long)]
         projects_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
         #[arg(long, default_value = LOOPBACK_ADDR)]
         server: String,
         #[arg(long)]
@@ -197,10 +222,22 @@ enum ClaudeCommand {
     },
     Import {
         paths: Vec<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
         #[arg(long, default_value = LOOPBACK_ADDR)]
         server: String,
     },
     Stream {
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
         #[arg(long, default_value = LOOPBACK_ADDR)]
         server: String,
     },
@@ -209,6 +246,12 @@ enum ClaudeCommand {
         sessions: usize,
         #[arg(long)]
         projects_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -275,6 +318,12 @@ enum P2pCommand {
         sessions_dir: Option<PathBuf>,
         #[arg(long)]
         claude_projects_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "only collect events whose cwd is this workspace or one of its children"
+        )]
+        workspace: Option<PathBuf>,
         #[arg(long, default_value = "codex-exec")]
         summarizer: String,
         #[arg(
@@ -589,16 +638,24 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 sessions,
                 history,
                 sessions_dir,
+                workspace,
                 server,
                 watch,
                 poll_ms,
             } => {
                 let history = history.unwrap_or_else(default_codex_history);
                 let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
-                let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
+                let paths = active_codex_session_paths(
+                    &history,
+                    &sessions_dir,
+                    sessions,
+                    workspace_filter.as_ref(),
+                )?;
                 info!(
                     sessions_requested = sessions,
                     sessions_found = paths.len(),
+                    workspace = workspace_filter.log_value(),
                     %server,
                     watch,
                     poll_ms,
@@ -607,29 +664,47 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     "codex active session capture starting"
                 );
                 if watch {
-                    watch_codex_sessions(&server, &paths, poll_ms)?;
+                    watch_codex_sessions(&server, &paths, poll_ms, workspace_filter.as_ref())?;
                 } else {
-                    import_codex_sessions(&server, &paths)?;
+                    import_codex_sessions(&server, &paths, workspace_filter.as_ref())?;
                 }
             }
-            CodexCommand::Import { paths, server } => {
-                info!(sessions = paths.len(), %server, "codex transcript import starting");
-                import_codex_sessions(&server, &paths)?;
+            CodexCommand::Import {
+                paths,
+                workspace,
+                server,
+            } => {
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
+                info!(
+                    sessions = paths.len(),
+                    workspace = workspace_filter.log_value(),
+                    %server,
+                    "codex transcript import starting"
+                );
+                import_codex_sessions(&server, &paths, workspace_filter.as_ref())?;
             }
             CodexCommand::Stories {
                 sessions,
                 history,
                 sessions_dir,
+                workspace,
             } => {
                 let history = history.unwrap_or_else(default_codex_history);
                 let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
-                let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
+                let paths = active_codex_session_paths(
+                    &history,
+                    &sessions_dir,
+                    sessions,
+                    workspace_filter.as_ref(),
+                )?;
                 info!(
                     sessions_requested = sessions,
                     sessions_found = paths.len(),
+                    workspace = workspace_filter.log_value(),
                     "codex story compilation starting"
                 );
-                let stories = compile_codex_stories(&paths)?;
+                let stories = compile_codex_stories(&paths, workspace_filter.as_ref())?;
                 print_stories("codex", &paths, &stories)?;
             }
         },
@@ -637,15 +712,22 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             ClaudeCommand::Active {
                 sessions,
                 projects_dir,
+                workspace,
                 server,
                 watch,
                 poll_ms,
             } => {
                 let projects_dir = projects_dir.unwrap_or_else(default_claude_projects_dir);
-                let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
+                let paths = active_claude_session_paths(
+                    &projects_dir,
+                    sessions,
+                    workspace_filter.as_ref(),
+                )?;
                 info!(
                     sessions_requested = sessions,
                     sessions_found = paths.len(),
+                    workspace = workspace_filter.log_value(),
                     %server,
                     watch,
                     poll_ms,
@@ -653,34 +735,62 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     "claude active session capture starting"
                 );
                 if watch {
-                    watch_claude_sessions(&server, &paths, poll_ms)?;
+                    watch_claude_sessions(&server, &paths, poll_ms, workspace_filter.as_ref())?;
                 } else {
-                    import_claude_sessions(&server, &paths)?;
+                    import_claude_sessions(&server, &paths, workspace_filter.as_ref())?;
                 }
             }
-            ClaudeCommand::Import { paths, server } => {
-                info!(sessions = paths.len(), %server, "claude stream import starting");
-                import_claude_sessions(&server, &paths)?;
+            ClaudeCommand::Import {
+                paths,
+                workspace,
+                server,
+            } => {
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
+                info!(
+                    sessions = paths.len(),
+                    workspace = workspace_filter.log_value(),
+                    %server,
+                    "claude stream import starting"
+                );
+                import_claude_sessions(&server, &paths, workspace_filter.as_ref())?;
             }
-            ClaudeCommand::Stream { server } => {
+            ClaudeCommand::Stream { workspace, server } => {
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
                 let mut input = String::new();
                 std::io::stdin().read_to_string(&mut input)?;
-                info!(%server, bytes = input.len(), "claude stream stdin import starting");
-                let imported = import_claude_stream_input(&server, Path::new("<stdin>"), &input);
-                println!("claude stream imported: {imported} events from stdin");
+                info!(
+                    %server,
+                    bytes = input.len(),
+                    workspace = workspace_filter.log_value(),
+                    "claude stream stdin import starting"
+                );
+                let stats = import_claude_stream_input(
+                    &server,
+                    Path::new("<stdin>"),
+                    &input,
+                    workspace_filter.as_ref(),
+                );
+                print_import_complete("claude stream", stats);
             }
             ClaudeCommand::Stories {
                 sessions,
                 projects_dir,
+                workspace,
             } => {
                 let projects_dir = projects_dir.unwrap_or_else(default_claude_projects_dir);
-                let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
+                let paths = active_claude_session_paths(
+                    &projects_dir,
+                    sessions,
+                    workspace_filter.as_ref(),
+                )?;
                 info!(
                     sessions_requested = sessions,
                     sessions_found = paths.len(),
+                    workspace = workspace_filter.log_value(),
                     "claude story compilation starting"
                 );
-                let stories = compile_claude_stories(&paths)?;
+                let stories = compile_claude_stories(&paths, workspace_filter.as_ref())?;
                 print_stories("claude", &paths, &stories)?;
             }
         },
@@ -856,6 +966,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 history,
                 sessions_dir,
                 claude_projects_dir,
+                workspace,
                 summarizer,
                 summary_style,
                 summary_prompt_max_chars,
@@ -879,11 +990,13 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     ));
                 }
                 let selected_agents = parse_agent_list(&agents);
+                let workspace_filter = WorkspaceFilter::from_cli(workspace)?;
                 info!(
                     feed_name = %feed,
                     agents = %agents,
                     selected_agents = ?selected_agents,
                     sessions,
+                    workspace = workspace_filter.log_value(),
                     summarizer = %summarizer,
                     per_story,
                     images,
@@ -894,15 +1007,24 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 if selected_agents.contains("codex") {
                     let history = history.unwrap_or_else(default_codex_history);
                     let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
-                    let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
-                    stories.extend(compile_codex_stories(&paths)?);
+                    let paths = active_codex_session_paths(
+                        &history,
+                        &sessions_dir,
+                        sessions,
+                        workspace_filter.as_ref(),
+                    )?;
+                    stories.extend(compile_codex_stories(&paths, workspace_filter.as_ref())?);
                     captured_paths.extend(paths);
                 }
                 if selected_agents.contains("claude") {
                     let projects_dir =
                         claude_projects_dir.unwrap_or_else(default_claude_projects_dir);
-                    let paths = active_claude_session_paths(&projects_dir, sessions)?;
-                    stories.extend(compile_claude_stories(&paths)?);
+                    let paths = active_claude_session_paths(
+                        &projects_dir,
+                        sessions,
+                        workspace_filter.as_ref(),
+                    )?;
+                    stories.extend(compile_claude_stories(&paths, workspace_filter.as_ref())?);
                     captured_paths.extend(paths);
                 }
                 let summary_config = summary_config(SummaryCliOptions {
@@ -1107,6 +1229,142 @@ fn parse_feed_arg(value: &str) -> Result<String, String> {
         .map_err(|err| err.to_string())
 }
 
+#[derive(Clone, Debug)]
+struct WorkspaceFilter {
+    root: PathBuf,
+}
+
+impl WorkspaceFilter {
+    fn from_cli(path: Option<PathBuf>) -> Result<Option<Self>, CliError> {
+        path.map(|path| {
+            let root = normalize_absolute_path(expand_home_path(path))?;
+            info!(workspace = %root.display(), "workspace capture filter enabled");
+            Ok(Self { root })
+        })
+        .transpose()
+    }
+
+    fn allows(&self, event: &AgentEvent) -> bool {
+        let Some(cwd) = event.cwd.as_deref() else {
+            return false;
+        };
+        let Ok(cwd) = normalize_absolute_path(expand_home_path(PathBuf::from(cwd))) else {
+            return false;
+        };
+        cwd == self.root || cwd.starts_with(&self.root)
+    }
+
+    fn display(&self) -> String {
+        self.root.display().to_string()
+    }
+}
+
+trait WorkspaceFilterLogValue {
+    fn log_value(&self) -> &str;
+}
+
+impl WorkspaceFilterLogValue for Option<WorkspaceFilter> {
+    fn log_value(&self) -> &str {
+        self.as_ref()
+            .map(|filter| filter.root.to_str().unwrap_or("<non-utf8>"))
+            .unwrap_or("all")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ImportStats {
+    imported: usize,
+    filtered: usize,
+}
+
+impl ImportStats {
+    fn add(&mut self, other: Self) {
+        self.imported += other.imported;
+        self.filtered += other.filtered;
+    }
+}
+
+#[derive(Debug, Default)]
+struct CollectedEvents {
+    events: Vec<AgentEvent>,
+    filtered: usize,
+}
+
+fn event_matches_workspace(
+    event: &AgentEvent,
+    workspace: Option<&WorkspaceFilter>,
+    path: &Path,
+    source: &str,
+) -> bool {
+    let Some(workspace) = workspace else {
+        return true;
+    };
+    if workspace.allows(event) {
+        return true;
+    }
+    debug!(
+        %source,
+        path = %path.display(),
+        event_id = %event.id,
+        cwd = event.cwd.as_deref().unwrap_or("<none>"),
+        workspace = %workspace.display(),
+        "agent event dropped by workspace filter"
+    );
+    false
+}
+
+fn normalize_absolute_path(path: PathBuf) -> Result<PathBuf, CliError> {
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(clean_path(&absolute))
+}
+
+fn expand_home_path(path: PathBuf) -> PathBuf {
+    let Some(raw) = path.to_str().map(ToOwned::to_owned) else {
+        return path;
+    };
+    if raw == "~" {
+        return home_dir().unwrap_or(path);
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return home.join(rest);
+    }
+    path
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let mut cleaned = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                cleaned.pop();
+            }
+            std::path::Component::Normal(part) => cleaned.push(part),
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                cleaned.push(component.as_os_str());
+            }
+        }
+    }
+    cleaned
+}
+
+fn print_import_complete(label: &str, stats: ImportStats) {
+    if stats.filtered == 0 {
+        println!("{label} import complete: {} events", stats.imported);
+    } else {
+        println!(
+            "{label} import complete: {} events; {} filtered outside workspace",
+            stats.imported, stats.filtered
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,6 +1388,47 @@ mod tests {
             panic!("expected p2p publish command");
         };
         assert_eq!(feed, "gpu-vm");
+    }
+
+    #[test]
+    fn codex_active_accepts_workspace_scope() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "codex",
+            "active",
+            "--workspace",
+            "/tmp/agent-feed-workspace",
+        ])
+        .expect("workspace scope parses");
+
+        let Commands::Codex {
+            command: CodexCommand::Active { workspace, .. },
+        } = cli.command
+        else {
+            panic!("expected codex active command");
+        };
+        assert_eq!(workspace, Some(PathBuf::from("/tmp/agent-feed-workspace")));
+    }
+
+    #[test]
+    fn p2p_publish_accepts_workspace_scope() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "p2p",
+            "publish",
+            "--dry-run",
+            "--workspace",
+            "/tmp/agent-feed-workspace",
+        ])
+        .expect("workspace scope parses");
+
+        let Commands::P2p {
+            command: P2pCommand::Publish { workspace, .. },
+        } = cli.command
+        else {
+            panic!("expected p2p publish command");
+        };
+        assert_eq!(workspace, Some(PathBuf::from("/tmp/agent-feed-workspace")));
     }
 
     #[test]
@@ -1177,6 +1476,99 @@ mod tests {
 
         assert_eq!(cli.log_level, "debug");
         assert_eq!(cli.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn workspace_filter_accepts_child_cwd_and_rejects_missing_cwd() {
+        let root = PathBuf::from("/tmp/agent-feed-workspace");
+        let filter = WorkspaceFilter::from_cli(Some(root.clone()))
+            .expect("filter builds")
+            .expect("filter enabled");
+
+        let mut event = AgentEvent::new(
+            agent_feed_core::SourceKind::Codex,
+            agent_feed_core::EventKind::TurnComplete,
+            "done",
+        );
+        event.cwd = Some(root.join("crate").display().to_string());
+        assert!(filter.allows(&event));
+
+        event.cwd = Some("/tmp/other-workspace".to_string());
+        assert!(!filter.allows(&event));
+
+        event.cwd = None;
+        assert!(!filter.allows(&event));
+    }
+
+    #[test]
+    fn codex_collection_filters_by_workspace_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-feed-cli-workspace-filter-{}",
+            std::process::id()
+        ));
+        let workspace = root.join("repo");
+        let other = root.join("other");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&other).expect("other dir");
+        let transcript = root.join("codex.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "codex-workspace-test", "cwd": workspace}
+            }),
+            json!({
+                "type": "turn_context",
+                "timestamp": "2026-04-24T03:16:49.697Z",
+                "payload": {"cwd": workspace, "turn_id": "turn_1"}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-24T03:17:00.000Z",
+                "payload": {
+                    "type": "exec_command_end",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "duration": "120ms",
+                    "command": ["cargo", "test"]
+                }
+            }),
+            json!({
+                "type": "turn_context",
+                "timestamp": "2026-04-24T03:18:49.697Z",
+                "payload": {"cwd": other, "turn_id": "turn_2"}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-24T03:19:00.000Z",
+                "payload": {
+                    "type": "exec_command_end",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "duration": "120ms",
+                    "command": ["cargo", "fmt"]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&transcript, format!("{lines}\n")).expect("write transcript");
+
+        let filter = WorkspaceFilter::from_cli(Some(workspace.clone()))
+            .expect("filter builds")
+            .expect("filter enabled");
+        let collected =
+            collect_codex_events(&transcript, Some(&filter)).expect("codex collection works");
+        assert!(collected.filtered > 0);
+        assert!(!collected.events.is_empty());
+        assert!(collected.events.iter().all(|event| filter.allows(event)));
+
+        let unfiltered = collect_codex_events(&transcript, None).expect("unfiltered collection");
+        assert!(unfiltered.events.len() > collected.events.len());
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
 }
 
@@ -1226,81 +1618,120 @@ fn hook_payload(source: &str, event: &str, input: &str) -> String {
     }
 }
 
-fn import_codex_sessions(server: &str, paths: &[PathBuf]) -> Result<(), CliError> {
+fn import_codex_sessions(
+    server: &str,
+    paths: &[PathBuf],
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<(), CliError> {
     if paths.is_empty() {
         println!("codex transcript import complete: 0 events; no sessions found");
         return Ok(());
     }
 
-    let mut imported = 0usize;
+    let mut total = ImportStats::default();
     for path in paths {
         let input = fs::read_to_string(path)?;
         let mut state = TranscriptState::default();
-        let file_events = import_codex_chunk(server, path, &input, &mut state);
-        imported += file_events;
+        let file_stats = import_codex_chunk(server, path, &input, &mut state, workspace);
+        total.add(file_stats);
         info!(
             path = %path.display(),
-            events = file_events,
-            total_events = imported,
+            events = file_stats.imported,
+            filtered_events = file_stats.filtered,
+            total_events = total.imported,
+            total_filtered_events = total.filtered,
+            workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "codex transcript imported"
         );
-        println!(
-            "codex transcript imported: {} events from {}",
-            file_events,
-            path.display()
-        );
+        print_import_file("codex transcript", path, file_stats);
     }
-    println!("codex transcript import complete: {imported} events");
+    print_import_complete("codex transcript", total);
     Ok(())
 }
 
-fn compile_codex_stories(paths: &[PathBuf]) -> Result<Vec<CompiledStory>, CliError> {
+fn compile_codex_stories(
+    paths: &[PathBuf],
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<Vec<CompiledStory>, CliError> {
     let mut events = Vec::new();
+    let mut filtered = 0usize;
     for path in paths {
-        events.extend(collect_codex_events(path)?);
+        let collected = collect_codex_events(path, workspace)?;
+        filtered += collected.filtered;
+        events.extend(collected.events);
     }
+    info!(
+        sessions = paths.len(),
+        events = events.len(),
+        filtered_events = filtered,
+        workspace = workspace
+            .map(WorkspaceFilter::display)
+            .unwrap_or_else(|| "all".to_string()),
+        "codex events collected for story compilation"
+    );
     Ok(compile_events(events))
 }
 
-fn import_claude_sessions(server: &str, paths: &[PathBuf]) -> Result<(), CliError> {
+fn import_claude_sessions(
+    server: &str,
+    paths: &[PathBuf],
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<(), CliError> {
     if paths.is_empty() {
         println!("claude stream import complete: 0 events; no sessions found");
         return Ok(());
     }
 
-    let mut imported = 0usize;
+    let mut total = ImportStats::default();
     for path in paths {
         let input = fs::read_to_string(path)?;
-        let file_events = import_claude_stream_input(server, path, &input);
-        imported += file_events;
+        let file_stats = import_claude_stream_input(server, path, &input, workspace);
+        total.add(file_stats);
         info!(
             path = %path.display(),
-            events = file_events,
-            total_events = imported,
+            events = file_stats.imported,
+            filtered_events = file_stats.filtered,
+            total_events = total.imported,
+            total_filtered_events = total.filtered,
+            workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "claude stream imported"
         );
-        println!(
-            "claude stream imported: {} events from {}",
-            file_events,
-            path.display()
-        );
+        print_import_file("claude stream", path, file_stats);
     }
-    println!("claude stream import complete: {imported} events");
+    print_import_complete("claude stream", total);
     Ok(())
 }
 
-fn compile_claude_stories(paths: &[PathBuf]) -> Result<Vec<CompiledStory>, CliError> {
+fn compile_claude_stories(
+    paths: &[PathBuf],
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<Vec<CompiledStory>, CliError> {
     let mut events = Vec::new();
+    let mut filtered = 0usize;
     for path in paths {
-        events.extend(collect_claude_events(path)?);
+        let collected = collect_claude_events(path, workspace)?;
+        filtered += collected.filtered;
+        events.extend(collected.events);
     }
+    info!(
+        sessions = paths.len(),
+        events = events.len(),
+        filtered_events = filtered,
+        workspace = workspace
+            .map(WorkspaceFilter::display)
+            .unwrap_or_else(|| "all".to_string()),
+        "claude events collected for story compilation"
+    );
     Ok(compile_events(events))
 }
 
-fn collect_codex_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
+fn collect_codex_events(
+    path: &Path,
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<CollectedEvents, CliError> {
     let input = fs::read_to_string(path)?;
     let mut state = TranscriptState::default();
-    let mut events = Vec::new();
+    let mut collected = CollectedEvents::default();
     for (index, line) in input
         .lines()
         .map(str::trim)
@@ -1325,16 +1756,23 @@ fn collect_codex_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
             }
         };
         if let Some(event) = normalize_transcript_value(value, &mut state, Some(path)) {
-            events.push(event);
+            if event_matches_workspace(&event, workspace, path, "codex") {
+                collected.events.push(event);
+            } else {
+                collected.filtered += 1;
+            }
         }
     }
-    Ok(events)
+    Ok(collected)
 }
 
-fn collect_claude_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
+fn collect_claude_events(
+    path: &Path,
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<CollectedEvents, CliError> {
     let input = fs::read_to_string(path)?;
     let mut state = ClaudeState::default();
-    let mut events = Vec::new();
+    let mut collected = CollectedEvents::default();
     for (index, line) in input
         .lines()
         .map(str::trim)
@@ -1359,10 +1797,65 @@ fn collect_claude_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
             }
         };
         if let Some(event) = normalize_stream_value(value, &mut state, Some(path)) {
-            events.push(event);
+            if event_matches_workspace(&event, workspace, path, "claude") {
+                collected.events.push(event);
+            } else {
+                collected.filtered += 1;
+            }
         }
     }
-    Ok(events)
+    Ok(collected)
+}
+
+fn print_import_file(label: &str, path: &Path, stats: ImportStats) {
+    if stats.filtered == 0 {
+        println!(
+            "{label} imported: {} events from {}",
+            stats.imported,
+            path.display()
+        );
+    } else {
+        println!(
+            "{label} imported: {} events from {}; {} filtered outside workspace",
+            stats.imported,
+            path.display(),
+            stats.filtered
+        );
+    }
+}
+
+fn print_watch_started(label: &str, path: &Path, stats: ImportStats) {
+    if stats.filtered == 0 {
+        println!(
+            "{label} watching: {} ({} initial events)",
+            path.display(),
+            stats.imported
+        );
+    } else {
+        println!(
+            "{label} watching: {} ({} initial events; {} filtered outside workspace)",
+            path.display(),
+            stats.imported,
+            stats.filtered
+        );
+    }
+}
+
+fn print_watch_appended(label: &str, path: &Path, stats: ImportStats) {
+    if stats.filtered == 0 {
+        println!(
+            "{label} imported: {} appended events from {}",
+            stats.imported,
+            path.display()
+        );
+    } else {
+        println!(
+            "{label} imported: {} appended events from {}; {} filtered outside workspace",
+            stats.imported,
+            path.display(),
+            stats.filtered
+        );
+    }
 }
 
 fn print_stories(
@@ -1523,25 +2016,28 @@ fn parse_visibility(value: &str) -> FeedVisibility {
     }
 }
 
-fn watch_codex_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Result<(), CliError> {
+fn watch_codex_sessions(
+    server: &str,
+    paths: &[PathBuf],
+    poll_ms: u64,
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
         let input = fs::read_to_string(path)?;
         let mut state = TranscriptState::default();
-        let imported = import_codex_chunk(server, path, &input, &mut state);
+        let stats = import_codex_chunk(server, path, &input, &mut state, workspace);
         let offset = fs::metadata(path)?.len();
         info!(
             path = %path.display(),
-            initial_events = imported,
+            initial_events = stats.imported,
+            filtered_events = stats.filtered,
             offset,
             poll_ms,
+            workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "codex transcript watcher started"
         );
-        println!(
-            "codex transcript watching: {} ({} initial events)",
-            path.display(),
-            imported
-        );
+        print_watch_started("codex transcript", path, stats);
         watchers.push(CodexWatcher {
             path: path.clone(),
             offset,
@@ -1564,19 +2060,22 @@ fn watch_codex_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Result
             watcher.offset = len;
             watcher.pending.push_str(&chunk);
             let complete = split_complete_jsonl(&mut watcher.pending);
-            let imported = import_codex_chunk(server, &watcher.path, &complete, &mut watcher.state);
-            if imported > 0 {
+            let stats = import_codex_chunk(
+                server,
+                &watcher.path,
+                &complete,
+                &mut watcher.state,
+                workspace,
+            );
+            if stats.imported > 0 || stats.filtered > 0 {
                 info!(
                     path = %watcher.path.display(),
-                    events = imported,
+                    events = stats.imported,
+                    filtered_events = stats.filtered,
                     offset = watcher.offset,
                     "codex transcript appended events imported"
                 );
-                println!(
-                    "codex transcript imported: {} appended events from {}",
-                    imported,
-                    watcher.path.display()
-                );
+                print_watch_appended("codex transcript", &watcher.path, stats);
             }
         }
     }
@@ -1587,8 +2086,9 @@ fn import_codex_chunk(
     path: &Path,
     input: &str,
     state: &mut TranscriptState,
-) -> usize {
-    let mut imported = 0usize;
+    workspace: Option<&WorkspaceFilter>,
+) -> ImportStats {
+    let mut stats = ImportStats::default();
     for (index, line) in input
         .lines()
         .map(str::trim)
@@ -1616,6 +2116,10 @@ fn import_codex_chunk(
         let Some(event) = normalize_transcript_value(value, state, Some(path)) else {
             continue;
         };
+        if !event_matches_workspace(&event, workspace, path, "codex") {
+            stats.filtered += 1;
+            continue;
+        }
         let body = match serde_json::to_string(&event) {
             Ok(body) => body,
             Err(err) => {
@@ -1652,30 +2156,33 @@ fn import_codex_chunk(
             severity = ?event.severity,
             "codex event outgoing"
         );
-        imported += 1;
+        stats.imported += 1;
     }
-    imported
+    stats
 }
 
-fn watch_claude_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Result<(), CliError> {
+fn watch_claude_sessions(
+    server: &str,
+    paths: &[PathBuf],
+    poll_ms: u64,
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
         let input = fs::read_to_string(path)?;
         let mut state = ClaudeState::default();
-        let imported = import_claude_chunk(server, path, &input, &mut state);
+        let stats = import_claude_chunk(server, path, &input, &mut state, workspace);
         let offset = fs::metadata(path)?.len();
         info!(
             path = %path.display(),
-            initial_events = imported,
+            initial_events = stats.imported,
+            filtered_events = stats.filtered,
             offset,
             poll_ms,
+            workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "claude stream watcher started"
         );
-        println!(
-            "claude stream watching: {} ({} initial events)",
-            path.display(),
-            imported
-        );
+        print_watch_started("claude stream", path, stats);
         watchers.push(ClaudeWatcher {
             path: path.clone(),
             offset,
@@ -1698,32 +2205,45 @@ fn watch_claude_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Resul
             watcher.offset = len;
             watcher.pending.push_str(&chunk);
             let complete = split_complete_jsonl(&mut watcher.pending);
-            let imported =
-                import_claude_chunk(server, &watcher.path, &complete, &mut watcher.state);
-            if imported > 0 {
+            let stats = import_claude_chunk(
+                server,
+                &watcher.path,
+                &complete,
+                &mut watcher.state,
+                workspace,
+            );
+            if stats.imported > 0 || stats.filtered > 0 {
                 info!(
                     path = %watcher.path.display(),
-                    events = imported,
+                    events = stats.imported,
+                    filtered_events = stats.filtered,
                     offset = watcher.offset,
                     "claude stream appended events imported"
                 );
-                println!(
-                    "claude stream imported: {} appended events from {}",
-                    imported,
-                    watcher.path.display()
-                );
+                print_watch_appended("claude stream", &watcher.path, stats);
             }
         }
     }
 }
 
-fn import_claude_stream_input(server: &str, path: &Path, input: &str) -> usize {
+fn import_claude_stream_input(
+    server: &str,
+    path: &Path,
+    input: &str,
+    workspace: Option<&WorkspaceFilter>,
+) -> ImportStats {
     let mut state = ClaudeState::default();
-    import_claude_chunk(server, path, input, &mut state)
+    import_claude_chunk(server, path, input, &mut state, workspace)
 }
 
-fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut ClaudeState) -> usize {
-    let mut imported = 0usize;
+fn import_claude_chunk(
+    server: &str,
+    path: &Path,
+    input: &str,
+    state: &mut ClaudeState,
+    workspace: Option<&WorkspaceFilter>,
+) -> ImportStats {
+    let mut stats = ImportStats::default();
     for (index, line) in input
         .lines()
         .map(str::trim)
@@ -1751,6 +2271,10 @@ fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut Claud
         let Some(event) = normalize_stream_value(value, state, Some(path)) else {
             continue;
         };
+        if !event_matches_workspace(&event, workspace, path, "claude") {
+            stats.filtered += 1;
+            continue;
+        }
         let body = match serde_json::to_string(&event) {
             Ok(body) => body,
             Err(err) => {
@@ -1787,9 +2311,9 @@ fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut Claud
             severity = ?event.severity,
             "claude event outgoing"
         );
-        imported += 1;
+        stats.imported += 1;
     }
-    imported
+    stats
 }
 
 fn split_complete_jsonl(buffer: &mut String) -> String {
@@ -1826,6 +2350,7 @@ fn active_codex_session_paths(
     history: &Path,
     sessions_dir: &Path,
     limit: usize,
+    workspace: Option<&WorkspaceFilter>,
 ) -> Result<Vec<PathBuf>, CliError> {
     if limit == 0 || !history.exists() || !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -1833,37 +2358,70 @@ fn active_codex_session_paths(
 
     let input = fs::read_to_string(history)?;
     let mut seen = HashSet::new();
-    let mut ids = Vec::new();
+    let mut paths = Vec::new();
     for line in input.lines().rev() {
         let value = serde_json::from_str::<Value>(line)?;
         let Some(session_id) = value.get("session_id").and_then(Value::as_str) else {
             continue;
         };
-        if seen.insert(session_id.to_string()) {
-            ids.push(session_id.to_string());
+        if !seen.insert(session_id.to_string()) {
+            continue;
         }
-        if ids.len() >= limit {
+        if let Some(path) = find_session_path(sessions_dir, session_id)? {
+            if session_matches_workspace(&path, workspace, collect_codex_events)? {
+                paths.push(path);
+            } else if let Some(workspace) = workspace {
+                debug!(
+                    session_id,
+                    path = %path.display(),
+                    workspace = %workspace.display(),
+                    "codex active session skipped by workspace filter"
+                );
+            }
+        }
+        if paths.len() >= limit {
             break;
-        }
-    }
-
-    let mut paths = Vec::new();
-    for session_id in ids {
-        if let Some(path) = find_session_path(sessions_dir, &session_id)? {
-            paths.push(path);
         }
     }
     Ok(paths)
 }
 
-fn active_claude_session_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, CliError> {
+fn active_claude_session_paths(
+    root: &Path,
+    limit: usize,
+    workspace: Option<&WorkspaceFilter>,
+) -> Result<Vec<PathBuf>, CliError> {
     if limit == 0 || !root.exists() {
         return Ok(Vec::new());
     }
 
-    let mut paths = jsonl_files_by_mtime(root)?;
-    paths.truncate(limit);
+    let mut paths = Vec::new();
+    for path in jsonl_files_by_mtime(root)? {
+        if session_matches_workspace(&path, workspace, collect_claude_events)? {
+            paths.push(path);
+        } else if let Some(workspace) = workspace {
+            debug!(
+                path = %path.display(),
+                workspace = %workspace.display(),
+                "claude active session skipped by workspace filter"
+            );
+        }
+        if paths.len() >= limit {
+            break;
+        }
+    }
     Ok(paths)
+}
+
+fn session_matches_workspace(
+    path: &Path,
+    workspace: Option<&WorkspaceFilter>,
+    collect: fn(&Path, Option<&WorkspaceFilter>) -> Result<CollectedEvents, CliError>,
+) -> Result<bool, CliError> {
+    if workspace.is_none() {
+        return Ok(true);
+    }
+    Ok(!collect(path, workspace)?.events.is_empty())
 }
 
 fn jsonl_files_by_mtime(root: &Path) -> Result<Vec<PathBuf>, CliError> {

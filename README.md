@@ -46,11 +46,15 @@ agent-feed codex active --sessions 2 --watch
 agent-feed claude active --sessions 2 --watch
 ```
 
+to opt in only one workspace, add `--workspace /path/to/repo` to the codex,
+claude, or p2p publish commands. events without a matching `cwd` are ignored
+before import, story compilation, or p2p publishing.
+
 for an existing transcript or stream:
 
 ```sh
-agent-feed ingest --source codex-jsonl < events.jsonl
-agent-feed ingest --source claude-stream-json < events.jsonl
+agent-feed codex import path/to/codex-session.jsonl
+agent-feed claude import path/to/claude-stream.jsonl
 ```
 
 that is enough for the normal local loop: start the daemon, attach future or
