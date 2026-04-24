@@ -1,0 +1,154 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: rust lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: format
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: rust tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: test
+        run: cargo test --workspace
+
+  package:
+    name: package and install
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: package workspace
+        run: cargo package --workspace --exclude xtask --locked
+
+      - name: install cli from workspace
+        run: cargo install --path crates/agent_feed_cli --locked --root "$RUNNER_TEMP/agent-feed-install"
+
+      - name: smoke installed cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/agent-feed-install/bin/agent-feed"
+          "$bin" --help >/tmp/agent-feed-help.txt
+          "$bin" serve --bind 127.0.0.1:7780 >/tmp/agent-feed-server.log 2>&1 &
+          pid="$!"
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fsSL --connect-timeout 2 --max-time 5 http://127.0.0.1:7780/api/health | grep -q ok; then
+              curl -fsSL --connect-timeout 2 --max-time 5 http://127.0.0.1:7780/reel | grep -q '<title>feed</title>'
+              exit 0
+            fi
+            echo "waiting for agent-feed serve; attempt ${attempt}/30"
+            sleep 1
+          done
+          cat /tmp/agent-feed-server.log >&2
+          exit 1
+
+  browser-site:
+    name: browser site
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: build browser site
+        run: cargo run -p xtask -- build-browser-site --out-dir target/feed-site --no-cname
+
+      - name: smoke browser site
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s target/feed-site/index.html
+          test -s target/feed-site/404.html
+          test -s target/feed-site/feed-config.json
+          grep -q '<title>feed</title>' target/feed-site/index.html
+
+      - name: upload browser site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-browser-site
+          path: target/feed-site
+          if-no-files-found: error
+
+  terraform:
+    name: terraform validate
+    runs-on: ubuntu-latest
+    env:
+      TF_ROOT: crates/agent_feed_p2p/deploy/terraform/aws
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.8
+
+      - name: terraform format
+        run: terraform fmt -check -recursive "$TF_ROOT"
+
+      - name: terraform init
+        run: terraform -chdir="$TF_ROOT" init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform -chdir="$TF_ROOT" validate
