@@ -147,6 +147,10 @@ body.controls-visible .mode-switcher,
   background: var(--line);
 }
 
+.stage-progress[hidden] {
+  display: none;
+}
+
 .stage-progress span {
   display: block;
   width: 100%;

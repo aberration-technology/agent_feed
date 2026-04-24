@@ -75,6 +75,7 @@ function restartStageProgress(dwellMs = 14000) {
   const duration = Number.isFinite(Number(dwellMs))
     ? Math.max(Number(dwellMs), 1000)
     : 14000;
+  stageProgress.hidden = false;
   stageProgress.style.setProperty("--dwell", `${duration}ms`);
   stageProgress.classList.remove("is-running");
   void stageProgress.offsetWidth;
@@ -84,6 +85,8 @@ function restartStageProgress(dwellMs = 14000) {
 function stopStageProgress() {
   if (stageProgress) {
     stageProgress.classList.remove("is-running");
+    stageProgress.style.removeProperty("--dwell");
+    stageProgress.hidden = true;
   }
 }
 
@@ -106,7 +109,11 @@ function renderBulletin(bulletin) {
     renderChips(bulletin.chips || []);
     renderTicker(bulletin.ticker || []);
     stage?.classList.remove("is-changing");
-    restartStageProgress(bulletin.dwell_ms || bulletin.dwellMs || 14000);
+    if (bulletins.length > 1) {
+      restartStageProgress(bulletin.dwell_ms || bulletin.dwellMs || 14000);
+    } else {
+      stopStageProgress();
+    }
   }, 180);
 }
 
@@ -228,7 +235,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
     "redacted",
   ]);
   renderTicker(lines);
-  restartStageProgress(state === "live" ? 14000 : 30000);
+  stopStageProgress();
 }
 
 function renderP2pDisabled(route) {
@@ -247,7 +254,7 @@ function renderP2pDisabled(route) {
   clearAuthAction();
   renderChips(["local", "no-p2p", "redacted"]);
   renderTicker(["start with --p2p or use the hosted p2p browser shell"]);
-  restartStageProgress(30000);
+  stopStageProgress();
 }
 
 function renderAuthRequired(route) {
@@ -299,6 +306,7 @@ function scheduleNext(dwellMs) {
   window.clearTimeout(dwellTimer);
   dwellTimer = window.setTimeout(() => {
     if (bulletins.length <= 1) {
+      stopStageProgress();
       scheduleNext(dwellMs);
       return;
     }
@@ -319,6 +327,8 @@ function applySnapshot(snapshot) {
     activeIndex = index >= 0 ? index : bulletins.length - 1;
     renderBulletin(snapshot.active);
     scheduleNext(snapshot.active.dwell_ms || 14000);
+  } else {
+    stopStageProgress();
   }
   updateSourceCount();
 }
@@ -332,6 +342,7 @@ async function hydrate() {
     applySnapshot(await response.json());
   } catch (error) {
     setText(liveState, "WAIT");
+    stopStageProgress();
     logError("snapshot hydration failed", error);
   }
 }
@@ -634,7 +645,7 @@ function handleGithubAuthCallback(callback) {
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   renderChips(["github", "verified", "browser", "session"]);
-  restartStageProgress(30000);
+  stopStageProgress();
   const expectedState =
     window.localStorage.getItem("feed.github.auth_state") ||
     window.localStorage.getItem("agent_feed.github.auth_state") ||
@@ -704,7 +715,7 @@ function startNetworkView() {
     renderChips(["github", "browser", "private feeds", "redacted"]);
   }
   renderTicker(["auth stays on the edge", "projection remains story-only"]);
-  restartStageProgress(30000);
+  stopStageProgress();
 }
 
 async function startRemoteRoute(route) {
@@ -807,7 +818,7 @@ function startSubscribedRoute(route) {
   if (route.interactive) {
     renderSubscribedTimeline(route, targets);
   } else {
-    restartStageProgress(30000);
+    stopStageProgress();
   }
   console.info("[feed] subscribed mode selected", {
     network: route.network,

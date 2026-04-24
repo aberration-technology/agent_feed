@@ -24,3 +24,28 @@ pub fn render_index_with_config(view: Option<&str>, config: &UiConfig) -> String
         .replace("/*__FEED_CONFIG__*/", &config_js)
         .replace("__REEL_VIEW__", view.unwrap_or("stage"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{UiConfig, render_index_with_config};
+
+    #[test]
+    fn stage_progress_starts_hidden() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("id=\"stage-progress\""));
+        assert!(html.contains("aria-hidden=\"true\" hidden"));
+    }
+
+    #[test]
+    fn remote_states_stop_dwell_progress() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let remote_state = html
+            .split("function renderRemoteState")
+            .nth(1)
+            .expect("remote state renderer is embedded");
+
+        assert!(remote_state.contains("stopStageProgress();"));
+        assert!(!remote_state.contains("restartStageProgress"));
+    }
+}
