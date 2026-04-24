@@ -249,14 +249,14 @@ async fn ingest_codex(
     State(state): State<Arc<AppState>>,
     Json(value): Json<Value>,
 ) -> Result<Json<IngestView>, AppError> {
-    ingest_value(state, value, SourceKind::Codex).await
+    ingest_agent_value(state, value, SourceKind::Codex).await
 }
 
 async fn ingest_claude(
     State(state): State<Arc<AppState>>,
     Json(value): Json<Value>,
 ) -> Result<Json<IngestView>, AppError> {
-    ingest_value(state, value, SourceKind::Claude).await
+    ingest_agent_value(state, value, SourceKind::Claude).await
 }
 
 async fn ingest_mcp(
@@ -282,6 +282,36 @@ async fn ingest_value(
         tracing::warn!(%source, error = %err, "ingest normalization failed");
         AppError::BadInput(err.to_string())
     })?;
+    ingest_event(state, event).await
+}
+
+async fn ingest_agent_value(
+    state: Arc<AppState>,
+    value: Value,
+    source: SourceKind,
+) -> Result<Json<IngestView>, AppError> {
+    let event = match source {
+        SourceKind::Codex => {
+            agent_reel_adapters::codex::normalize_exec_json(value).map_err(|err| {
+                tracing::warn!(%source, error = %err, "adapter normalization failed");
+                AppError::BadInput(err.to_string())
+            })?
+        }
+        SourceKind::Claude => {
+            agent_reel_adapters::claude::normalize_stream_json(value).map_err(|err| {
+                tracing::warn!(%source, error = %err, "adapter normalization failed");
+                AppError::BadInput(err.to_string())
+            })?
+        }
+        _ => unreachable!("ingest_agent_value only handles first-party agent adapters"),
+    };
+    ingest_event(state, event).await
+}
+
+async fn ingest_event(
+    state: Arc<AppState>,
+    event: AgentEvent,
+) -> Result<Json<IngestView>, AppError> {
     let event = state.redactor.redact_event(event);
     let event_id = event.id.to_string();
     let event_kind = event.kind.as_str();

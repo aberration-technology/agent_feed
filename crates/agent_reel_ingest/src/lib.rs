@@ -53,8 +53,10 @@ pub struct GenericIngestEvent {
 #[must_use]
 pub fn source_from_str(value: &str) -> SourceKind {
     match value {
-        "codex" | "codex-jsonl" | "codex-hook" | "codex-transcript" => SourceKind::Codex,
-        "claude" | "claude-stream-json" | "claude-hook" => SourceKind::Claude,
+        "codex" | "codex-jsonl" | "codex-exec-json" | "codex-hook" | "codex-transcript" => {
+            SourceKind::Codex
+        }
+        "claude" | "claude-code" | "claude-stream-json" | "claude-hook" => SourceKind::Claude,
         "mcp" => SourceKind::Mcp,
         "otel" => SourceKind::Otel,
         "shell" => SourceKind::Shell,

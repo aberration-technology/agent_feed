@@ -1,3 +1,4 @@
+use agent_reel_adapters::claude::{ClaudeState, normalize_stream_value};
 use agent_reel_adapters::codex::{TranscriptState, normalize_transcript_value};
 use agent_reel_auth_github::{
     GithubAuthError, GithubCliAuthConfig, GithubSessionStore, begin_cli_login, complete_cli_login,
@@ -28,8 +29,6 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
-const CODEX_SESSIONS_DIR: &str = "/home/mosure/.codex/sessions";
-const CODEX_HISTORY: &str = "/home/mosure/.codex/history.jsonl";
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-reel")]
@@ -82,6 +81,10 @@ enum Commands {
         #[command(subcommand)]
         command: CodexCommand,
     },
+    Claude {
+        #[command(subcommand)]
+        command: ClaudeCommand,
+    },
     P2p {
         #[command(subcommand)]
         command: P2pCommand,
@@ -127,10 +130,10 @@ enum CodexCommand {
     Active {
         #[arg(long, default_value_t = 2)]
         sessions: usize,
-        #[arg(long, default_value = CODEX_HISTORY)]
-        history: PathBuf,
-        #[arg(long, default_value = CODEX_SESSIONS_DIR)]
-        sessions_dir: PathBuf,
+        #[arg(long)]
+        history: Option<PathBuf>,
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
         #[arg(long, default_value = LOOPBACK_ADDR)]
         server: String,
         #[arg(long)]
@@ -146,14 +149,46 @@ enum CodexCommand {
     Stories {
         #[arg(long, default_value_t = 2)]
         sessions: usize,
-        #[arg(long, default_value = CODEX_HISTORY)]
-        history: PathBuf,
-        #[arg(long, default_value = CODEX_SESSIONS_DIR)]
-        sessions_dir: PathBuf,
+        #[arg(long)]
+        history: Option<PathBuf>,
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
     },
 }
 
 #[derive(Debug, Subcommand)]
+enum ClaudeCommand {
+    Active {
+        #[arg(long, default_value_t = 2)]
+        sessions: usize,
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
+        #[arg(long, default_value = LOOPBACK_ADDR)]
+        server: String,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value_t = 1000)]
+        poll_ms: u64,
+    },
+    Import {
+        paths: Vec<PathBuf>,
+        #[arg(long, default_value = LOOPBACK_ADDR)]
+        server: String,
+    },
+    Stream {
+        #[arg(long, default_value = LOOPBACK_ADDR)]
+        server: String,
+    },
+    Stories {
+        #[arg(long, default_value_t = 2)]
+        sessions: usize,
+        #[arg(long)]
+        projects_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum P2pCommand {
     Init,
     Join {
@@ -193,10 +228,14 @@ enum P2pCommand {
         feed: String,
         #[arg(long, default_value_t = 2)]
         sessions: usize,
-        #[arg(long, default_value = CODEX_HISTORY)]
-        history: PathBuf,
-        #[arg(long, default_value = CODEX_SESSIONS_DIR)]
-        sessions_dir: PathBuf,
+        #[arg(long, default_value = "codex,claude")]
+        agents: String,
+        #[arg(long)]
+        history: Option<PathBuf>,
+        #[arg(long)]
+        sessions_dir: Option<PathBuf>,
+        #[arg(long)]
+        claude_projects_dir: Option<PathBuf>,
         #[arg(long, default_value = "deterministic")]
         summarizer: String,
         #[arg(long)]
@@ -418,6 +457,8 @@ async fn main() -> Result<(), CliError> {
                 watch,
                 poll_ms,
             } => {
+                let history = history.unwrap_or_else(default_codex_history);
+                let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
                 let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
                 if watch {
                     watch_codex_sessions(&server, &paths, poll_ms)?;
@@ -433,9 +474,46 @@ async fn main() -> Result<(), CliError> {
                 history,
                 sessions_dir,
             } => {
+                let history = history.unwrap_or_else(default_codex_history);
+                let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
                 let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
                 let stories = compile_codex_stories(&paths)?;
-                print_stories(&paths, &stories)?;
+                print_stories("codex", &paths, &stories)?;
+            }
+        },
+        Commands::Claude { command } => match command {
+            ClaudeCommand::Active {
+                sessions,
+                projects_dir,
+                server,
+                watch,
+                poll_ms,
+            } => {
+                let projects_dir = projects_dir.unwrap_or_else(default_claude_projects_dir);
+                let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                if watch {
+                    watch_claude_sessions(&server, &paths, poll_ms)?;
+                } else {
+                    import_claude_sessions(&server, &paths)?;
+                }
+            }
+            ClaudeCommand::Import { paths, server } => {
+                import_claude_sessions(&server, &paths)?;
+            }
+            ClaudeCommand::Stream { server } => {
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input)?;
+                let imported = import_claude_stream_input(&server, Path::new("<stdin>"), &input);
+                println!("claude stream imported: {imported} events from stdin");
+            }
+            ClaudeCommand::Stories {
+                sessions,
+                projects_dir,
+            } => {
+                let projects_dir = projects_dir.unwrap_or_else(default_claude_projects_dir);
+                let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                let stories = compile_claude_stories(&paths)?;
+                print_stories("claude", &paths, &stories)?;
             }
         },
         Commands::P2p { command } => match command {
@@ -516,8 +594,10 @@ async fn main() -> Result<(), CliError> {
                 dry_run,
                 feed,
                 sessions,
+                agents,
                 history,
                 sessions_dir,
+                claude_projects_dir,
                 summarizer,
                 per_story,
                 allow_project_names,
@@ -535,8 +615,23 @@ async fn main() -> Result<(), CliError> {
                             .to_string(),
                     ));
                 }
-                let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
-                let stories = compile_codex_stories(&paths)?;
+                let selected_agents = parse_agent_list(&agents);
+                let mut captured_paths = Vec::new();
+                let mut stories = Vec::new();
+                if selected_agents.contains("codex") {
+                    let history = history.unwrap_or_else(default_codex_history);
+                    let sessions_dir = sessions_dir.unwrap_or_else(default_codex_sessions_dir);
+                    let paths = active_codex_session_paths(&history, &sessions_dir, sessions)?;
+                    stories.extend(compile_codex_stories(&paths)?);
+                    captured_paths.extend(paths);
+                }
+                if selected_agents.contains("claude") {
+                    let projects_dir =
+                        claude_projects_dir.unwrap_or_else(default_claude_projects_dir);
+                    let paths = active_claude_session_paths(&projects_dir, sessions)?;
+                    stories.extend(compile_claude_stories(&paths)?);
+                    captured_paths.extend(paths);
+                }
                 let summary_config = summary_config(SummaryCliOptions {
                     summarizer: &summarizer,
                     per_story,
@@ -551,10 +646,10 @@ async fn main() -> Result<(), CliError> {
                 })?;
                 let capsules = signed_capsules(&feed, &stories, &summary_config)?;
                 println!(
-                    "p2p publish dry-run: {} summarized capsules from {} stories and {} codex sessions",
+                    "p2p publish dry-run: {} summarized capsules from {} stories and {} local agent sessions",
                     capsules.len(),
                     stories.len(),
-                    paths.len()
+                    captured_paths.len()
                 );
                 for capsule in capsules.iter().take(8) {
                     println!("{}", serde_json::to_string(capsule)?);
@@ -658,6 +753,11 @@ fn hook_payload(source: &str, event: &str, input: &str) -> String {
 }
 
 fn import_codex_sessions(server: &str, paths: &[PathBuf]) -> Result<(), CliError> {
+    if paths.is_empty() {
+        println!("codex transcript import complete: 0 events; no sessions found");
+        return Ok(());
+    }
+
     let mut imported = 0usize;
     for path in paths {
         let input = fs::read_to_string(path)?;
@@ -678,6 +778,35 @@ fn compile_codex_stories(paths: &[PathBuf]) -> Result<Vec<CompiledStory>, CliErr
     let mut events = Vec::new();
     for path in paths {
         events.extend(collect_codex_events(path)?);
+    }
+    Ok(compile_events(events))
+}
+
+fn import_claude_sessions(server: &str, paths: &[PathBuf]) -> Result<(), CliError> {
+    if paths.is_empty() {
+        println!("claude stream import complete: 0 events; no sessions found");
+        return Ok(());
+    }
+
+    let mut imported = 0usize;
+    for path in paths {
+        let input = fs::read_to_string(path)?;
+        let file_events = import_claude_stream_input(server, path, &input);
+        imported += file_events;
+        println!(
+            "claude stream imported: {} events from {}",
+            file_events,
+            path.display()
+        );
+    }
+    println!("claude stream import complete: {imported} events");
+    Ok(())
+}
+
+fn compile_claude_stories(paths: &[PathBuf]) -> Result<Vec<CompiledStory>, CliError> {
+    let mut events = Vec::new();
+    for path in paths {
+        events.extend(collect_claude_events(path)?);
     }
     Ok(compile_events(events))
 }
@@ -710,9 +839,41 @@ fn collect_codex_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
     Ok(events)
 }
 
-fn print_stories(paths: &[PathBuf], stories: &[CompiledStory]) -> Result<(), CliError> {
+fn collect_claude_events(path: &Path) -> Result<Vec<AgentEvent>, CliError> {
+    let input = fs::read_to_string(path)?;
+    let mut state = ClaudeState::default();
+    let mut events = Vec::new();
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "agent-reel: failed to parse claude stream line {} in {}: {err}",
+                    index + 1,
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if let Some(event) = normalize_stream_value(value, &mut state, Some(path)) {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
+fn print_stories(
+    agent: &str,
+    paths: &[PathBuf],
+    stories: &[CompiledStory],
+) -> Result<(), CliError> {
     println!(
-        "codex stories compiled: {} stories from {} sessions",
+        "{agent} stories compiled: {} stories from {} sessions",
         stories.len(),
         paths.len()
     );
@@ -936,6 +1097,103 @@ fn import_codex_chunk(
     imported
 }
 
+fn watch_claude_sessions(server: &str, paths: &[PathBuf], poll_ms: u64) -> Result<(), CliError> {
+    let mut watchers = Vec::new();
+    for path in paths {
+        let input = fs::read_to_string(path)?;
+        let mut state = ClaudeState::default();
+        let imported = import_claude_chunk(server, path, &input, &mut state);
+        let offset = fs::metadata(path)?.len();
+        println!(
+            "claude stream watching: {} ({} initial events)",
+            path.display(),
+            imported
+        );
+        watchers.push(ClaudeWatcher {
+            path: path.clone(),
+            offset,
+            state,
+            pending: String::new(),
+        });
+    }
+
+    loop {
+        std::thread::sleep(Duration::from_millis(poll_ms.max(100)));
+        for watcher in &mut watchers {
+            let len = fs::metadata(&watcher.path)?.len();
+            if len <= watcher.offset {
+                continue;
+            }
+            let mut file = File::open(&watcher.path)?;
+            file.seek(SeekFrom::Start(watcher.offset))?;
+            let mut chunk = String::new();
+            file.read_to_string(&mut chunk)?;
+            watcher.offset = len;
+            watcher.pending.push_str(&chunk);
+            let complete = split_complete_jsonl(&mut watcher.pending);
+            let imported =
+                import_claude_chunk(server, &watcher.path, &complete, &mut watcher.state);
+            if imported > 0 {
+                println!(
+                    "claude stream imported: {} appended events from {}",
+                    imported,
+                    watcher.path.display()
+                );
+            }
+        }
+    }
+}
+
+fn import_claude_stream_input(server: &str, path: &Path, input: &str) -> usize {
+    let mut state = ClaudeState::default();
+    import_claude_chunk(server, path, input, &mut state)
+}
+
+fn import_claude_chunk(server: &str, path: &Path, input: &str, state: &mut ClaudeState) -> usize {
+    let mut imported = 0usize;
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "agent-reel: failed to parse claude stream line {} in {}: {err}",
+                    index + 1,
+                    path.display()
+                );
+                continue;
+            }
+        };
+
+        let Some(event) = normalize_stream_value(value, state, Some(path)) else {
+            continue;
+        };
+        let body = match serde_json::to_string(&event) {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!(
+                    "agent-reel: failed to encode claude event from {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if let Err(err) = post_json(server, "/ingest/claude/stream-json", &body) {
+            eprintln!(
+                "agent-reel: failed to post claude event from {}: {err}",
+                path.display()
+            );
+            continue;
+        }
+        imported += 1;
+    }
+    imported
+}
+
 fn split_complete_jsonl(buffer: &mut String) -> String {
     if buffer.ends_with('\n') {
         return std::mem::take(buffer);
@@ -958,11 +1216,23 @@ struct CodexWatcher {
     pending: String,
 }
 
+#[derive(Debug)]
+struct ClaudeWatcher {
+    path: PathBuf,
+    offset: u64,
+    state: ClaudeState,
+    pending: String,
+}
+
 fn active_codex_session_paths(
     history: &Path,
     sessions_dir: &Path,
     limit: usize,
 ) -> Result<Vec<PathBuf>, CliError> {
+    if limit == 0 || !history.exists() || !sessions_dir.exists() {
+        return Ok(Vec::new());
+    }
+
     let input = fs::read_to_string(history)?;
     let mut seen = HashSet::new();
     let mut ids = Vec::new();
@@ -988,7 +1258,44 @@ fn active_codex_session_paths(
     Ok(paths)
 }
 
+fn active_claude_session_paths(root: &Path, limit: usize) -> Result<Vec<PathBuf>, CliError> {
+    if limit == 0 || !root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = jsonl_files_by_mtime(root)?;
+    paths.truncate(limit);
+    Ok(paths)
+}
+
+fn jsonl_files_by_mtime(root: &Path) -> Result<Vec<PathBuf>, CliError> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                let modified = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                files.push((modified, path));
+            }
+        }
+    }
+    files.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+    Ok(files.into_iter().map(|(_, path)| path).collect())
+}
+
 fn find_session_path(root: &Path, session_id: &str) -> Result<Option<PathBuf>, CliError> {
+    if !root.exists() {
+        return Ok(None);
+    }
+
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
         for entry in fs::read_dir(path)? {
@@ -1007,6 +1314,35 @@ fn find_session_path(root: &Path, session_id: &str) -> Result<Option<PathBuf>, C
         }
     }
     Ok(None)
+}
+
+fn default_codex_history() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+        .join("history.jsonl")
+}
+
+fn default_codex_sessions_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".codex")
+        .join("sessions")
+}
+
+fn default_claude_projects_dir() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("projects")
+}
+
+fn parse_agent_list(value: &str) -> HashSet<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|agent| matches!(*agent, "codex" | "claude"))
+        .collect()
 }
 
 fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {

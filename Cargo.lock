@@ -267,6 +267,7 @@ dependencies = [
 name = "agent_reel_server"
 version = "0.1.0"
 dependencies = [
+ "agent_reel_adapters",
  "agent_reel_core",
  "agent_reel_highlight",
  "agent_reel_identity",

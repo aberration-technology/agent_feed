@@ -129,15 +129,21 @@ agent-reel auth status
 agent-reel auth logout
 agent-reel ingest --source generic < event.json
 agent-reel ingest --source codex-jsonl < events.jsonl
+agent-reel ingest --source claude-stream-json < events.jsonl
 agent-reel codex active --sessions 2
 agent-reel codex active --sessions 2 --watch
 agent-reel codex import ~/.codex/sessions/2026/04/23/rollout-...jsonl
 agent-reel codex stories --sessions 2
+agent-reel claude stream < stream.jsonl
+agent-reel claude active --sessions 2
+agent-reel claude active --sessions 2 --watch
+agent-reel claude import ~/.claude/projects/.../session.jsonl
+agent-reel claude stories --sessions 2
 agent-reel p2p init
 agent-reel p2p join mainnet
 agent-reel p2p discover github mosure --all --explain
 agent-reel p2p share --feed workstation --visibility private
-agent-reel p2p publish --dry-run --sessions 2
+agent-reel p2p publish --dry-run --agents codex,claude --sessions 2
 agent-reel p2p publish --dry-run --sessions 2 --per-story
 agent-reel p2p publish --dry-run --summarizer codex-exec
 agent-reel p2p publish --dry-run --summarizer claude-code
@@ -155,6 +161,12 @@ redaction path.
 
 `codex stories` uses the same active-session discovery, but it does not post to
 the daemon. it compiles selected transcripts into settled story summaries.
+
+`claude stream` reads Claude Code `--output-format stream-json` JSONL from stdin
+and posts display-safe events to the local daemon. `claude active` discovers the
+newest transcript JSONL files under `~/.claude/projects` and can watch appended
+events. hook JSON from Claude Code can also be piped through `agent-reel hook
+--source claude --event PreToolUse`; failures are logged and fail open.
 
 the hook helper reads stdin, posts to loopback, exits `0` on daemon failure, and never
 blocks the agent unless explicitly installed as a policy hook. telemetry hooks are

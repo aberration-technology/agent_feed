@@ -643,7 +643,7 @@ fn safe_sentence(input: &str) -> String {
     {
         return "display-safe summary recorded".to_string();
     }
-    clamp_words(input, 20)
+    clamp_words(input.trim_end_matches(['.', '!', '?']), 20)
 }
 
 fn summary_is_redundant(input: &str) -> bool {

@@ -41,39 +41,40 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/aberration-technology/agent_reel"
 homepage = "https://aberration.technology/"
 readme = "README.md"
+description = "projection-safe feed for local coding-agent activity"
 rust-version = "1.95"
 
 [workspace.dependencies]
-agent_reel = { path = "crates/agent_reel" }
-agent_reel_adapters = { path = "crates/agent_reel_adapters" }
-agent_reel_auth = { path = "crates/agent_reel_auth" }
-agent_reel_auth_github = { path = "crates/agent_reel_auth_github" }
-agent_reel_browser = { path = "crates/agent_reel_browser" }
-agent_reel_core = { path = "crates/agent_reel_core" }
-agent_reel_deploy = { path = "crates/agent_reel_deploy" }
-agent_reel_edge = { path = "crates/agent_reel_edge" }
-agent_reel_filter = { path = "crates/agent_reel_filter" }
-agent_reel_highlight = { path = "crates/agent_reel_highlight" }
-agent_reel_ingest = { path = "crates/agent_reel_ingest" }
-agent_reel_install = { path = "crates/agent_reel_install" }
-agent_reel_directory = { path = "crates/agent_reel_directory" }
-agent_reel_identity = { path = "crates/agent_reel_identity" }
-agent_reel_identity_github = { path = "crates/agent_reel_identity_github" }
-agent_reel_metrics = { path = "crates/agent_reel_metrics" }
-agent_reel_p2p = { path = "crates/agent_reel_p2p" }
-agent_reel_p2p_browser = { path = "crates/agent_reel_p2p_browser" }
-agent_reel_p2p_proto = { path = "crates/agent_reel_p2p_proto" }
-agent_reel_redaction = { path = "crates/agent_reel_redaction" }
-agent_reel_reel = { path = "crates/agent_reel_reel" }
-agent_reel_security = { path = "crates/agent_reel_security" }
-agent_reel_server = { path = "crates/agent_reel_server" }
-agent_reel_social = { path = "crates/agent_reel_social" }
-agent_reel_store = { path = "crates/agent_reel_store" }
-agent_reel_story = { path = "crates/agent_reel_story" }
-agent_reel_summarize = { path = "crates/agent_reel_summarize" }
-agent_reel_testkit = { path = "crates/agent_reel_testkit" }
-agent_reel_ui = { path = "crates/agent_reel_ui" }
-agent_reel_views = { path = "crates/agent_reel_views" }
+agent_reel = { path = "crates/agent_reel", version = "0.1.0" }
+agent_reel_adapters = { path = "crates/agent_reel_adapters", version = "0.1.0" }
+agent_reel_auth = { path = "crates/agent_reel_auth", version = "0.1.0" }
+agent_reel_auth_github = { path = "crates/agent_reel_auth_github", version = "0.1.0" }
+agent_reel_browser = { path = "crates/agent_reel_browser", version = "0.1.0" }
+agent_reel_core = { path = "crates/agent_reel_core", version = "0.1.0" }
+agent_reel_deploy = { path = "crates/agent_reel_deploy", version = "0.1.0" }
+agent_reel_edge = { path = "crates/agent_reel_edge", version = "0.1.0" }
+agent_reel_filter = { path = "crates/agent_reel_filter", version = "0.1.0" }
+agent_reel_highlight = { path = "crates/agent_reel_highlight", version = "0.1.0" }
+agent_reel_ingest = { path = "crates/agent_reel_ingest", version = "0.1.0" }
+agent_reel_install = { path = "crates/agent_reel_install", version = "0.1.0" }
+agent_reel_directory = { path = "crates/agent_reel_directory", version = "0.1.0" }
+agent_reel_identity = { path = "crates/agent_reel_identity", version = "0.1.0" }
+agent_reel_identity_github = { path = "crates/agent_reel_identity_github", version = "0.1.0" }
+agent_reel_metrics = { path = "crates/agent_reel_metrics", version = "0.1.0" }
+agent_reel_p2p = { path = "crates/agent_reel_p2p", version = "0.1.0" }
+agent_reel_p2p_browser = { path = "crates/agent_reel_p2p_browser", version = "0.1.0" }
+agent_reel_p2p_proto = { path = "crates/agent_reel_p2p_proto", version = "0.1.0" }
+agent_reel_redaction = { path = "crates/agent_reel_redaction", version = "0.1.0" }
+agent_reel_reel = { path = "crates/agent_reel_reel", version = "0.1.0" }
+agent_reel_security = { path = "crates/agent_reel_security", version = "0.1.0" }
+agent_reel_server = { path = "crates/agent_reel_server", version = "0.1.0" }
+agent_reel_social = { path = "crates/agent_reel_social", version = "0.1.0" }
+agent_reel_store = { path = "crates/agent_reel_store", version = "0.1.0" }
+agent_reel_story = { path = "crates/agent_reel_story", version = "0.1.0" }
+agent_reel_summarize = { path = "crates/agent_reel_summarize", version = "0.1.0" }
+agent_reel_testkit = { path = "crates/agent_reel_testkit", version = "0.1.0" }
+agent_reel_ui = { path = "crates/agent_reel_ui", version = "0.1.0" }
+agent_reel_views = { path = "crates/agent_reel_views", version = "0.1.0" }
 
 axum = "0.8.4"
 clap = "4.5.53"
