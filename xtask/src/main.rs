@@ -61,7 +61,7 @@ fn build_browser_site(args: Vec<String>) -> Result<()> {
     let mut edge_url = "https://edge.feed.aberration.technology".to_string();
     let mut site_base_url = "https://feed.aberration.technology".to_string();
     let mut network_id = "agent-feed-mainnet".to_string();
-    let mut cname = Some("feed.aberration.technology".to_string());
+    let mut cname = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {

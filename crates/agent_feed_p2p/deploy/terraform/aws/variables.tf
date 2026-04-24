@@ -40,9 +40,15 @@ variable "edge_domain_name" {
 }
 
 variable "browser_app_pages_domain_target" {
-  description = "GitHub Pages DNS target for feed.aberration.technology."
+  description = "GitHub Pages origin host used by the edge to fetch the browser shell."
   type        = string
   default     = "aberration-technology.github.io"
+}
+
+variable "browser_app_pages_base_path" {
+  description = "Path prefix for the GitHub Pages browser shell origin."
+  type        = string
+  default     = "/agent_feed"
 }
 
 variable "allow_route53_zone_apex_records" {

@@ -8,6 +8,28 @@ http://${edge_domain_name} {
     redir https://${edge_domain_name}{uri} 308
 }
 
+http://${browser_app_hostname} {
+    redir https://${browser_app_hostname}{uri} 308
+}
+
+https://${browser_app_hostname} {
+    encode gzip zstd
+
+    handle /feed-config.json {
+        rewrite * ${browser_pages_base_path}/feed-config.json
+        reverse_proxy https://${browser_pages_origin_host} {
+            header_up Host ${browser_pages_origin_host}
+        }
+    }
+
+    handle {
+        rewrite * ${browser_pages_base_path}/index.html
+        reverse_proxy https://${browser_pages_origin_host} {
+            header_up Host ${browser_pages_origin_host}
+        }
+    }
+}
+
 https://${edge_domain_name} {
     encode gzip zstd
 

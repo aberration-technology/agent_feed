@@ -110,7 +110,7 @@ jobs:
             --edge-url "$EDGE_BASE_URL" \
             --site-base-url "$SITE_BASE_URL" \
             --network-id "$NETWORK_ID" \
-            --cname "$SITE_CNAME"
+            --no-cname
 
       - name: upload pages artifact
         uses: actions/upload-pages-artifact@v3
