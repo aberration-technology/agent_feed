@@ -57,6 +57,7 @@ jobs:
           VAR_BROWSER_APP_PAGES_DOMAIN_TARGET: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}
           VAR_GITHUB_CALLBACK_URL: ${{ vars.AGENT_FEED_P2P_GITHUB_CALLBACK_URL }}
           VAR_ROUTE53_ZONE_NAME: ${{ vars.AGENT_FEED_P2P_ROUTE53_ZONE_NAME }}
+          VAR_TLS_CONTACT_EMAIL: ${{ vars.AGENT_FEED_P2P_TLS_CONTACT_EMAIL }}
           VAR_NETWORK_ID: ${{ vars.AGENT_FEED_P2P_NETWORK_ID }}
           VAR_CANARY_GITHUB_LOGIN: ${{ vars.AGENT_FEED_P2P_CANARY_GITHUB_LOGIN }}
           VAR_CANARY_FEED_LABEL: ${{ vars.AGENT_FEED_P2P_CANARY_FEED_LABEL }}
@@ -106,6 +107,7 @@ jobs:
             echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
             echo "TF_VAR_github_callback_url=$github_callback_url"
             echo "TF_VAR_route53_zone_name=${VAR_ROUTE53_ZONE_NAME:-aberration.technology}"
+            echo "TF_VAR_tls_contact_email=${VAR_TLS_CONTACT_EMAIL:-admin@aberration.technology}"
             echo "TF_VAR_network_id=${VAR_NETWORK_ID:-agent-feed-mainnet}"
             echo "TF_VAR_canary_github_login=${VAR_CANARY_GITHUB_LOGIN:-mosure}"
             echo "TF_VAR_canary_feed_label=${VAR_CANARY_FEED_LABEL:-workstation}"

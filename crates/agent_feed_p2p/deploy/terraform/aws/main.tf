@@ -96,6 +96,7 @@ locals {
     browser_app_origin = local.browser_app_base_url
     edge_domain_name   = var.edge_domain_name
     edge_loopback_port = var.edge_loopback_port
+    tls_contact_email  = var.tls_contact_email
   })
   edge_service_unit = templatefile("${path.module}/templates/agent-feed-edge.service.tftpl", {
     edge_loopback_port  = var.edge_loopback_port

@@ -27,6 +27,12 @@ variable "route53_zone_name" {
   default     = "aberration.technology"
 }
 
+variable "tls_contact_email" {
+  description = "Contact email used by Caddy ACME issuers for the edge certificate."
+  type        = string
+  default     = "admin@aberration.technology"
+}
+
 variable "browser_app_base_url" {
   description = "Public GitHub Pages browser shell base URL."
   type        = string
