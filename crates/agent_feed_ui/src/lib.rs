@@ -59,6 +59,9 @@ mod tests {
         assert!(html.contains("--secondary: #d87c7c;"));
         assert!(html.contains(".brand {\n  color: var(--secondary);\n}"));
         assert!(html.contains(".footer-links a {\n  color: var(--secondary);"));
+        assert!(html.contains("href=\"https://aberration.technology/\""));
+        assert!(html.contains("href=\"https://github.com/aberration-technology\""));
+        assert!(!html.contains("href=\"https://github.com/aberration-technology/agent_feed\""));
         assert!(html.contains("text-decoration: underline;"));
         assert!(!html.contains("text-transform: uppercase;"));
     }
