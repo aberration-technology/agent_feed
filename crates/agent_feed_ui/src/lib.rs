@@ -76,6 +76,34 @@ mod tests {
     }
 
     #[test]
+    fn remote_user_route_shows_identity_once() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("function routeStreamLabel"));
+        assert!(html.contains("function remoteHeadlineForState"));
+        assert!(html.contains(
+            "setText(eyebrow, `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`);"
+        ));
+        assert!(html.contains("setText(headline, remoteHeadlineForState(state));"));
+        assert!(html.contains("renderPublisher(nextPublisher || { login: route.login });"));
+        assert!(!html.contains("`@${route.login} / ${route.selection} / ${route.feedMode}`"));
+        assert!(!html.contains("setText(headline, `@${route.login}`);"));
+    }
+
+    #[test]
+    fn timeline_uses_feed_labels_without_repeating_login() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("feedLink(route.login, \"*\", \"all feeds\""));
+        assert!(html.contains("meta.textContent = feedLabel;"));
+        assert!(html.contains("interactive timeline · ${routeStreamLabel(route)}"));
+        assert!(!html.contains("feedLink(route.login, \"*\", `${route.login}/*`"));
+        assert!(
+            !html.contains("meta.textContent = `${publisherText(feed, ticket)} / ${feedLabel}`;")
+        );
+    }
+
+    #[test]
     fn browser_console_logs_feed_lifecycle_events() {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
 

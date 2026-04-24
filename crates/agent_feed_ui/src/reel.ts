@@ -278,13 +278,10 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   showStage();
   document.body.dataset.mode = state === "failed" ? "breaking" : "dispatch";
   setText(liveState, state === "live" ? "live" : "wait");
-  setText(
-    eyebrow,
-    `@${route.login} / ${route.selection} / ${route.feedMode}`,
-  );
-  setText(headline, `@${route.login}`);
+  setText(eyebrow, `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`);
+  setText(headline, remoteHeadlineForState(state));
   setText(deck, lines.join(" · "));
-  renderPublisher(nextPublisher);
+  renderPublisher(nextPublisher || { login: route.login });
   renderHeadlineImage(undefined);
   clearAuthAction();
   renderChips([
@@ -294,6 +291,48 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   ]);
   renderTicker(lines);
   stopStageProgress();
+}
+
+function routeStreamLabel(route) {
+  if (route.feed === "*") {
+    return "all feeds";
+  }
+  if (route.feed) {
+    return route.feed;
+  }
+  const selection = route.selection || "";
+  const prefix = `${route.login}/`;
+  if (selection === route.login) {
+    return "visible feeds";
+  }
+  if (selection === `${route.login}/*`) {
+    return "all feeds";
+  }
+  if (selection.startsWith(prefix)) {
+    return selection.slice(prefix.length) || "visible feeds";
+  }
+  return selection && selection !== route.login ? selection : "visible feeds";
+}
+
+function remoteHeadlineForState(state) {
+  switch (state) {
+    case "resolving":
+      return "finding feed";
+    case "not-found":
+      return "github user not found";
+    case "auth-required":
+      return "sign in required";
+    case "no-feeds":
+      return "no visible streams";
+    case "waiting":
+      return "waiting for stories";
+    case "live":
+      return "live feed";
+    case "failed":
+      return "feed unavailable";
+    default:
+      return "waiting for stories";
+  }
 }
 
 function renderP2pDisabled(route) {
@@ -959,12 +998,12 @@ function renderTimeline(route, ticket) {
   const toolbar = document.createElement("div");
   toolbar.className = "timeline-toolbar";
   const label = document.createElement("span");
-  label.textContent = `@${ticket.profile?.login || route.login} / ${route.selection}`;
+  label.textContent = `@${ticket.profile?.login || route.login} / ${routeStreamLabel(route)}`;
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
   nav.appendChild(
-    feedLink(route.login, "*", `${route.login}/*`, !route.feed || route.feed === "*"),
+    feedLink(route.login, "*", "all feeds", !route.feed || route.feed === "*"),
   );
   for (const feed of feeds) {
     const feedLabel = feed.label || feed.feed_label || "feed";
@@ -984,7 +1023,7 @@ function renderTimeline(route, ticket) {
     card.appendChild(timelinePublisher(feed, ticket));
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
-    meta.textContent = `${publisherText(feed, ticket)} / ${feedLabel}`;
+    meta.textContent = feedLabel;
     const title = document.createElement("h2");
     title.textContent = `waiting for ${feedLabel}`;
     const copy = document.createElement("p");
@@ -999,7 +1038,7 @@ function renderTimeline(route, ticket) {
     card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
-    meta.textContent = `@${route.login} / ${route.selection}`;
+    meta.textContent = `@${route.login} / ${routeStreamLabel(route)}`;
     const title = document.createElement("h2");
     title.textContent = "no matching feed";
     const copy = document.createElement("p");
@@ -1007,7 +1046,7 @@ function renderTimeline(route, ticket) {
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
-  renderTicker([`interactive timeline · ${route.selection}`, "projection mode remains automatic"]);
+  renderTicker([`interactive timeline · ${routeStreamLabel(route)}`, "projection mode remains automatic"]);
 }
 
 function renderSubscribedTimeline(route, targets) {
