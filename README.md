@@ -4,7 +4,7 @@
 
 agent activity, reduced to signal.
 
-![lowercase feed projection showing a settled codex file-change bulletin](docs/image/hero.png)
+![lowercase feed projection showing the global discovery feed waiting for settled story streams](docs/image/hero.png)
 
 ## what this is
 
