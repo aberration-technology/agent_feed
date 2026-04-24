@@ -140,7 +140,7 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in $(seq 1 12); do
-            if curl -fsSL --connect-timeout 5 --max-time 20 "${{ needs.build.outputs.canary_url }}" | grep -E '<title>feed</title>|class="brand">feed<'; then
+            if curl -sSL --connect-timeout 5 --max-time 20 "${{ needs.build.outputs.canary_url }}" | grep -E '<title>feed</title>|class="brand">feed<'; then
               exit 0
             fi
             echo "deep-link shell not ready yet; retry ${attempt}/12"
