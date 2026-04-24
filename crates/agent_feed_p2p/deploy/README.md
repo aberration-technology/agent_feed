@@ -113,8 +113,8 @@ one ec2 edge host
 one elastic ip
 one small public vpc/subnet
 route53 A record for api.feed.aberration.technology
-route53 CNAME for feed.aberration.technology -> github pages
-caddy tls termination for the edge host
+route53 A record for feed.aberration.technology -> edge caddy
+caddy tls termination for the edge and browser hosts
 tcp/udp p2p fabric probes on 7747
 udp browser handoff probe on 443
 ssm-enabled instance role
@@ -135,7 +135,7 @@ is explicitly disabled.
 deploy is not considered green until these pass:
 
 ```text
-https://feed.aberration.technology/{canary_github_login}?all loads the static shell
+https://feed.aberration.technology/{canary_github_login}?all loads the static shell with a 200 response
 https://feed.aberration.technology/callback/github is the github oauth callback URL
 https://api.feed.aberration.technology/healthz returns ok
 api.feed.aberration.technology:7747 accepts tcp p2p fabric probes

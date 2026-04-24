@@ -10,6 +10,10 @@ http://${edge_domain_name} {
     redir https://${edge_domain_name}{uri} 308
 }
 
+http://${browser_app_hostname} {
+    redir https://${browser_app_hostname}{uri} 308
+}
+
 https://${edge_domain_name} {
     encode gzip zstd
 
@@ -38,5 +42,29 @@ https://${edge_domain_name} {
         header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
         header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
         reverse_proxy 127.0.0.1:${edge_loopback_port}
+    }
+}
+
+https://${browser_app_hostname} {
+    encode gzip zstd
+
+    @browserAsset path /favicon.svg /browser-config.json /robots.txt /sitemap.xml
+    handle @browserAsset {
+        reverse_proxy https://${browser_app_pages_domain_target} {
+            header_up Host ${browser_app_hostname}
+            transport http {
+                tls_server_name ${browser_app_hostname}
+            }
+        }
+    }
+
+    handle {
+        rewrite * /index.html
+        reverse_proxy https://${browser_app_pages_domain_target} {
+            header_up Host ${browser_app_hostname}
+            transport http {
+                tls_server_name ${browser_app_hostname}
+            }
+        }
     }
 }
