@@ -103,11 +103,10 @@ jobs:
             echo "GITHUB_CLIENT_SECRET_PARAMETER_NAME=$secret_parameter_prefix/github_client_secret"
           } >>"$GITHUB_ENV"
           if [ -n "${VAR_GITHUB_ADMIN_LOGINS:-}" ]; then
-            python3 - <<'PY' >>"$GITHUB_ENV"
-import json, os
-logins = [x.strip() for x in os.environ["VAR_GITHUB_ADMIN_LOGINS"].split(",") if x.strip()]
-print("TF_VAR_github_admin_logins=" + json.dumps(logins))
-PY
+            admin_logins="$(
+              python3 -c 'import json, os; print(json.dumps([x.strip() for x in os.environ["VAR_GITHUB_ADMIN_LOGINS"].split(",") if x.strip()]))'
+            )"
+            echo "TF_VAR_github_admin_logins=$admin_logins" >>"$GITHUB_ENV"
           fi
 
       - name: configure aws credentials
