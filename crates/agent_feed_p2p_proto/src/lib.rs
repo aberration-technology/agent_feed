@@ -18,12 +18,109 @@ pub type CapsuleId = String;
 pub type StoryWindowRef = String;
 pub type AgentKind = String;
 
+pub const AGENT_FEED_PROTOCOL_VERSION: u16 = 1;
+pub const AGENT_FEED_MODEL_VERSION: u16 = 1;
+pub const AGENT_FEED_MIN_MODEL_VERSION: u16 = 1;
+pub const AGENT_FEED_RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
     #[error("serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error(transparent)]
     Summary(#[from] SummaryError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolCompatibility {
+    pub product: String,
+    pub release_version: String,
+    pub protocol_version: u16,
+    pub model_version: u16,
+    pub min_model_version: u16,
+}
+
+impl ProtocolCompatibility {
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            product: "feed".to_string(),
+            release_version: AGENT_FEED_RELEASE_VERSION.to_string(),
+            protocol_version: AGENT_FEED_PROTOCOL_VERSION,
+            model_version: AGENT_FEED_MODEL_VERSION,
+            min_model_version: AGENT_FEED_MIN_MODEL_VERSION,
+        }
+    }
+
+    #[must_use]
+    pub fn with_model_version(mut self, model_version: u16, min_model_version: u16) -> Self {
+        self.model_version = model_version;
+        self.min_model_version = min_model_version;
+        self
+    }
+
+    #[must_use]
+    pub fn with_protocol_version(mut self, protocol_version: u16) -> Self {
+        self.protocol_version = protocol_version;
+        self
+    }
+
+    #[must_use]
+    pub fn is_compatible_with(&self, remote: &Self) -> bool {
+        self.product == remote.product
+            && self.protocol_version == remote.protocol_version
+            && self.model_version >= remote.min_model_version
+            && remote.model_version >= self.min_model_version
+    }
+
+    #[must_use]
+    pub fn status_with(&self, remote: &Self) -> CompatibilityStatus {
+        CompatibilityStatus {
+            compatible: self.is_compatible_with(remote),
+            local: self.clone(),
+            remote: remote.clone(),
+            message: compatibility_message(self, remote),
+        }
+    }
+}
+
+impl Default for ProtocolCompatibility {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatibilityStatus {
+    pub compatible: bool,
+    pub local: ProtocolCompatibility,
+    pub remote: ProtocolCompatibility,
+    pub message: String,
+}
+
+impl CompatibilityStatus {
+    #[must_use]
+    pub fn current() -> Self {
+        let current = ProtocolCompatibility::current();
+        current.status_with(&current)
+    }
+}
+
+fn compatibility_message(local: &ProtocolCompatibility, remote: &ProtocolCompatibility) -> String {
+    if local.is_compatible_with(remote) {
+        "compatible".to_string()
+    } else if local.product != remote.product {
+        "incompatible product".to_string()
+    } else if local.protocol_version != remote.protocol_version {
+        "protocol changed; update your peer to the latest version".to_string()
+    } else if remote.min_model_version > local.model_version {
+        "remote feed requires a newer data model; update your peer to the latest version"
+            .to_string()
+    } else if local.min_model_version > remote.model_version {
+        "remote peer is using an older data model; ask the publisher to update".to_string()
+    } else {
+        "incompatible feed data model".to_string()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +201,7 @@ pub enum FeedVisibility {
 pub struct FeedProfile {
     pub feed_id: FeedId,
     pub network_id: NetworkId,
+    pub compatibility: ProtocolCompatibility,
     pub owner: PrincipalRef,
     pub peer_id: PeerIdString,
     pub label: String,
@@ -135,6 +233,7 @@ impl FeedProfile {
         Self {
             feed_id: feed_id.into(),
             network_id: network_id.into(),
+            compatibility: ProtocolCompatibility::current(),
             owner: owner.clone(),
             peer_id: peer_id.into(),
             label: label.clone(),
@@ -644,5 +743,41 @@ mod tests {
         .sign("peer-a")?;
         assert!(profile.verify_signature()?);
         Ok(())
+    }
+
+    #[test]
+    fn compatibility_accepts_current_model_overlap() {
+        let local = ProtocolCompatibility::current();
+        let remote = ProtocolCompatibility::current()
+            .with_model_version(AGENT_FEED_MODEL_VERSION, AGENT_FEED_MIN_MODEL_VERSION);
+
+        let status = local.status_with(&remote);
+
+        assert!(status.compatible);
+        assert_eq!(status.message, "compatible");
+    }
+
+    #[test]
+    fn compatibility_rejects_newer_required_model() {
+        let local = ProtocolCompatibility::current();
+        let remote = ProtocolCompatibility::current()
+            .with_model_version(AGENT_FEED_MODEL_VERSION + 1, AGENT_FEED_MODEL_VERSION + 1);
+
+        let status = local.status_with(&remote);
+
+        assert!(!status.compatible);
+        assert!(status.message.contains("update your peer"));
+    }
+
+    #[test]
+    fn compatibility_rejects_protocol_mismatch() {
+        let local = ProtocolCompatibility::current();
+        let remote =
+            ProtocolCompatibility::current().with_protocol_version(AGENT_FEED_PROTOCOL_VERSION + 1);
+
+        let status = local.status_with(&remote);
+
+        assert!(!status.compatible);
+        assert!(status.message.contains("protocol changed"));
     }
 }

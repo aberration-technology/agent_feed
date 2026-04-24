@@ -3,7 +3,7 @@ use agent_feed_core::HeadlineImage;
 use agent_feed_directory::{
     DirectoryError, FeedDirectoryEntry, GithubDiscoveryTicket, RemoteHeadlineView, RemoteUserRoute,
 };
-use agent_feed_p2p_proto::{Signed, StoryCapsule};
+use agent_feed_p2p_proto::{ProtocolCompatibility, Signed, StoryCapsule};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, VecDeque};
 use time::OffsetDateTime;
@@ -86,6 +86,7 @@ pub enum RemoteRouteState {
     Live,
     OfflineCached,
     DegradedEdgeFallback,
+    VersionMismatch,
     Failed,
 }
 
@@ -112,6 +113,7 @@ impl RemoteRouteState {
             Self::Live => "live",
             Self::OfflineCached => "offline cached profile",
             Self::DegradedEdgeFallback => "edge snapshot mode",
+            Self::VersionMismatch => "update your peer to the latest version",
             Self::Failed => "unable to connect",
         }
     }
@@ -126,6 +128,7 @@ impl RemoteRouteState {
                 | Self::Live
                 | Self::OfflineCached
                 | Self::DegradedEdgeFallback
+                | Self::VersionMismatch
                 | Self::Failed
         )
     }
@@ -297,17 +300,35 @@ impl RemoteRouteViewModel {
 
     #[must_use]
     pub fn with_ticket(mut self, ticket: GithubDiscoveryTicket) -> Self {
-        self.state = if ticket.candidate_feeds.is_empty() {
+        let local = ProtocolCompatibility::current();
+        let ticket_status = local.status_with(&ticket.compatibility);
+        let incompatible_feed = ticket
+            .candidate_feeds
+            .iter()
+            .find(|feed| !local.is_compatible_with(&feed.compatibility));
+        self.state = if !ticket_status.compatible || incompatible_feed.is_some() {
+            RemoteRouteState::VersionMismatch
+        } else if ticket.candidate_feeds.is_empty() {
             RemoteRouteState::NoPublicFeeds
         } else {
             RemoteRouteState::FeedsFound
         };
         self.headline = format!("@{}", ticket.profile.login);
-        self.lines = vec![
-            "github identity found".to_string(),
-            format!("{} visible feeds", ticket.candidate_feeds.len()),
-            "connected · waiting for first story".to_string(),
-        ];
+        self.lines = if self.state == RemoteRouteState::VersionMismatch {
+            vec![
+                "feed protocol or data model changed".to_string(),
+                incompatible_feed
+                    .map(|feed| local.status_with(&feed.compatibility).message)
+                    .unwrap_or(ticket_status.message),
+                "update your peer to the latest version".to_string(),
+            ]
+        } else {
+            vec![
+                "github identity found".to_string(),
+                format!("{} visible feeds", ticket.candidate_feeds.len()),
+                "connected · waiting for first story".to_string(),
+            ]
+        };
         self.ticket = Some(ticket);
         self.sign_in = None;
         self
@@ -370,9 +391,11 @@ fn split_targets(value: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use agent_feed_core::{AgentEvent, EventKind, SourceKind};
-    use agent_feed_directory::GithubPrincipal;
-    use agent_feed_identity::GithubUserId;
-    use agent_feed_p2p_proto::{FeedVisibility, Signed, StoryCapsule};
+    use agent_feed_directory::{GithubPrincipal, GithubProfileView, SignedBrowserSeed};
+    use agent_feed_identity::{GithubLogin, GithubUserId};
+    use agent_feed_p2p_proto::{
+        FeedVisibility, ProtocolCompatibility, Signature, Signed, StoryCapsule,
+    };
     use agent_feed_story::compile_events;
     use time::OffsetDateTime;
 
@@ -467,6 +490,54 @@ mod tests {
         assert_eq!(
             RemoteRouteState::Failed.projection_copy(),
             "unable to connect"
+        );
+        assert_eq!(
+            RemoteRouteState::VersionMismatch.projection_copy(),
+            "update your peer to the latest version"
+        );
+    }
+
+    fn discovery_ticket(entry: FeedDirectoryEntry) -> GithubDiscoveryTicket {
+        GithubDiscoveryTicket {
+            network_id: "agent-feed-mainnet".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            requested_login: GithubLogin::parse(&entry.owner.current_login).expect("login parses"),
+            resolved_github_id: entry.owner.github_user_id,
+            profile: GithubProfileView {
+                login: entry.owner.current_login.clone(),
+                name: entry.owner.display_name.clone(),
+                avatar: entry.owner.avatar.clone(),
+            },
+            candidate_feeds: vec![entry],
+            bootstrap_peers: Vec::new(),
+            rendezvous_namespaces: Vec::new(),
+            provider_keys: Vec::new(),
+            browser_seed: SignedBrowserSeed::new(
+                "agent-feed-mainnet",
+                "https://edge.example",
+                Vec::new(),
+                "edge",
+            )
+            .expect("seed signs"),
+            issued_at: OffsetDateTime::now_utc(),
+            expires_at: OffsetDateTime::now_utc(),
+            signature: Signature::unsigned(),
+        }
+    }
+
+    #[test]
+    fn route_model_surfaces_version_mismatch() {
+        let route = RemoteUserRoute::parse("/mosure", Some("all")).expect("route parses");
+        let mut entry = public_entry();
+        entry.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        let model = RemoteRouteViewModel::waiting(route).with_ticket(discovery_ticket(entry));
+
+        assert_eq!(model.state, RemoteRouteState::VersionMismatch);
+        assert!(
+            model
+                .lines
+                .iter()
+                .any(|line| line.contains("update your peer"))
         );
     }
 

@@ -1,7 +1,10 @@
-use agent_feed_directory::{DirectoryError, FeedAccessPolicy, FeedDirectoryEntry};
+use agent_feed_directory::{
+    DirectoryError, FeedAccessPolicy, FeedDirectoryEntry, ensure_current_compatibility,
+};
 use agent_feed_identity::{GithubOrgName, GithubTeamSlug, GithubUserId};
 use agent_feed_p2p_proto::{
-    FeedId, FeedProfile, FeedVisibility, NetworkId, PeerIdString, Signed, StoryCapsule, feed_topic,
+    FeedId, FeedProfile, FeedVisibility, NetworkId, PeerIdString, ProtocolCompatibility, Signed,
+    StoryCapsule, feed_topic,
 };
 use agent_feed_summarize::headline_similarity;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -23,6 +26,7 @@ pub enum PeerRole {
 pub struct PeerParticipation {
     pub network_id: NetworkId,
     pub peer_id: PeerIdString,
+    pub compatibility: ProtocolCompatibility,
     pub principal: String,
     pub roles: BTreeSet<PeerRole>,
     pub browser_handoff_addrs: Vec<String>,
@@ -33,6 +37,7 @@ impl PeerParticipation {
         Self {
             network_id: peer.network_id.clone(),
             peer_id: peer.peer_id.clone(),
+            compatibility: peer.compatibility.clone(),
             principal: peer.principal.clone(),
             roles: BTreeSet::new(),
             browser_handoff_addrs: Vec::new(),
@@ -55,6 +60,8 @@ pub enum P2pError {
     SubscriptionDenied(String),
     #[error("capsule signature rejected")]
     InvalidSignature,
+    #[error("p2p compatibility rejected: {0}")]
+    IncompatibleProtocol(String),
     #[error(transparent)]
     Proto(#[from] agent_feed_p2p_proto::ProtoError),
     #[error(transparent)]
@@ -89,6 +96,23 @@ impl InMemoryNetwork {
         PeerNode {
             network_id: network_id.into(),
             peer_id: peer_id.into(),
+            compatibility: ProtocolCompatibility::current(),
+            principal: principal.into(),
+            network: self.clone(),
+        }
+    }
+
+    pub fn peer_with_compatibility(
+        &self,
+        network_id: impl Into<String>,
+        peer_id: impl Into<String>,
+        principal: impl Into<String>,
+        compatibility: ProtocolCompatibility,
+    ) -> PeerNode {
+        PeerNode {
+            network_id: network_id.into(),
+            peer_id: peer_id.into(),
+            compatibility,
             principal: principal.into(),
             network: self.clone(),
         }
@@ -99,6 +123,7 @@ impl InMemoryNetwork {
 pub struct PeerNode {
     pub network_id: NetworkId,
     pub peer_id: PeerIdString,
+    pub compatibility: ProtocolCompatibility,
     pub principal: String,
     network: InMemoryNetwork,
 }
@@ -108,6 +133,7 @@ impl PeerNode {
     where
         I: IntoIterator<Item = PeerRole>,
     {
+        self.ensure_compatible()?;
         let mut state = self
             .network
             .state
@@ -128,6 +154,8 @@ impl PeerNode {
             network_id = %self.network_id,
             peer_id = %self.peer_id,
             principal = %self.principal,
+            protocol_version = self.compatibility.protocol_version,
+            model_version = self.compatibility.model_version,
             roles = ?roles,
             "p2p peer joined fabric"
         );
@@ -138,6 +166,7 @@ impl PeerNode {
     where
         I: IntoIterator<Item = String>,
     {
+        self.ensure_compatible()?;
         let mut state = self
             .network
             .state
@@ -165,9 +194,13 @@ impl PeerNode {
     }
 
     pub fn announce_feed(&self, profile: FeedProfile) -> Result<(), P2pError> {
+        self.ensure_compatible()?;
+        ensure_current_compatibility(&profile.compatibility)?;
         let feed_id = profile.feed_id.clone();
         let network_id = profile.network_id.clone();
         let visibility = profile.visibility;
+        let protocol_version = profile.compatibility.protocol_version;
+        let model_version = profile.compatibility.model_version;
         let topic = feed_topic(&profile.network_id, &profile.feed_id);
         let mut state = self
             .network
@@ -192,12 +225,16 @@ impl PeerNode {
             %feed_id,
             topic = %topic,
             visibility = ?visibility,
+            protocol_version,
+            model_version,
             "p2p feed announced"
         );
         Ok(())
     }
 
     pub fn announce_directory_entry(&self, entry: FeedDirectoryEntry) -> Result<(), P2pError> {
+        self.ensure_compatible()?;
+        ensure_current_compatibility(&entry.compatibility)?;
         if !entry.verify_signature()? {
             return Err(P2pError::Directory(DirectoryError::InvalidSignature));
         }
@@ -239,6 +276,8 @@ impl PeerNode {
     }
 
     pub fn cache_directory_entry(&self, entry: FeedDirectoryEntry) -> Result<(), P2pError> {
+        self.ensure_compatible()?;
+        ensure_current_compatibility(&entry.compatibility)?;
         if !entry.verify_signature()? {
             return Err(P2pError::Directory(DirectoryError::InvalidSignature));
         }
@@ -276,6 +315,7 @@ impl PeerNode {
     where
         I: IntoIterator<Item = GithubTeamSlug>,
     {
+        self.ensure_compatible()?;
         let mut state = self
             .network
             .state
@@ -303,6 +343,7 @@ impl PeerNode {
         &self,
         github_user_id: GithubUserId,
     ) -> Result<Vec<FeedDirectoryEntry>, P2pError> {
+        self.ensure_compatible()?;
         let state = self
             .network
             .state
@@ -326,6 +367,7 @@ impl PeerNode {
         &self,
         org: &GithubOrgName,
     ) -> Result<Vec<FeedDirectoryEntry>, P2pError> {
+        self.ensure_compatible()?;
         let state = self
             .network
             .state
@@ -350,6 +392,7 @@ impl PeerNode {
         org: &GithubOrgName,
         team: &GithubTeamSlug,
     ) -> Result<Vec<FeedDirectoryEntry>, P2pError> {
+        self.ensure_compatible()?;
         let state = self
             .network
             .state
@@ -371,6 +414,7 @@ impl PeerNode {
     }
 
     pub fn follow(&self, feed_id: &str) -> Result<(), P2pError> {
+        self.ensure_compatible()?;
         let mut state = self
             .network
             .state
@@ -380,6 +424,7 @@ impl PeerNode {
             .feeds
             .get(feed_id)
             .ok_or_else(|| P2pError::FeedNotFound(feed_id.to_string()))?;
+        ensure_current_compatibility(&profile.compatibility)?;
         let allowed = state.can_follow(self, feed_id, profile.visibility);
         if !allowed {
             tracing::warn!(
@@ -416,6 +461,8 @@ impl PeerNode {
     }
 
     pub fn grant_subscription(&self, feed_id: &str, subscriber: &PeerNode) -> Result<(), P2pError> {
+        self.ensure_compatible()?;
+        subscriber.ensure_compatible()?;
         let mut state = self
             .network
             .state
@@ -425,6 +472,7 @@ impl PeerNode {
             .feeds
             .get(feed_id)
             .ok_or_else(|| P2pError::FeedNotFound(feed_id.to_string()))?;
+        ensure_current_compatibility(&profile.compatibility)?;
         if profile.peer_id != self.peer_id {
             tracing::warn!(
                 publisher_peer_id = %self.peer_id,
@@ -447,6 +495,7 @@ impl PeerNode {
     }
 
     pub fn publish_capsule(&self, signed: Signed<StoryCapsule>) -> Result<usize, P2pError> {
+        self.ensure_compatible()?;
         if !signed.verify_capsule()? {
             tracing::warn!(
                 peer_id = %self.peer_id,
@@ -465,6 +514,7 @@ impl PeerNode {
             .feeds
             .get(&signed.value.feed_id)
             .ok_or_else(|| P2pError::FeedNotFound(signed.value.feed_id.clone()))?;
+        ensure_current_compatibility(&profile.compatibility)?;
         if profile.peer_id != self.peer_id {
             tracing::warn!(
                 publisher_peer_id = %self.peer_id,
@@ -540,10 +590,11 @@ impl PeerNode {
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
-        if !state.feeds.contains_key(feed_id) {
+        let Some(profile) = state.feeds.get(feed_id) else {
             tracing::warn!(peer_id = %self.peer_id, %feed_id, "p2p snapshot requested for unknown feed");
             return Err(P2pError::FeedNotFound(feed_id.to_string()));
-        }
+        };
+        ensure_current_compatibility(&profile.compatibility)?;
         let history = state.history.get(feed_id).cloned().unwrap_or_default();
         let keep = limit.min(history.len());
         let skip = history.len().saturating_sub(keep);
@@ -558,6 +609,7 @@ impl PeerNode {
     }
 
     pub fn drain(&self) -> Result<Vec<Signed<StoryCapsule>>, P2pError> {
+        self.ensure_compatible()?;
         let mut state = self
             .network
             .state
@@ -577,6 +629,7 @@ impl PeerNode {
     }
 
     pub fn known_peers(&self) -> Result<Vec<PeerIdString>, P2pError> {
+        self.ensure_compatible()?;
         let state = self
             .network
             .state
@@ -586,6 +639,7 @@ impl PeerNode {
     }
 
     pub fn participation(&self, peer_id: &str) -> Result<Option<PeerParticipation>, P2pError> {
+        self.ensure_compatible()?;
         let state = self
             .network
             .state
@@ -595,6 +649,7 @@ impl PeerNode {
     }
 
     pub fn browser_handoff_peers(&self) -> Result<Vec<PeerParticipation>, P2pError> {
+        self.ensure_compatible()?;
         let state = self
             .network
             .state
@@ -606,6 +661,17 @@ impl PeerNode {
             .filter(|peer| peer.roles.contains(&PeerRole::BrowserHandoff))
             .cloned()
             .collect())
+    }
+
+    fn ensure_compatible(&self) -> Result<(), P2pError> {
+        let local = ProtocolCompatibility::current();
+        if local.is_compatible_with(&self.compatibility) {
+            Ok(())
+        } else {
+            Err(P2pError::IncompatibleProtocol(
+                local.status_with(&self.compatibility).message,
+            ))
+        }
     }
 }
 
@@ -773,7 +839,9 @@ mod tests {
     use agent_feed_core::{AgentEvent, EventKind, SourceKind};
     use agent_feed_directory::{FeedDirectoryEntry, GithubPrincipal};
     use agent_feed_identity::GithubUserId;
-    use agent_feed_p2p_proto::{FeedVisibility, ProtoError, Signed, StoryCapsule};
+    use agent_feed_p2p_proto::{
+        FeedVisibility, ProtoError, ProtocolCompatibility, Signed, StoryCapsule,
+    };
     use agent_feed_story::compile_events;
     use time::OffsetDateTime;
 
@@ -986,6 +1054,68 @@ mod tests {
         assert_eq!(entries[0].feed_label, "workstation");
         assert!(entries[0].verify_signature()?);
         assert!(!entries[0].live_topic.contains("mosure"));
+        Ok(())
+    }
+
+    #[test]
+    fn incompatible_peer_cannot_join_fabric() {
+        let network = InMemoryNetwork::new();
+        let stale = network.peer_with_compatibility(
+            "agent-feed-mainnet",
+            "peer-old",
+            "github:1",
+            ProtocolCompatibility::current().with_model_version(2, 2),
+        );
+
+        let err = stale
+            .join_fabric([PeerRole::Rendezvous])
+            .expect_err("incompatible peer is rejected");
+
+        assert!(matches!(err, P2pError::IncompatibleProtocol(_)));
+        assert!(err.to_string().contains("update your peer"));
+    }
+
+    #[test]
+    fn incompatible_feed_profile_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let network = InMemoryNetwork::new();
+        let publisher = network.peer("agent-feed-mainnet", "peer-a", "github:1");
+        let mut feed = profile("feed-public", FeedVisibility::Public)?;
+        feed.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        feed = feed.sign("peer-a")?;
+
+        let err = publisher
+            .announce_feed(feed)
+            .expect_err("incompatible feed is rejected");
+
+        assert!(matches!(
+            err,
+            P2pError::Directory(DirectoryError::IncompatibleProtocol(_))
+        ));
+        assert!(err.to_string().contains("update your peer"));
+        Ok(())
+    }
+
+    #[test]
+    fn incompatible_directory_entry_is_not_cached() -> Result<(), Box<dyn std::error::Error>> {
+        let network = InMemoryNetwork::new();
+        let fabric = network.peer("agent-feed-mainnet", "peer-fabric", "fabric:edge");
+        let mut entry = directory_entry("feed-public", "workstation", FeedVisibility::Public)?;
+        entry.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        entry = entry.sign("peer-a")?;
+
+        let err = fabric
+            .cache_directory_entry(entry)
+            .expect_err("incompatible directory entry is rejected");
+
+        assert!(matches!(
+            err,
+            P2pError::Directory(DirectoryError::IncompatibleProtocol(_))
+        ));
+        assert!(
+            fabric
+                .discover_github_user(GithubUserId::new(1))?
+                .is_empty()
+        );
         Ok(())
     }
 

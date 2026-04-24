@@ -112,4 +112,15 @@ mod tests {
         assert!(html.contains("feed.resolver.response"));
         assert!(html.contains("feed.sse.bulletin.incoming"));
     }
+
+    #[test]
+    fn browser_remote_route_reports_version_mismatch() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("const FEED_PROTOCOL_VERSION = 1;"));
+        assert!(html.contains("function compatibilityStatus"));
+        assert!(html.contains("version-mismatch"));
+        assert!(html.contains("update your peer to the latest version"));
+        assert!(html.contains("feed.discovery.incompatible_feeds_ignored"));
+    }
 }

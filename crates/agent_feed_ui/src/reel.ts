@@ -24,6 +24,10 @@ let activeIndex = 0;
 let dwellTimer = undefined;
 let controlsTimer = undefined;
 
+const FEED_PROTOCOL_VERSION = 1;
+const FEED_MODEL_VERSION = 1;
+const FEED_MIN_MODEL_VERSION = 1;
+
 const githubAuthCallback = parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
 
@@ -276,8 +280,11 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
     lines,
   });
   showStage();
-  document.body.dataset.mode = state === "failed" ? "breaking" : "dispatch";
-  setText(liveState, state === "live" ? "live" : "wait");
+  document.body.dataset.mode = state === "failed" || state === "version-mismatch" ? "breaking" : "dispatch";
+  setText(
+    liveState,
+    state === "live" ? "live" : state === "version-mismatch" ? "update" : "wait",
+  );
   setText(eyebrow, `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`);
   setText(headline, remoteHeadlineForState(state));
   setText(deck, lines.join(" · "));
@@ -287,7 +294,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   renderChips([
     route.feedMode === "subscribed" ? "subscribed" : "discovery",
     route.network,
-    "redacted",
+    state === "version-mismatch" ? "version" : "redacted",
   ]);
   renderTicker(lines);
   stopStageProgress();
@@ -326,6 +333,8 @@ function remoteHeadlineForState(state) {
       return "no visible streams";
     case "waiting":
       return "waiting for stories";
+    case "version-mismatch":
+      return "update your peer";
     case "live":
       return "live feed";
     case "failed":
@@ -888,13 +897,52 @@ async function startDiscoveryRoute(route) {
       throw new Error(`resolver failed: ${response.status}`);
     }
     const ticket = await response.json();
-    const feedCount = ticket.feeds?.length || ticket.candidate_feeds?.length || 0;
+    const ticketStatus = compatibilityStatus(ticket.compatibility || ticket.browser_seed?.compatibility);
+    if (!ticketStatus.compatible) {
+      renderRemoteState(route, "version-mismatch", [
+        "feed protocol or data model changed",
+        ticketStatus.message,
+        "update your peer to the latest version",
+      ], ticket.profile);
+      logWarn("feed.discovery.version_mismatch", {
+        login: ticket.profile?.login || route.login,
+        compatibility: ticket.compatibility,
+        message: ticketStatus.message,
+      });
+      return;
+    }
+    const allFeeds = ticketFeeds(ticket);
+    const compatibleFeeds = allFeeds.filter((feed) => compatibilityStatus(feed.compatibility).compatible);
+    const incompatibleFeeds = allFeeds.length - compatibleFeeds.length;
+    if (incompatibleFeeds > 0) {
+      logWarn("feed.discovery.incompatible_feeds_ignored", {
+        login: ticket.profile?.login || route.login,
+        incompatible_feeds: incompatibleFeeds,
+      });
+    }
+    if (ticket.feeds) {
+      ticket.feeds = compatibleFeeds;
+    }
+    if (ticket.candidate_feeds) {
+      ticket.candidate_feeds = compatibleFeeds;
+    }
+    const feedCount = compatibleFeeds.length;
     logInfo("feed.discovery.ticket", {
       login: ticket.profile?.login || route.login,
       github_user_id: ticket.github_user_id || ticket.resolved_github_id,
       feeds: feedCount,
+      incompatible_feeds: incompatibleFeeds,
       expires_at: ticket.expires_at,
     });
+    if (allFeeds.length > 0 && feedCount === 0) {
+      const firstStatus = compatibilityStatus(allFeeds[0].compatibility);
+      renderRemoteState(route, "version-mismatch", [
+        "visible feeds use a different data model",
+        firstStatus.message,
+        "update your peer to the latest version",
+      ], ticket.profile);
+      return;
+    }
     if (feedCount === 0) {
       renderRemoteState(route, "no-feeds", [
         "github identity found",
@@ -926,6 +974,41 @@ async function startDiscoveryRoute(route) {
     ]);
     logError("remote route resolution failed", error);
   }
+}
+
+function ticketFeeds(ticket) {
+  return ticket.feeds || ticket.candidate_feeds || [];
+}
+
+function compatibilityStatus(remote) {
+  if (!remote) {
+    return {
+      compatible: false,
+      message: "compatibility metadata unavailable; update your peer to the latest version",
+    };
+  }
+  const protocolVersion = Number(remote.protocol_version ?? remote.protocolVersion ?? 0);
+  const modelVersion = Number(remote.model_version ?? remote.modelVersion ?? 0);
+  const minModelVersion = Number(remote.min_model_version ?? remote.minModelVersion ?? 0);
+  let message = "compatible";
+  let compatible =
+    protocolVersion === FEED_PROTOCOL_VERSION &&
+    FEED_MODEL_VERSION >= minModelVersion &&
+    modelVersion >= FEED_MIN_MODEL_VERSION;
+  if (protocolVersion !== FEED_PROTOCOL_VERSION) {
+    message = "protocol changed; update your peer to the latest version";
+  } else if (minModelVersion > FEED_MODEL_VERSION) {
+    message = "remote feed requires a newer data model; update your peer to the latest version";
+  } else if (modelVersion < FEED_MIN_MODEL_VERSION) {
+    message = "remote peer is using an older data model; ask the publisher to update";
+  }
+  return {
+    compatible,
+    message,
+    protocolVersion,
+    modelVersion,
+    minModelVersion,
+  };
 }
 
 function startSubscribedRoute(route) {

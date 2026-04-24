@@ -4,9 +4,9 @@ use agent_feed_identity::{
 };
 use agent_feed_identity_github::GithubProfile;
 use agent_feed_p2p_proto::{
-    AgentKind, FeedId, FeedVisibility, NetworkId, PeerIdString, ProtoError, PublisherIdentity,
-    Signature, Signed, StoryCapsule, StoryKind, feed_topic, github_org_topic, github_team_topic,
-    github_user_topic, stable_digest,
+    AgentKind, FeedId, FeedVisibility, NetworkId, PeerIdString, ProtoError, ProtocolCompatibility,
+    PublisherIdentity, Signature, Signed, StoryCapsule, StoryKind, feed_topic, github_org_topic,
+    github_team_topic, github_user_topic, stable_digest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,6 +41,8 @@ pub enum DirectoryError {
     GithubIdMismatch,
     #[error("directory record access policy mismatch")]
     AccessPolicyMismatch,
+    #[error("p2p compatibility rejected: {0}")]
+    IncompatibleProtocol(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +497,7 @@ pub struct StreamDescriptor {
 pub struct FeedDirectoryEntry {
     pub feed_id: FeedId,
     pub network_id: NetworkId,
+    pub compatibility: ProtocolCompatibility,
     pub owner: GithubPrincipal,
     pub peer_id: PeerIdString,
     pub feed_label: String,
@@ -547,6 +550,7 @@ impl FeedDirectoryEntry {
         Self {
             feed_id: feed_id.clone(),
             network_id: network_id.to_string(),
+            compatibility: ProtocolCompatibility::current(),
             owner: owner.clone(),
             peer_id: peer_id.into(),
             display_name: format!(
@@ -745,6 +749,7 @@ impl From<&GithubProfile> for GithubProfileView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBrowserSeed {
     pub network_id: NetworkId,
+    pub compatibility: ProtocolCompatibility,
     pub edge_base_url: String,
     pub bootstrap_peers: Vec<MultiaddrString>,
     #[serde(with = "time::serde::rfc3339")]
@@ -764,6 +769,7 @@ impl SignedBrowserSeed {
         let now = OffsetDateTime::now_utc();
         let mut seed = Self {
             network_id: network_id.into(),
+            compatibility: ProtocolCompatibility::current(),
             edge_base_url: edge_base_url.into(),
             bootstrap_peers,
             issued_at: now,
@@ -778,6 +784,7 @@ impl SignedBrowserSeed {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubDiscoveryTicket {
     pub network_id: NetworkId,
+    pub compatibility: ProtocolCompatibility,
     pub requested_login: GithubLogin,
     pub resolved_github_id: GithubUserId,
     pub profile: GithubProfileView,
@@ -810,6 +817,7 @@ impl GithubDiscoveryTicket {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgDiscoveryTicket {
     pub network_id: NetworkId,
+    pub compatibility: ProtocolCompatibility,
     pub org: GithubOrgName,
     pub team: Option<GithubTeamSlug>,
     pub candidate_feeds: Vec<FeedDirectoryEntry>,
@@ -851,6 +859,7 @@ impl DirectoryStore {
     }
 
     pub fn publish(&mut self, entry: FeedDirectoryEntry) -> Result<(), DirectoryError> {
+        ensure_current_compatibility(&entry.compatibility)?;
         if !entry.verify_signature()? {
             return Err(DirectoryError::InvalidSignature);
         }
@@ -1004,6 +1013,17 @@ impl DirectoryStore {
             .into_iter()
             .filter_map(|(label, entries)| logical_feed_summary(label, entries))
             .collect())
+    }
+}
+
+pub fn ensure_current_compatibility(remote: &ProtocolCompatibility) -> Result<(), DirectoryError> {
+    let local = ProtocolCompatibility::current();
+    if local.is_compatible_with(remote) {
+        Ok(())
+    } else {
+        Err(DirectoryError::IncompatibleProtocol(
+            local.status_with(remote).message,
+        ))
     }
 }
 
@@ -1470,6 +1490,21 @@ mod tests {
             store.publish(first),
             Err(DirectoryError::ReplayedSequence)
         ));
+    }
+
+    #[test]
+    fn directory_rejects_incompatible_feed_model() {
+        let mut bad = entry("workstation", FeedVisibility::Public, 1);
+        bad.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        bad = bad.sign("peer-a").expect("entry resigns");
+        let mut store = DirectoryStore::new();
+
+        let err = store
+            .publish(bad)
+            .expect_err("incompatible record is rejected");
+
+        assert!(matches!(err, DirectoryError::IncompatibleProtocol(_)));
+        assert!(err.to_string().contains("update your peer"));
     }
 
     #[test]

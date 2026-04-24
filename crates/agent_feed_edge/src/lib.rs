@@ -8,8 +8,8 @@ use agent_feed_identity_github::{
     GithubUserResponse, StaticGithubResolver,
 };
 use agent_feed_p2p_proto::{
-    Signature, github_org_provider_key, github_org_topic, github_provider_key,
-    github_team_provider_key, github_team_topic, github_user_topic,
+    ProtocolCompatibility, Signature, github_org_provider_key, github_org_topic,
+    github_provider_key, github_team_provider_key, github_team_topic, github_user_topic,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -205,6 +205,7 @@ impl<R: GithubResolver, A: GithubAccessResolver> EdgeResolver<R, A> {
         let now = OffsetDateTime::now_utc();
         let ticket = GithubDiscoveryTicket {
             network_id: route.network.network_id(),
+            compatibility: ProtocolCompatibility::current(),
             requested_login: route.login.clone(),
             resolved_github_id: profile.id,
             profile: GithubProfileView::from(&profile),
@@ -258,6 +259,7 @@ impl<R: GithubResolver, A: GithubAccessResolver> EdgeResolver<R, A> {
         let now = OffsetDateTime::now_utc();
         OrgDiscoveryTicket {
             network_id: self.config.network_id.clone(),
+            compatibility: ProtocolCompatibility::current(),
             org: org.clone(),
             team: team.cloned(),
             candidate_feeds: feeds,
@@ -296,6 +298,7 @@ impl<R: GithubResolver, A: GithubAccessResolver> EdgeResolver<R, A> {
 pub struct ResolveGithubResponse {
     pub state: String,
     pub network_id: String,
+    pub compatibility: ProtocolCompatibility,
     pub requested_login: String,
     pub github_user_id: u64,
     pub profile: GithubProfileView,
@@ -310,6 +313,7 @@ pub struct ResolveGithubResponse {
 pub struct ResolveFeedView {
     pub feed_id: String,
     pub label: String,
+    pub compatibility: ProtocolCompatibility,
     pub visibility: String,
     pub publisher_login: String,
     pub publisher_display_name: Option<String>,
@@ -324,6 +328,7 @@ impl From<&GithubDiscoveryTicket> for ResolveGithubResponse {
         Self {
             state: "resolved".to_string(),
             network_id: ticket.network_id.clone(),
+            compatibility: ticket.compatibility.clone(),
             requested_login: ticket.requested_login.to_string(),
             github_user_id: ticket.resolved_github_id.get(),
             profile: ticket.profile.clone(),
@@ -333,6 +338,7 @@ impl From<&GithubDiscoveryTicket> for ResolveGithubResponse {
                 .map(|feed| ResolveFeedView {
                     feed_id: feed.feed_id.clone(),
                     label: feed.feed_label.clone(),
+                    compatibility: feed.compatibility.clone(),
                     visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
                     publisher_login: feed.owner.current_login.clone(),
                     publisher_display_name: feed.owner.display_name.clone(),
@@ -352,6 +358,7 @@ impl From<&GithubDiscoveryTicket> for ResolveGithubResponse {
 pub struct ResolveOrgResponse {
     pub state: String,
     pub network_id: String,
+    pub compatibility: ProtocolCompatibility,
     pub org: String,
     pub team: Option<String>,
     pub feeds: Vec<ResolveFeedView>,
@@ -366,6 +373,7 @@ impl From<&OrgDiscoveryTicket> for ResolveOrgResponse {
         Self {
             state: "resolved".to_string(),
             network_id: ticket.network_id.clone(),
+            compatibility: ticket.compatibility.clone(),
             org: ticket.org.to_string(),
             team: ticket.team.as_ref().map(ToString::to_string),
             feeds: ticket
@@ -374,6 +382,7 @@ impl From<&OrgDiscoveryTicket> for ResolveOrgResponse {
                 .map(|feed| ResolveFeedView {
                     feed_id: feed.feed_id.clone(),
                     label: feed.feed_label.clone(),
+                    compatibility: feed.compatibility.clone(),
                     visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
                     publisher_login: feed.owner.current_login.clone(),
                     publisher_display_name: feed.owner.display_name.clone(),
@@ -593,6 +602,10 @@ fn fabric_probe_payload(edge: &EdgeConfig, transport: &str) -> String {
     serde_json::json!({
         "product": "feed",
         "protocol": "agent-feed.edge/1",
+        "protocol_version": agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
+        "model_version": agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
+        "min_model_version": agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION,
+        "release_version": agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION,
         "transport": transport,
         "network_id": edge.network_id,
         "edge": edge.edge_domain,
@@ -619,8 +632,15 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-async fn readyz() -> &'static str {
-    "ready"
+async fn readyz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "state": "ready",
+        "product": "feed",
+        "protocol_version": agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
+        "model_version": agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
+        "min_model_version": agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION,
+        "release_version": agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION,
+    }))
 }
 
 async fn auth_github(
@@ -876,6 +896,7 @@ async fn network_snapshot(State(state): State<Arc<HttpState>>) -> Json<serde_jso
     Json(serde_json::json!({
         "product": "feed",
         "network_id": state.config.network_id,
+        "compatibility": ProtocolCompatibility::current(),
         "edge_base_url": state.config.edge_domain,
         "browser_app_base_url": state.config.browser_app_base_url,
         "bootstrap_peers": state.config.bootstrap_peers,
@@ -1329,8 +1350,11 @@ mod tests {
         assert_eq!(response.state, "resolved");
         assert_eq!(response.requested_login, "mosure");
         assert_eq!(response.github_user_id, 123);
+        assert_eq!(response.compatibility.protocol_version, 1);
+        assert_eq!(response.compatibility.model_version, 1);
         assert_eq!(response.browser_seed_url, "/browser-seed");
         assert_eq!(response.feeds[0].publisher_login, "mosure");
+        assert_eq!(response.feeds[0].compatibility.protocol_version, 1);
         assert_eq!(
             response.feeds[0].publisher_avatar.as_deref(),
             Some("/avatar/github/123")
@@ -1358,6 +1382,8 @@ mod tests {
 
         assert!(payload.contains("\"product\":\"feed\""));
         assert!(payload.contains("\"protocol\":\"agent-feed.edge/1\""));
+        assert!(payload.contains("\"protocol_version\":1"));
+        assert!(payload.contains("\"model_version\":1"));
         assert!(payload.contains("\"transport\":\"tcp\""));
         assert!(payload.contains("\"state\":\"ready\""));
         assert!(!payload.contains("secret"));
