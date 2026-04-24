@@ -135,6 +135,18 @@ mod tests {
     }
 
     #[test]
+    fn github_oauth_code_callback_forwards_to_edge() {
+        let html = render_index_with_config(Some("network"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("code: params.get(\"code\") || \"\""));
+        assert!(html.contains("function handleGithubOauthCodeCallback"));
+        assert!(html.contains("/callback/github${window.location.search}"));
+        assert!(html.contains("feed.github.oauth.forward"));
+        assert!(html.contains("if (githubAuthCallback?.code)"));
+        assert!(html.contains("handleGithubOauthCodeCallback(githubAuthCallback);"));
+    }
+
+    #[test]
     fn browser_remote_route_reports_version_mismatch() {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
 

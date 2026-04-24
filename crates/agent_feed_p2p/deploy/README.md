@@ -76,6 +76,11 @@ AGENT_FEED_P2P_CANARY_GITHUB_LOGIN=mosure
 AGENT_FEED_P2P_CANARY_FEED_LABEL=workstation
 ```
 
+the github oauth app callback may stay on the browser host:
+`https://feed.aberration.technology/callback/github`. the static shell forwards
+raw oauth `code` callbacks to the edge, then the edge exchanges the code and
+redirects to the local cli callback or the browser session callback.
+
 optional variables:
 
 ```text

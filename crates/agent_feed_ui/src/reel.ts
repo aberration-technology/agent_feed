@@ -802,6 +802,7 @@ function parseGithubAuthCallback(location) {
   }
   const params = new URLSearchParams(location.search);
   return {
+    code: params.get("code") || "",
     state: params.get("state") || "",
     login: params.get("login") || "",
     github_user_id: params.get("github_user_id") || params.get("id") || "",
@@ -872,6 +873,35 @@ function randomState() {
     logWarn("browser crypto unavailable; github auth state used weak fallback");
   }
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function handleGithubOauthCodeCallback(callback) {
+  setText(liveState, "auth");
+  setText(eyebrow, "github / sign-in / edge");
+  setText(headline, "github sign-in");
+  renderPublisher(undefined);
+  renderHeadlineImage(undefined);
+  renderChips(["github", "edge", "oauth", "session"]);
+  stopStageProgress();
+
+  const edge = edgeBaseUrl();
+  if (!edge) {
+    setText(deck, "edge callback is not configured. start again from /network.");
+    logError("github oauth callback could not find edge", {
+      has_code: Boolean(callback.code),
+      has_state: Boolean(callback.state),
+    });
+    return;
+  }
+
+  setText(deck, "finishing github sign-in with the edge.");
+  const edgeCallback = `${edge.replace(/\/$/, "")}/callback/github${window.location.search}`;
+  logInfo("feed.github.oauth.forward", {
+    edge,
+    has_code: Boolean(callback.code),
+    has_state: Boolean(callback.state),
+  });
+  window.location.replace(edgeCallback);
 }
 
 function handleGithubAuthCallback(callback) {
@@ -1747,7 +1777,9 @@ function updateSourceCount() {
 
 updateClock();
 window.setInterval(updateClock, 1000);
-if (githubAuthCallback) {
+if (githubAuthCallback?.code) {
+  handleGithubOauthCodeCallback(githubAuthCallback);
+} else if (githubAuthCallback) {
   handleGithubAuthCallback(githubAuthCallback);
 } else if (isNetworkView()) {
   startNetworkView();
