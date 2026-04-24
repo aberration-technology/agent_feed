@@ -1,6 +1,6 @@
-# agent_reel ✨🎞️
+# agent_feed ✨🎞️
 
-`agent_reel` turns local coding-agent activity into a projection-safe live reel.
+`agent_feed` turns local coding-agent activity into a projection-safe live reel.
 
 agent activity, reduced to signal.
 
@@ -20,15 +20,15 @@ the product is not a dashboard. it is a local broadcast layer.
 ## install
 
 ```sh
-cargo install agent_reel_cli --locked
-agent-reel init --auto
-agent-reel serve
+cargo install agent_feed_cli --locked
+agent-feed init --auto
+agent-feed serve
 ```
 
 ## happy path
 
 ```sh
-agent-reel open
+agent-feed open
 ```
 
 the reel is served at:
@@ -54,7 +54,7 @@ first-class inputs:
 
 the daemon may discover active tools, but it is honest about capture limits.
 already-running private TUI sessions are only observable when they expose a stream, hook,
-app-server, telemetry surface, transcript, or were launched through an `agent_reel` shim.
+app-server, telemetry surface, transcript, or were launched through an `agent_feed` shim.
 
 ## safety boundary
 
@@ -91,7 +91,7 @@ the reel is a view of agent activity, not an agent control plane.
 start the daemon:
 
 ```sh
-agent-reel serve
+agent-feed serve
 ```
 
 send a safe generic event:
@@ -101,7 +101,7 @@ curl -sS http://127.0.0.1:7777/ingest/generic \
   -H 'content-type: application/json' \
   -d '{
     "agent": "codex",
-    "project": "agent_reel",
+    "project": "agent_feed",
     "kind": "turn.complete",
     "title": "signal path is live",
     "summary": "generic ingest produced one redacted bulletin.",
@@ -112,46 +112,51 @@ curl -sS http://127.0.0.1:7777/ingest/generic \
 open:
 
 ```sh
-agent-reel open
+agent-feed open
 ```
 
 ## commands
 
 ```text
-agent-reel doctor
-agent-reel init --auto
-agent-reel init --codex
-agent-reel init --claude
-agent-reel serve
-agent-reel open
-agent-reel auth github
-agent-reel auth status
-agent-reel auth logout
-agent-reel ingest --source generic < event.json
-agent-reel ingest --source codex-jsonl < events.jsonl
-agent-reel ingest --source claude-stream-json < events.jsonl
-agent-reel codex active --sessions 2
-agent-reel codex active --sessions 2 --watch
-agent-reel codex import ~/.codex/sessions/2026/04/23/rollout-...jsonl
-agent-reel codex stories --sessions 2
-agent-reel claude stream < stream.jsonl
-agent-reel claude active --sessions 2
-agent-reel claude active --sessions 2 --watch
-agent-reel claude import ~/.claude/projects/.../session.jsonl
-agent-reel claude stories --sessions 2
-agent-reel p2p init
-agent-reel p2p join mainnet
-agent-reel p2p discover github mosure --all --explain
-agent-reel p2p share --feed workstation --visibility private
-agent-reel p2p publish --dry-run --agents codex,claude --sessions 2
-agent-reel p2p publish --dry-run --sessions 2 --per-story
-agent-reel p2p publish --dry-run --summarizer codex-exec
-agent-reel p2p publish --dry-run --summarizer claude-code
-agent-reel p2p publish --dry-run --images --image-processor codex-exec
-agent-reel p2p publish --dry-run --images --image-processor process --image-command ./summarize-image
-agent-reel p2p publish --dry-run --images --image-processor http-endpoint --image-endpoint http://127.0.0.1:8787/summarize-image
-agent-reel hook --source claude --event PreToolUse
-agent-reel uninstall --restore-hooks
+agent-feed doctor
+agent-feed init --auto
+agent-feed init --codex
+agent-feed init --claude
+agent-feed serve
+agent-feed serve --p2p
+agent-feed open
+agent-feed auth github
+agent-feed auth status
+agent-feed auth logout
+agent-feed ingest --source generic < event.json
+agent-feed ingest --source codex-jsonl < events.jsonl
+agent-feed ingest --source claude-stream-json < events.jsonl
+agent-feed codex active --sessions 2
+agent-feed codex active --sessions 2 --watch
+agent-feed codex import ~/.codex/sessions/2026/04/23/rollout-...jsonl
+agent-feed codex stories --sessions 2
+agent-feed claude stream < stream.jsonl
+agent-feed claude active --sessions 2
+agent-feed claude active --sessions 2 --watch
+agent-feed claude import ~/.claude/projects/.../session.jsonl
+agent-feed claude stories --sessions 2
+agent-feed p2p init
+agent-feed p2p join mainnet
+agent-feed p2p discover github mosure --all --explain
+agent-feed p2p discover github-org aberration-technology --all --explain
+agent-feed p2p discover github-team aberration-technology --team release --all --explain
+agent-feed p2p share --feed workstation --visibility private
+agent-feed p2p share --feed release --visibility github_org --github-org aberration-technology
+agent-feed p2p share --feed release --visibility github_team --github-org aberration-technology --github-team release
+agent-feed p2p publish --dry-run --agents codex,claude --sessions 2
+agent-feed p2p publish --dry-run --sessions 2 --per-story
+agent-feed p2p publish --dry-run --summarizer codex-exec
+agent-feed p2p publish --dry-run --summarizer claude-code
+agent-feed p2p publish --dry-run --images --image-processor codex-exec
+agent-feed p2p publish --dry-run --images --image-processor process --image-command ./summarize-image
+agent-feed p2p publish --dry-run --images --image-processor http-endpoint --image-endpoint http://127.0.0.1:8787/summarize-image
+agent-feed hook --source claude --event PreToolUse
+agent-feed uninstall --restore-hooks
 ```
 
 `codex active` reads `~/.codex/history.jsonl`, selects the most recent distinct
@@ -165,7 +170,7 @@ the daemon. it compiles selected transcripts into settled story summaries.
 `claude stream` reads Claude Code `--output-format stream-json` JSONL from stdin
 and posts display-safe events to the local daemon. `claude active` discovers the
 newest transcript JSONL files under `~/.claude/projects` and can watch appended
-events. hook JSON from Claude Code can also be piped through `agent-reel hook
+events. hook JSON from Claude Code can also be piped through `agent-feed hook
 --source claude --event PreToolUse`; failures are logged and fail open.
 
 the hook helper reads stdin, posts to loopback, exits `0` on daemon failure, and never
@@ -178,21 +183,21 @@ native github auth is edge-mediated. the cli never needs a github client
 secret.
 
 ```text
-agent-reel auth github
+agent-feed auth github
 ```
 
 the command binds a one-shot loopback callback, opens the edge github sign-in
 URL in the browser, validates the returned `state`, and writes the resulting
-github profile/session to `~/.agent_reel/auth/github.json` with owner-only file
+github profile/session to `~/.agent_feed/auth/github.json` with owner-only file
 permissions.
 
 useful variants:
 
 ```text
-agent-reel auth github --print-url
-agent-reel auth github --no-browser
-agent-reel auth github --edge https://edge.feed.aberration.technology
-agent-reel auth github --callback-bind 127.0.0.1:0
+agent-feed auth github --print-url
+agent-feed auth github --no-browser
+agent-feed auth github --edge https://edge.feed.aberration.technology
+agent-feed auth github --callback-bind 127.0.0.1:0
 ```
 
 the hosted browser shell uses the same edge authority. `/network` is the
@@ -230,10 +235,41 @@ cache signed directory records, serve rendezvous/kad/provider lookups, or host
 browser handoff transports without receiving story capsules. a feed starts delivering
 only after an explicit follow/subscription grant path.
 
+the public discovery feed and subscribed remote feed are separate operating
+modes. local-only `agent-feed serve` does not enable the public github discovery
+UX; username routes render as local-only until the browser shell is p2p-enabled
+by the hosted build or `agent-feed serve --p2p`.
+
+headless projection links can pin the mode:
+
+```text
+/mosure?feed_mode=discovery
+/mosure?feed_mode=subscribed&subscriptions=mosure/workstation,alice/release
+/mosure/workstation?feed_mode=subscribed
+```
+
+the projection surface stays clean. the browser exposes a small discovery /
+subscribed switcher only after recent mouse or keyboard activity, then fades it
+back out.
+
+org deployments are first-class. an edge can require github org access before a
+session may enter the network, and publishers can mark feeds as visible to an
+org or to a specific team inside that org. discovery still stays p2p-shaped:
+org and team namespaces are hashed, directory records are signed, and multiple
+peers owned by the same github user may publish the same logical feed name.
+subscribing to `aberration-technology/*` means all visible settled story feeds
+for that org; it does not subscribe a fabric peer automatically.
+
 summarization is publisher-side. subscribers receive already-summarized capsules and do
 not spend tokens or run external processors. the default p2p publisher uses a deterministic
 feed rollup, so a noisy window becomes one small recap capsule. `--per-story` keeps one
 capsule per settled story when an operator wants more detail.
+
+publish decisions also happen before signing. the local publisher keeps a short
+memory of recent summaries and suppresses duplicates when the headline and deck
+have not meaningfully changed. codex, claude, process, or HTTP summarizers may
+also return `publish=false` with a reason; severe stories still bypass duplicate
+suppression so failures and permission events do not disappear.
 
 external summarizers are opt-in and still pass through the same guardrails before signing:
 
@@ -258,7 +294,7 @@ readable code, command output, diffs, absolute paths, repo names, credentials,
 or personal data. subscribers do not run image generation.
 
 the projection UI is text-only by default. a viewer may opt in with
-`?images=on` or local storage key `agent_reel.images=enabled`; `?images=off`,
+`?images=on` or local storage key `agent_feed.images=enabled`; `?images=off`,
 `text=only`, or `text_only=true` force text-only mode.
 
 ## github routes
@@ -308,6 +344,20 @@ timeline mode is a vertical, scroll-snapped view over the selected user/feed.
 it keeps a bounded ring buffer of recent settled story capsules and never
 subscribes to private feeds without an explicit grant. `/reel` and the normal
 deep links stay hands-free.
+
+subscribed mode is explicit:
+
+```text
+?feed_mode=subscribed
+?subscriptions=mosure/workstation,alice/release
+```
+
+it shows only selected follow targets and does not mix in the public discovery
+feed. discovery mode remains the public github lookup view:
+
+```text
+?feed_mode=discovery
+```
 
 `?all` means all visible settled story streams:
 
@@ -382,7 +432,7 @@ public_bind_requires_token = true
 snapshot_interval_ms = 5000
 
 [store]
-path = "~/.agent_reel/events.db"
+path = "~/.agent_feed/events.db"
 raw_events = "off"
 retention_days = 7
 max_events = 100_000
@@ -418,6 +468,14 @@ processor = "deterministic"   # deterministic | codex-exec | claude-code | proce
 max_capsule_chars = 720
 max_feed_rollup_stories = 32
 
+[summarize.publish]
+enabled = true
+allow_processor_skip = true
+recent_window = 24
+max_headline_similarity = 88
+max_deck_similarity_when_headline_matches = 82
+severe_score_bypass = 90
+
 [summarize.image]
 enabled = false
 processor = "disabled"        # disabled | codex-exec | claude-code | process | http-endpoint
@@ -438,8 +496,9 @@ action = "mask"
 
 [p2p]
 enabled = false
-network_id = "agent-reel-mainnet"
+network_id = "agent-feed-mainnet"
 profile = "local"
+browser_discovery = false
 
 [p2p.discovery]
 edge_directory = true
@@ -447,6 +506,11 @@ rendezvous = true
 kad = true
 presence_gossip = true
 resolve_timeout_ms = 20000
+
+[p2p.discovery.github]
+org_namespaces = true
+team_namespaces = true
+hash_org_topics = true
 
 [p2p.fabric]
 enabled = true
@@ -466,13 +530,26 @@ raw_events = false
 summarizer = "deterministic"
 images = false
 
+[p2p.publish.github]
+required_org = ""
+required_teams = []
+
 [p2p.subscribe]
 enabled = true
 auto_follow_public = false
 request_private_grants = true
 
+[p2p.subscribe.github]
+follow_orgs = []
+follow_teams = []
+
+[edge.github]
+required_org = ""
+required_teams = []
+
 [remote_routes]
 default_mode = "settled"
+default_feed_mode = "discovery"   # discovery | subscribed
 allow_immediate = false
 story_only = true
 min_score = 75
@@ -497,7 +574,7 @@ started in explicit debug mode.
 ## workspace map
 
 ```text
-agent_reel/
+agent_feed/
   Cargo.toml
   README.md
   LICENSE-APACHE
@@ -507,37 +584,37 @@ agent_reel/
   xtask/
 
   crates/
-    agent_reel/           public facade, stable types, extension traits
-    agent_reel_cli/       binary: agent-reel
-    agent_reel_core/      ids, time, event model, score model, typed errors
-    agent_reel_adapters/  codex, claude, mcp, otel, shim, process discovery
-    agent_reel_ingest/    HTTP ingest, JSONL ingest, hook helper protocol
-    agent_reel_redaction/ secret scanning, path masking, prompt/output policy
-    agent_reel_filter/    allow/deny rules, URI filters, project filters
-    agent_reel_highlight/ scoring, clustering, deduplication, recap generation
-    agent_reel_story/     story windows, settle rules, p2p-safe summaries
-    agent_reel_summarize/ feed rollups, guardrails, external processors
-    agent_reel_reel/      bulletin scheduler, dwell rules, urgent queue
-    agent_reel_store/     sqlite store, ring buffer, retention, raw-event policy
-    agent_reel_server/    axum routes, SSE, auth, embedded UI assets
-    agent_reel_views/     read models consumed by /api and UI
-    agent_reel_security/  display tokens, LAN mode, CORS, mutation safety
-    agent_reel_metrics/   counters, health, adapter lag, dropped events
-    agent_reel_install/   doctor, discovery, shims, hook merge/uninstall
-    agent_reel_identity/  provider-neutral identity model
-    agent_reel_identity_github/ github login/id/profile resolver
-    agent_reel_directory/ route parser, signed feed directory, tickets
-    agent_reel_p2p_proto/ signed feed profiles, story capsules, grants
-    agent_reel_p2p/       native publish/subscribe runtime boundary
-    agent_reel_auth/      provider-neutral identity model
-    agent_reel_auth_github/ github profile and device-flow boundary
-    agent_reel_social/    feed directory and follow request state
-    agent_reel_browser/   wasm/browser peer bootstrap boundary
-    agent_reel_p2p_browser/ browser route states and discovery view models
-    agent_reel_edge/      bootstrap, auth, directory, browser seed edge
-    agent_reel_deploy/    deployment templates and operator surfaces
-    agent_reel_testkit/   fake streams, fixtures, projector snapshots
-    agent_reel_ui/        self-contained HTML/CSS/TS broadcast client
+    agent_feed/           public facade, stable types, extension traits
+    agent_feed_cli/       binary: agent-feed
+    agent_feed_core/      ids, time, event model, score model, typed errors
+    agent_feed_adapters/  codex, claude, mcp, otel, shim, process discovery
+    agent_feed_ingest/    HTTP ingest, JSONL ingest, hook helper protocol
+    agent_feed_redaction/ secret scanning, path masking, prompt/output policy
+    agent_feed_filter/    allow/deny rules, URI filters, project filters
+    agent_feed_highlight/ scoring, clustering, deduplication, recap generation
+    agent_feed_story/     story windows, settle rules, p2p-safe summaries
+    agent_feed_summarize/ feed rollups, guardrails, external processors
+    agent_feed_reel/      bulletin scheduler, dwell rules, urgent queue
+    agent_feed_store/     sqlite store, ring buffer, retention, raw-event policy
+    agent_feed_server/    axum routes, SSE, auth, embedded UI assets
+    agent_feed_views/     read models consumed by /api and UI
+    agent_feed_security/  display tokens, LAN mode, CORS, mutation safety
+    agent_feed_metrics/   counters, health, adapter lag, dropped events
+    agent_feed_install/   doctor, discovery, shims, hook merge/uninstall
+    agent_feed_identity/  provider-neutral identity model
+    agent_feed_identity_github/ github login/id/profile resolver
+    agent_feed_directory/ route parser, signed feed directory, tickets
+    agent_feed_p2p_proto/ signed feed profiles, story capsules, grants
+    agent_feed_p2p/       native publish/subscribe runtime boundary
+    agent_feed_auth/      provider-neutral identity model
+    agent_feed_auth_github/ github profile and device-flow boundary
+    agent_feed_social/    feed directory and follow request state
+    agent_feed_browser/   wasm/browser peer bootstrap boundary
+    agent_feed_p2p_browser/ browser route states and discovery view models
+    agent_feed_edge/      bootstrap, auth, directory, browser seed edge
+    agent_feed_deploy/    deployment templates and operator surfaces
+    agent_feed_testkit/   fake streams, fixtures, projector snapshots
+    agent_feed_ui/        self-contained HTML/CSS/TS broadcast client
 ```
 
 ## roadmap
@@ -601,7 +678,7 @@ m5 - story compiler:
 
 m6 - native p2p alpha:
 
-* agent_reel_p2p_proto
+* agent_feed_p2p_proto
 * native p2p node boundary
 * feed profiles
 * public feed capsules

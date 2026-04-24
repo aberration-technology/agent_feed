@@ -1,0 +1,21 @@
+[Unit]
+Description=feed p2p edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent-feed
+Group=agent-feed
+EnvironmentFile=/etc/agent-feed/edge.env
+ExecStart=/usr/local/bin/agent-feed edge serve --config /etc/agent-feed/edge.toml --bind 127.0.0.1:${edge_loopback_port}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-feed /etc/agent-feed
+
+[Install]
+WantedBy=multi-user.target

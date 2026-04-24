@@ -1,0 +1,16 @@
+[package]
+name = "agent_feed_browser"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_feed_p2p_proto = { workspace = true }
+agent_feed_social = { workspace = true }
+
+[lints]
+workspace = true

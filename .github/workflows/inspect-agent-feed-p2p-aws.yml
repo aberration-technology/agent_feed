@@ -1,0 +1,105 @@
+name: inspect feed p2p aws
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment containing AWS settings.
+        required: true
+        default: agent-feed-p2p-production
+        type: string
+      terraform_workspace:
+        description: Terraform workspace name.
+        required: true
+        default: mainnet
+        type: string
+      restart_edge_services:
+        description: Restart Caddy and agent-feed-edge through SSM before inspection.
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - name: resolve aws session settings
+        shell: bash
+        env:
+          AWS_REGION_VAR: ${{ vars.AGENT_FEED_P2P_AWS_REGION }}
+          AWS_ROLE_ARN_VAR: ${{ vars.AGENT_FEED_P2P_AWS_ROLE_ARN }}
+          STACK_NAME_VAR: ${{ vars.AGENT_FEED_P2P_STACK_NAME }}
+        run: |
+          set -euo pipefail
+          : "${AWS_ROLE_ARN_VAR:?missing AGENT_FEED_P2P_AWS_ROLE_ARN}"
+          {
+            echo "AWS_REGION=${AWS_REGION_VAR:-us-east-2}"
+            echo "AWS_ROLE_ARN=$AWS_ROLE_ARN_VAR"
+            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$AWS_ROLE_ARN_VAR")"
+            echo "STACK_NAME=${STACK_NAME_VAR:-agent-feed-p2p-production}"
+          } >>"$GITHUB_ENV"
+
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: feed-p2p-inspect-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
+
+      - name: verify aws account
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then
+            echo "assumed aws account mismatch: expected $AWS_ACCOUNT_ID got $account_id" >&2
+            exit 1
+          fi
+
+      - name: inspect edge
+        shell: bash
+        env:
+          RESTART_EDGE_SERVICES: ${{ github.event.inputs.restart_edge_services }}
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/feed-inspect"
+          mkdir -p "$artifact_dir"
+
+          instance_id="$(aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --filters \
+              "Name=tag:Name,Values=${STACK_NAME}-edge" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)"
+          if [ -z "$instance_id" ] || [ "$instance_id" = "None" ]; then
+            echo "feed edge instance not found for ${STACK_NAME}-edge" >&2
+            exit 1
+          fi
+          echo "instance: $instance_id"
+
+          aws ec2 describe-instances \
+            --region "$AWS_REGION" \
+            --instance-ids "$instance_id" \
+            --output json | tee "$artifact_dir/edge-instance.json"
+
+          if [ "$RESTART_EDGE_SERVICES" = "true" ]; then
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$instance_id" \
+              --document-name AWS-RunShellScript \
+              --parameters commands='["sudo systemctl restart caddy agent-feed-edge","sudo systemctl --no-pager status caddy agent-feed-edge"]' \
+              --output json | tee "$artifact_dir/restart-command.json"
+          fi
+
+      - name: upload inspect artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-p2p-inspect
+          path: ${{ runner.temp }}/feed-inspect

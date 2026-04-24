@@ -1,0 +1,15 @@
+[package]
+name = "agent_feed_highlight"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_feed_core = { workspace = true }
+time = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,1 +1,1 @@
-{"agent":"claude","project":"agent_reel","kind":"permission.denied","title":"permission denied for risky command","tool":"Bash"}
+{"agent":"claude","project":"agent_feed","kind":"permission.denied","title":"permission denied for risky command","tool":"Bash"}

@@ -1,6 +1,6 @@
 {
   "agent": "codex",
-  "project": "agent_reel",
+  "project": "agent_feed",
   "kind": "turn.complete",
   "title": "signal path is live",
   "summary": "generic ingest produced one redacted bulletin.",

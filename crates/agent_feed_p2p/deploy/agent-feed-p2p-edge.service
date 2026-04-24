@@ -1,0 +1,17 @@
+[Unit]
+Description=feed p2p edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agent-feed/edge.env
+ExecStart=/usr/local/bin/agent-feed edge serve --config /etc/agent-feed/edge.toml
+Restart=on-failure
+RestartSec=3
+User=agent-feed
+Group=agent-feed
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

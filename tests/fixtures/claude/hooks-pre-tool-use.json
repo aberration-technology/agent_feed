@@ -1,1 +1,1 @@
-{"agent":"claude","project":"agent_reel","kind":"permission.request","title":"claude requested Bash(git push)","tool":"Bash"}
+{"agent":"claude","project":"agent_feed","kind":"permission.request","title":"claude requested Bash(git push)","tool":"Bash"}

@@ -1,1 +1,1 @@
-{"type":"item.completed","agent":"codex","project":"agent_reel","kind":"tool.fail","title":"tool failed","summary":"command exited nonzero without exposing raw output."}
+{"type":"item.completed","agent":"codex","project":"agent_feed","kind":"tool.fail","title":"tool failed","summary":"command exited nonzero without exposing raw output."}

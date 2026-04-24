@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>feed</title>
+    <style>
+/*__REEL_CSS__*/
+    </style>
+  </head>
+  <body data-view="__REEL_VIEW__">
+    <main class="reel" aria-live="polite">
+      <header class="topbar">
+        <div class="brand">FEED</div>
+        <div class="status">
+          <span id="live-state">LIVE</span>
+          <span id="clock">--:--</span>
+          <span id="source-count">0 SRC</span>
+        </div>
+      </header>
+
+      <nav class="mode-switcher" id="mode-switcher" hidden aria-label="feed mode">
+        <a id="mode-discovery" href="#">discovery</a>
+        <a id="mode-subscribed" href="#">subscribed</a>
+      </nav>
+
+      <section class="stage" id="stage">
+        <div class="publisher" id="publisher" hidden>
+          <img id="publisher-avatar" alt="" loading="lazy">
+          <span id="publisher-label"></span>
+        </div>
+        <div class="eyebrow" id="eyebrow">LOCAL / QUIET / IDLE</div>
+        <h1 id="headline">waiting for signal</h1>
+        <p class="deck" id="deck">no display-safe activity has reached the feed yet.</p>
+        <figure class="headline-image" id="headline-image" hidden>
+          <img id="headline-image-img" alt="" loading="lazy">
+        </figure>
+        <a class="auth-action" id="auth-action" hidden rel="noopener">sign in with github</a>
+        <div class="chips" id="chips">
+          <span>local</span>
+          <span>redacted</span>
+          <span>idle</span>
+        </div>
+      </section>
+
+      <section class="timeline" id="timeline" hidden aria-label="feed timeline"></section>
+
+      <footer class="ticker" id="ticker">
+        <span>feed is listening on loopback</span>
+      </footer>
+    </main>
+    <script>
+/*__FEED_CONFIG__*/
+    </script>
+    <script type="module">
+/*__REEL_JS__*/
+    </script>
+  </body>
+</html>

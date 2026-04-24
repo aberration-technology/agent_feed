@@ -1,0 +1,14 @@
+[edge]
+bind = "127.0.0.1:${edge_loopback_port}"
+base_url = "${edge_base_url}"
+browser_app_base_url = "${browser_app_base_url}"
+network_id = "${network_id}"
+
+[p2p]
+tcp_port = ${p2p_port}
+quic_port = ${p2p_port}
+webrtc_direct_port = 443
+
+[auth.github]
+required_org = "${github_required_org}"
+required_teams = "${github_required_teams}"

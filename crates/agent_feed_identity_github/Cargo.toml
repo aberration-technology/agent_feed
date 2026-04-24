@@ -1,0 +1,17 @@
+[package]
+name = "agent_feed_identity_github"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_feed_identity = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

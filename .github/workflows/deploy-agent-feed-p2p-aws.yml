@@ -1,0 +1,218 @@
+name: deploy feed p2p aws
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment containing AWS/OAuth settings.
+        required: true
+        default: agent-feed-p2p-production
+        type: string
+      terraform_workspace:
+        description: Terraform workspace name.
+        required: true
+        default: mainnet
+        type: string
+      apply:
+        description: Apply the Terraform plan.
+        required: true
+        default: true
+        type: boolean
+      deploy_pages_after_apply:
+        description: Dispatch the Pages workflow after a successful apply.
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+
+concurrency:
+  group: deploy-feed-p2p-aws-${{ github.event.inputs.environment }}-${{ github.event.inputs.terraform_workspace }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      TF_ROOT: crates/agent_feed_p2p/deploy/terraform/aws
+      TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
+      DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: resolve deployment settings
+        shell: bash
+        env:
+          VAR_AWS_REGION: ${{ vars.AGENT_FEED_P2P_AWS_REGION }}
+          VAR_AWS_ROLE_ARN: ${{ vars.AGENT_FEED_P2P_AWS_ROLE_ARN }}
+          VAR_STACK_NAME: ${{ vars.AGENT_FEED_P2P_STACK_NAME }}
+          VAR_EDGE_DOMAIN_NAME: ${{ vars.AGENT_FEED_P2P_EDGE_DOMAIN_NAME }}
+          VAR_BROWSER_APP_BASE_URL: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_BASE_URL }}
+          VAR_BROWSER_APP_PAGES_DOMAIN_TARGET: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}
+          VAR_ROUTE53_ZONE_NAME: ${{ vars.AGENT_FEED_P2P_ROUTE53_ZONE_NAME }}
+          VAR_NETWORK_ID: ${{ vars.AGENT_FEED_P2P_NETWORK_ID }}
+          VAR_CANARY_GITHUB_LOGIN: ${{ vars.AGENT_FEED_P2P_CANARY_GITHUB_LOGIN }}
+          VAR_CANARY_FEED_LABEL: ${{ vars.AGENT_FEED_P2P_CANARY_FEED_LABEL }}
+          VAR_GITHUB_REQUIRED_ORG: ${{ vars.AGENT_FEED_P2P_GITHUB_REQUIRED_ORG }}
+          VAR_GITHUB_REQUIRED_REPO: ${{ vars.AGENT_FEED_P2P_GITHUB_REQUIRED_REPO }}
+          VAR_GITHUB_ADMIN_LOGINS: ${{ vars.AGENT_FEED_P2P_GITHUB_ADMIN_LOGINS }}
+          VAR_ALARM_SNS_TOPIC_ARN: ${{ vars.AGENT_FEED_P2P_ALARM_SNS_TOPIC_ARN }}
+          VAR_SECRET_PARAMETER_PREFIX: ${{ vars.AGENT_FEED_P2P_SECRET_PARAMETER_PREFIX }}
+          VAR_ALLOW_ROUTE53_ZONE_APEX_RECORDS: ${{ vars.AGENT_FEED_P2P_ALLOW_ROUTE53_ZONE_APEX_RECORDS }}
+        run: |
+          set -euo pipefail
+          secret_parameter_prefix="${VAR_SECRET_PARAMETER_PREFIX:-/agent-feed-p2p/mainnet/edge}"
+          allow_apex="${VAR_ALLOW_ROUTE53_ZONE_APEX_RECORDS:-false}"
+          aws_region="${VAR_AWS_REGION:-us-east-2}"
+          aws_role_arn="${VAR_AWS_ROLE_ARN:-}"
+          environment_name="$DEPLOY_ENVIRONMENT"
+          environment_name="${environment_name#agent-real-p2p-}"
+          environment_name="${environment_name#agent-feed-p2p-}"
+          if [ -z "$aws_role_arn" ]; then
+            echo "AGENT_FEED_P2P_AWS_ROLE_ARN must be set on the selected GitHub environment" >&2
+            exit 1
+          fi
+          {
+            echo "AWS_REGION=$aws_region"
+            echo "AWS_ROLE_ARN=$aws_role_arn"
+            echo "AWS_ACCOUNT_ID=$(cut -d: -f5 <<<"$aws_role_arn")"
+            echo "TF_VAR_aws_region=$aws_region"
+            echo "TF_VAR_environment_name=$environment_name"
+            echo "TF_VAR_stack_name=${VAR_STACK_NAME:-agent-feed-p2p-production}"
+            echo "TF_VAR_edge_domain_name=${VAR_EDGE_DOMAIN_NAME:-edge.feed.aberration.technology}"
+            echo "TF_VAR_browser_app_base_url=${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}"
+            echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
+            echo "TF_VAR_route53_zone_name=${VAR_ROUTE53_ZONE_NAME:-aberration.technology}"
+            echo "TF_VAR_network_id=${VAR_NETWORK_ID:-agent-feed-mainnet}"
+            echo "TF_VAR_canary_github_login=${VAR_CANARY_GITHUB_LOGIN:-mosure}"
+            echo "TF_VAR_canary_feed_label=${VAR_CANARY_FEED_LABEL:-workstation}"
+            echo "TF_VAR_github_required_org=${VAR_GITHUB_REQUIRED_ORG:-}"
+            echo "TF_VAR_github_required_repo=${VAR_GITHUB_REQUIRED_REPO:-}"
+            echo "TF_VAR_alarm_sns_topic_arn=${VAR_ALARM_SNS_TOPIC_ARN:-}"
+            echo "TF_VAR_secret_parameter_prefix=$secret_parameter_prefix"
+            echo "TF_VAR_allow_route53_zone_apex_records=$allow_apex"
+            echo "TF_VAR_github_client_id_parameter_name=$secret_parameter_prefix/github_client_id"
+            echo "TF_VAR_github_client_secret_parameter_name=$secret_parameter_prefix/github_client_secret"
+            echo "GITHUB_CLIENT_ID_PARAMETER_NAME=$secret_parameter_prefix/github_client_id"
+            echo "GITHUB_CLIENT_SECRET_PARAMETER_NAME=$secret_parameter_prefix/github_client_secret"
+          } >>"$GITHUB_ENV"
+          if [ -n "${VAR_GITHUB_ADMIN_LOGINS:-}" ]; then
+            python3 - <<'PY' >>"$GITHUB_ENV"
+import json, os
+logins = [x.strip() for x in os.environ["VAR_GITHUB_ADMIN_LOGINS"].split(",") if x.strip()]
+print("TF_VAR_github_admin_logins=" + json.dumps(logins))
+PY
+          fi
+
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: feed-p2p-deploy-${{ github.run_id }}
+          mask-aws-account-id: true
+          unset-current-credentials: true
+
+      - name: verify aws account
+        shell: bash
+        run: |
+          set -euo pipefail
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          if [ "$account_id" != "$AWS_ACCOUNT_ID" ]; then
+            echo "assumed aws account mismatch: expected $AWS_ACCOUNT_ID got $account_id" >&2
+            exit 1
+          fi
+
+      - name: sync edge oauth secrets
+        shell: bash
+        env:
+          SECRET_GITHUB_CLIENT_ID: ${{ secrets.AGENT_FEED_P2P_GITHUB_CLIENT_ID }}
+          SECRET_GITHUB_CLIENT_SECRET: ${{ secrets.AGENT_FEED_P2P_GITHUB_CLIENT_SECRET }}
+          LEGACY_OAUTH_CLIENT_ID: ${{ secrets.AGENT_FEED_P2P_OAUTH_CLIENT_ID }}
+          LEGACY_OAUTH_CLIENT_SECRET: ${{ secrets.AGENT_FEED_P2P_OAUTH_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          client_id="${SECRET_GITHUB_CLIENT_ID:-${LEGACY_OAUTH_CLIENT_ID:-}}"
+          client_secret="${SECRET_GITHUB_CLIENT_SECRET:-${LEGACY_OAUTH_CLIENT_SECRET:-}}"
+          if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
+            echo "GitHub OAuth secrets were not present; skipping SSM sync." >&2
+            exit 0
+          fi
+          aws ssm put-parameter \
+            --name "$GITHUB_CLIENT_ID_PARAMETER_NAME" \
+            --type SecureString \
+            --value "$client_id" \
+            --overwrite
+          aws ssm put-parameter \
+            --name "$GITHUB_CLIENT_SECRET_PARAMETER_NAME" \
+            --type SecureString \
+            --value "$client_secret" \
+            --overwrite
+
+      - name: setup terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: terraform fmt
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform fmt -check
+
+      - name: terraform init
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform init
+
+      - name: terraform workspace
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform workspace select "$TF_WORKSPACE_NAME" || terraform workspace new "$TF_WORKSPACE_NAME"
+
+      - name: terraform validate
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform validate
+
+      - name: terraform plan
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply
+        if: ${{ github.event.inputs.apply == 'true' }}
+        working-directory: ${{ env.TF_ROOT }}
+        run: terraform apply -auto-approve tfplan
+
+      - name: terraform outputs
+        if: ${{ github.event.inputs.apply == 'true' }}
+        id: terraform_outputs
+        working-directory: ${{ env.TF_ROOT }}
+        run: |
+          set -euo pipefail
+          echo "edge_url=$(terraform output -raw edge_url)" >>"$GITHUB_OUTPUT"
+          echo "browser_app_url=$(terraform output -raw browser_app_url)" >>"$GITHUB_OUTPUT"
+          echo "route_canary_url=$(terraform output -raw route_canary_url)" >>"$GITHUB_OUTPUT"
+          terraform output -json > "$RUNNER_TEMP/feed-terraform-outputs.json"
+
+      - name: upload terraform outputs
+        if: ${{ github.event.inputs.apply == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: feed-terraform-outputs
+          path: ${{ runner.temp }}/feed-terraform-outputs.json
+
+      - name: edge health canary
+        if: ${{ github.event.inputs.apply == 'true' }}
+        run: curl -fsSL "${{ steps.terraform_outputs.outputs.edge_url }}/healthz" | grep -q ok
+
+      - name: dispatch pages publish
+        if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run deploy-pages.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            -f environment="${{ github.event.inputs.environment }}" \
+            -f edge_base_url="${{ steps.terraform_outputs.outputs.edge_url }}" \
+            -f browser_app_base_url="${{ steps.terraform_outputs.outputs.browser_app_url }}"

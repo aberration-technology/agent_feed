@@ -1,0 +1,24 @@
+[package]
+name = "agent_feed_directory"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_feed_core = { workspace = true }
+agent_feed_identity = { workspace = true }
+agent_feed_identity_github = { workspace = true }
+agent_feed_p2p_proto = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde", "formatting"] }
+
+[dev-dependencies]
+agent_feed_story = { workspace = true }
+
+[lints]
+workspace = true

@@ -60,7 +60,7 @@ fn build_browser_site(args: Vec<String>) -> Result<()> {
     let mut out_dir = PathBuf::from("target/feed-site");
     let mut edge_url = "https://edge.feed.aberration.technology".to_string();
     let mut site_base_url = "https://feed.aberration.technology".to_string();
-    let mut network_id = "agent-reel-mainnet".to_string();
+    let mut network_id = "agent-feed-mainnet".to_string();
     let mut cname = Some("feed.aberration.technology".to_string());
 
     let mut iter = args.into_iter();
@@ -125,12 +125,12 @@ fn render_browser_shell(edge_url: &str, site_base_url: &str, network_id: &str) -
         .ok_or_else(|| {
             XtaskError::InvalidArgs("xtask manifest path has no workspace root".into())
         })?;
-    let ui_dir = root.join("crates/agent_reel_ui/src");
+    let ui_dir = root.join("crates/agent_feed_ui/src");
     let index = fs::read_to_string(ui_dir.join("index.html")).map_err(XtaskError::Io)?;
     let css = fs::read_to_string(ui_dir.join("reel.css")).map_err(XtaskError::Io)?;
     let js = fs::read_to_string(ui_dir.join("reel.ts")).map_err(XtaskError::Io)?;
     let config = format!(
-        "window.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.AGENT_REEL_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
+        "window.FEED_P2P_ENABLED = true;\nwindow.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.AGENT_FEED_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
         js_string(edge_url),
         js_string(site_base_url),
         js_string(network_id),
@@ -138,6 +138,7 @@ fn render_browser_shell(edge_url: &str, site_base_url: &str, network_id: &str) -
     Ok(index
         .replace("/*__REEL_CSS__*/", &css)
         .replace("/*__REEL_JS__*/", &js)
+        .replace("/*__FEED_CONFIG__*/", "")
         .replace("__REEL_VIEW__", "remote")
         .replace(
             "<script type=\"module\">",

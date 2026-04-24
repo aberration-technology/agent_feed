@@ -1,0 +1,44 @@
+[package]
+name = "agent_feed"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_feed_core = { workspace = true }
+agent_feed_filter = { workspace = true }
+agent_feed_highlight = { workspace = true }
+agent_feed_ingest = { workspace = true }
+agent_feed_directory = { workspace = true, optional = true }
+agent_feed_identity = { workspace = true }
+agent_feed_identity_github = { workspace = true, optional = true }
+agent_feed_p2p = { workspace = true, optional = true }
+agent_feed_p2p_browser = { workspace = true, optional = true }
+agent_feed_p2p_proto = { workspace = true, optional = true }
+agent_feed_redaction = { workspace = true }
+agent_feed_reel = { workspace = true }
+agent_feed_security = { workspace = true }
+agent_feed_store = { workspace = true }
+agent_feed_story = { workspace = true }
+agent_feed_summarize = { workspace = true }
+agent_feed_views = { workspace = true }
+agent_feed_auth_github = { workspace = true, optional = true }
+agent_feed_browser = { workspace = true, optional = true }
+agent_feed_edge = { workspace = true, optional = true }
+
+[features]
+default = ["local"]
+local = []
+p2p = ["dep:agent_feed_p2p", "dep:agent_feed_p2p_proto", "dep:agent_feed_directory"]
+p2p-browser = ["p2p", "dep:agent_feed_browser", "dep:agent_feed_p2p_browser"]
+github = ["dep:agent_feed_identity_github"]
+auth-github = ["github", "dep:agent_feed_auth_github"]
+edge = ["p2p", "github", "dep:agent_feed_edge"]
+aws-deploy = []
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "agent_feed_p2p_proto"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_feed_core = { workspace = true }
+agent_feed_story = { workspace = true }
+agent_feed_summarize = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde", "formatting"] }
+
+[lints]
+workspace = true
