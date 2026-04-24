@@ -1,0 +1,17 @@
+[Unit]
+Description=feed p2p edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/agent-reel/edge.env
+ExecStart=/usr/local/bin/agent-reel edge serve --config /etc/agent-reel/edge.toml
+Restart=on-failure
+RestartSec=3
+User=agent-reel
+Group=agent-reel
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

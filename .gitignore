@@ -1,0 +1,8 @@
+/target/
+**/.terraform/
+/.DS_Store
+/.idea/
+*.swp
+*.swo
+*.tmp
+*.log

@@ -1,0 +1,1 @@
+{"agent":"mcp","adapter":"mcp.stdio","kind":"mcp.call","title":"mcp tool call started","tool":"github.fetch_pr"}

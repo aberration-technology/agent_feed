@@ -1,0 +1,40 @@
+{
+    servers {
+        protocols h1 h2
+    }
+}
+
+http://${edge_domain_name} {
+    redir https://${edge_domain_name}{uri} 308
+}
+
+https://${edge_domain_name} {
+    encode gzip zstd
+
+    @preflight method OPTIONS
+    handle @preflight {
+        header Access-Control-Allow-Origin "${browser_app_origin}"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
+        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
+        header Access-Control-Max-Age "3600"
+        header Vary "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        respond "" 204
+    }
+
+    handle /healthz {
+        respond "ok" 200
+    }
+
+    handle /readyz {
+        respond "ready" 200
+    }
+
+    handle {
+        header Access-Control-Allow-Origin "${browser_app_origin}"
+        header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Authorization, Content-Type, Origin"
+        header Access-Control-Expose-Headers "Content-Length, Content-Type, Location"
+        reverse_proxy 127.0.0.1:${edge_loopback_port}
+    }
+}

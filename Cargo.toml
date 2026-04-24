@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/agent_reel",
+    "crates/agent_reel_adapters",
+    "crates/agent_reel_auth",
+    "crates/agent_reel_auth_github",
+    "crates/agent_reel_browser",
+    "crates/agent_reel_cli",
+    "crates/agent_reel_core",
+    "crates/agent_reel_deploy",
+    "crates/agent_reel_edge",
+    "crates/agent_reel_filter",
+    "crates/agent_reel_highlight",
+    "crates/agent_reel_ingest",
+    "crates/agent_reel_install",
+    "crates/agent_reel_directory",
+    "crates/agent_reel_identity",
+    "crates/agent_reel_identity_github",
+    "crates/agent_reel_metrics",
+    "crates/agent_reel_p2p",
+    "crates/agent_reel_p2p_browser",
+    "crates/agent_reel_p2p_proto",
+    "crates/agent_reel_redaction",
+    "crates/agent_reel_reel",
+    "crates/agent_reel_security",
+    "crates/agent_reel_server",
+    "crates/agent_reel_social",
+    "crates/agent_reel_store",
+    "crates/agent_reel_story",
+    "crates/agent_reel_summarize",
+    "crates/agent_reel_testkit",
+    "crates/agent_reel_ui",
+    "crates/agent_reel_views",
+    "xtask",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/aberration-technology/agent_reel"
+homepage = "https://aberration.technology/"
+readme = "README.md"
+rust-version = "1.95"
+
+[workspace.dependencies]
+agent_reel = { path = "crates/agent_reel" }
+agent_reel_adapters = { path = "crates/agent_reel_adapters" }
+agent_reel_auth = { path = "crates/agent_reel_auth" }
+agent_reel_auth_github = { path = "crates/agent_reel_auth_github" }
+agent_reel_browser = { path = "crates/agent_reel_browser" }
+agent_reel_core = { path = "crates/agent_reel_core" }
+agent_reel_deploy = { path = "crates/agent_reel_deploy" }
+agent_reel_edge = { path = "crates/agent_reel_edge" }
+agent_reel_filter = { path = "crates/agent_reel_filter" }
+agent_reel_highlight = { path = "crates/agent_reel_highlight" }
+agent_reel_ingest = { path = "crates/agent_reel_ingest" }
+agent_reel_install = { path = "crates/agent_reel_install" }
+agent_reel_directory = { path = "crates/agent_reel_directory" }
+agent_reel_identity = { path = "crates/agent_reel_identity" }
+agent_reel_identity_github = { path = "crates/agent_reel_identity_github" }
+agent_reel_metrics = { path = "crates/agent_reel_metrics" }
+agent_reel_p2p = { path = "crates/agent_reel_p2p" }
+agent_reel_p2p_browser = { path = "crates/agent_reel_p2p_browser" }
+agent_reel_p2p_proto = { path = "crates/agent_reel_p2p_proto" }
+agent_reel_redaction = { path = "crates/agent_reel_redaction" }
+agent_reel_reel = { path = "crates/agent_reel_reel" }
+agent_reel_security = { path = "crates/agent_reel_security" }
+agent_reel_server = { path = "crates/agent_reel_server" }
+agent_reel_social = { path = "crates/agent_reel_social" }
+agent_reel_store = { path = "crates/agent_reel_store" }
+agent_reel_story = { path = "crates/agent_reel_story" }
+agent_reel_summarize = { path = "crates/agent_reel_summarize" }
+agent_reel_testkit = { path = "crates/agent_reel_testkit" }
+agent_reel_ui = { path = "crates/agent_reel_ui" }
+agent_reel_views = { path = "crates/agent_reel_views" }
+
+axum = "0.8.4"
+clap = "4.5.53"
+http = "1.3.1"
+regex = "1.12.2"
+serde = "1.0.228"
+serde_json = "1.0.145"
+thiserror = "2.0.17"
+time = "0.3.44"
+tokio = "1.48.0"
+tokio-stream = "0.1.17"
+tower-http = "0.6.7"
+tracing = "0.1.43"
+tracing-subscriber = "0.3.22"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"

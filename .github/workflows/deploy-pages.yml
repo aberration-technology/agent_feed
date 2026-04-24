@@ -1,0 +1,147 @@
+name: deploy feed pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment containing feed deployment variables.
+        required: true
+        default: agent-real-p2p-production
+        type: string
+      edge_base_url:
+        description: Optional edge URL baked into the browser shell.
+        required: false
+        default: ""
+        type: string
+      browser_app_base_url:
+        description: Optional browser app URL.
+        required: false
+        default: ""
+        type: string
+      network_id:
+        description: Optional network id.
+        required: false
+        default: ""
+        type: string
+      canary_github_login:
+        description: Optional GitHub login for the deep-link canary.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: deploy-feed-pages-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      site_base_url: ${{ steps.settings.outputs.site_base_url }}
+      edge_base_url: ${{ steps.settings.outputs.edge_base_url }}
+      canary_url: ${{ steps.settings.outputs.canary_url }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v4
+
+      - name: setup rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: configure pages
+        uses: actions/configure-pages@v5
+
+      - name: resolve feed browser settings
+        id: settings
+        shell: bash
+        env:
+          INPUT_EDGE_BASE_URL: ${{ github.event.inputs.edge_base_url }}
+          INPUT_BROWSER_APP_BASE_URL: ${{ github.event.inputs.browser_app_base_url }}
+          INPUT_NETWORK_ID: ${{ github.event.inputs.network_id }}
+          INPUT_CANARY_GITHUB_LOGIN: ${{ github.event.inputs.canary_github_login }}
+          VAR_EDGE_BASE_URL: ${{ vars.AGENT_FEED_P2P_EDGE_BASE_URL }}
+          VAR_EDGE_DOMAIN_NAME: ${{ vars.AGENT_FEED_P2P_EDGE_DOMAIN_NAME }}
+          VAR_BROWSER_APP_BASE_URL: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_BASE_URL }}
+          VAR_NETWORK_ID: ${{ vars.AGENT_FEED_P2P_NETWORK_ID }}
+          VAR_CANARY_GITHUB_LOGIN: ${{ vars.AGENT_FEED_P2P_CANARY_GITHUB_LOGIN }}
+        run: |
+          set -euo pipefail
+          edge_base_url="${INPUT_EDGE_BASE_URL:-${VAR_EDGE_BASE_URL:-}}"
+          if [ -z "$edge_base_url" ] && [ -n "${VAR_EDGE_DOMAIN_NAME:-}" ]; then
+            edge_base_url="https://${VAR_EDGE_DOMAIN_NAME}"
+          fi
+          edge_base_url="${edge_base_url:-https://edge.feed.aberration.technology}"
+          site_base_url="${INPUT_BROWSER_APP_BASE_URL:-${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}}"
+          network_id="${INPUT_NETWORK_ID:-${VAR_NETWORK_ID:-agent-reel-mainnet}}"
+          canary_login="${INPUT_CANARY_GITHUB_LOGIN:-${VAR_CANARY_GITHUB_LOGIN:-mosure}}"
+          cname="${site_base_url#https://}"
+          cname="${cname#http://}"
+          cname="${cname%%/*}"
+          {
+            echo "EDGE_BASE_URL=$edge_base_url"
+            echo "SITE_BASE_URL=$site_base_url"
+            echo "NETWORK_ID=$network_id"
+            echo "SITE_CNAME=$cname"
+          } >>"$GITHUB_ENV"
+          {
+            echo "edge_base_url=$edge_base_url"
+            echo "site_base_url=$site_base_url"
+            echo "canary_url=${site_base_url%/}/${canary_login}?all"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: build feed browser site
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p xtask -- build-browser-site \
+            --out-dir target/feed-site \
+            --edge-url "$EDGE_BASE_URL" \
+            --site-base-url "$SITE_BASE_URL" \
+            --network-id "$NETWORK_ID" \
+            --cname "$SITE_CNAME"
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/feed-site
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: deploy to github pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  canary:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - deploy
+    steps:
+      - name: deep-link shell canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "${{ needs.build.outputs.canary_url }}" | grep -E '<title>feed</title>|class="brand">FEED<'
+      - name: edge health canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "${{ needs.build.outputs.edge_base_url }}/healthz" | grep -q ok

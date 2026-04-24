@@ -1,0 +1,29 @@
+[p2p]
+enabled = true
+network_id = "agent-reel-mainnet"
+profile = "mainnet"
+
+[p2p.mainnet]
+enabled = true
+edge_base_url = "https://edge.feed.aberration.technology"
+bootstrap_peers = [
+  "/dns4/edge.feed.aberration.technology/tcp/7747",
+  "/dns4/edge.feed.aberration.technology/udp/7747/quic-v1",
+  "/dns4/edge.feed.aberration.technology/udp/443/webrtc-direct",
+]
+
+[p2p.publish]
+enabled = false
+story_only = true
+settled_only = true
+raw_events = false
+min_score = 75
+
+[p2p.fabric]
+enabled = true
+subscribe = false
+browser_handoff = true
+
+[p2p.subscribe]
+enabled = true
+auto_follow_public = false

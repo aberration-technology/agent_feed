@@ -1,0 +1,17 @@
+[package]
+name = "agent_reel_story"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent_reel_core = { workspace = true }
+agent_reel_highlight = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["serde", "formatting"] }
+
+[lints]
+workspace = true
