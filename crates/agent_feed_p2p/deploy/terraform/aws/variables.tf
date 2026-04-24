@@ -51,6 +51,12 @@ variable "browser_app_pages_base_path" {
   default     = "/agent_feed"
 }
 
+variable "github_callback_url" {
+  description = "GitHub OAuth authorization callback URL registered on the OAuth app."
+  type        = string
+  default     = ""
+}
+
 variable "allow_route53_zone_apex_records" {
   description = "Whether Terraform may manage records at the hosted-zone apex."
   type        = bool

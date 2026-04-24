@@ -29,6 +29,7 @@ pub struct EdgeConfig {
     pub network_id: String,
     pub edge_domain: String,
     pub browser_app_base_url: String,
+    pub github_callback_url: String,
     pub bootstrap_peers: Vec<String>,
     pub authority_id: String,
     pub org_policy: OrgDeploymentPolicy,
@@ -41,6 +42,7 @@ impl EdgeConfig {
             network_id: "agent-feed-mainnet".to_string(),
             edge_domain: "https://edge.feed.aberration.technology".to_string(),
             browser_app_base_url: "https://feed.aberration.technology".to_string(),
+            github_callback_url: "https://feed.aberration.technology/callback/github".to_string(),
             bootstrap_peers: vec![
                 "/dns4/edge.feed.aberration.technology/tcp/7747".to_string(),
                 "/dns4/edge.feed.aberration.technology/udp/7747/quic-v1".to_string(),
@@ -59,6 +61,19 @@ impl EdgeConfig {
     #[must_use]
     pub fn ready_path(&self) -> &'static str {
         "/readyz"
+    }
+
+    #[must_use]
+    pub fn github_callback_url(&self) -> String {
+        let value = self.github_callback_url.trim();
+        if value.is_empty() {
+            format!(
+                "{}/callback/github",
+                self.browser_app_base_url.trim_end_matches('/')
+            )
+        } else {
+            value.trim_end_matches('/').to_string()
+        }
     }
 }
 
@@ -656,7 +671,7 @@ async fn auth_github(
             "github auth state failed",
         );
     };
-    let callback_url = format!("{}/callback/github", state.config.edge_domain);
+    let callback_url = state.config.github_callback_url();
     let scope = query
         .get("scope")
         .cloned()
@@ -710,7 +725,7 @@ async fn callback_github(
         return edge_error(StatusCode::BAD_REQUEST, "browser return_to is not allowed");
     }
 
-    let callback_url = format!("{}/callback/github", state.config.edge_domain);
+    let callback_url = state.config.github_callback_url();
     let token = match exchange_github_code(&client_id, &client_secret, code, &callback_url) {
         Ok(token) => token,
         Err(message) => return edge_error(StatusCode::BAD_GATEWAY, message),
@@ -1321,6 +1336,20 @@ mod tests {
             Some("/avatar/github/123")
         );
         assert!(response.feeds[0].publisher_verified);
+    }
+
+    #[test]
+    fn github_oauth_callback_uses_feed_host() {
+        let config = config();
+
+        assert_eq!(
+            config.github_callback_url(),
+            "https://feed.aberration.technology/callback/github"
+        );
+        assert_ne!(
+            config.github_callback_url(),
+            "https://edge.feed.aberration.technology/callback/github"
+        );
     }
 
     #[test]

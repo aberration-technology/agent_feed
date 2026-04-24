@@ -42,6 +42,7 @@ locals {
   browser_app_hostname_normalized   = trimsuffix(lower(local.browser_app_hostname), ".")
   browser_app_pages_domain_target   = trimsuffix(trimspace(var.browser_app_pages_domain_target), ".")
   browser_app_pages_base_path       = trimsuffix(trimspace(var.browser_app_pages_base_path), "/")
+  github_callback_url               = trimspace(var.github_callback_url) == "" ? "${local.browser_app_base_url}/callback/github" : trimspace(var.github_callback_url)
   claiming_edge_apex                = local.edge_domain_name_normalized == local.route53_zone_apex
   claiming_browser_apex             = local.browser_app_hostname_normalized == local.route53_zone_apex
   cloudwatch_alarm_actions          = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
@@ -70,6 +71,7 @@ locals {
   edge_env = templatefile("${path.module}/templates/edge.env.tftpl", {
     browser_app_base_url                = local.browser_app_base_url
     edge_base_url                       = local.edge_url
+    github_callback_url                 = local.github_callback_url
     network_id                          = var.network_id
     p2p_port                            = var.p2p_port
     github_required_org                 = var.github_required_org
@@ -84,6 +86,7 @@ locals {
   edge_toml = templatefile("${path.module}/templates/edge.toml.tftpl", {
     browser_app_base_url  = local.browser_app_base_url
     edge_base_url         = local.edge_url
+    github_callback_url   = local.github_callback_url
     network_id            = var.network_id
     p2p_port              = var.p2p_port
     edge_loopback_port    = var.edge_loopback_port
@@ -100,7 +103,8 @@ locals {
     edge_loopback_port        = var.edge_loopback_port
   })
   edge_service_unit = templatefile("${path.module}/templates/agent-feed-edge.service.tftpl", {
-    edge_loopback_port = var.edge_loopback_port
+    edge_loopback_port  = var.edge_loopback_port
+    github_callback_url = local.github_callback_url
   })
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
     agent_feed_binary_s3_uri   = var.agent_feed_binary_s3_uri

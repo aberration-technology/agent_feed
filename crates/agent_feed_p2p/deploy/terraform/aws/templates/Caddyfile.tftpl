@@ -15,6 +15,21 @@ http://${browser_app_hostname} {
 https://${browser_app_hostname} {
     encode gzip zstd
 
+    @githubAuth {
+        path /auth/github
+    }
+    handle @githubAuth {
+        reverse_proxy 127.0.0.1:${edge_loopback_port}
+    }
+
+    @githubOauthCallback {
+        path /callback/github
+        query code=*
+    }
+    handle @githubOauthCallback {
+        reverse_proxy 127.0.0.1:${edge_loopback_port}
+    }
+
     handle /feed-config.json {
         rewrite * ${browser_pages_base_path}/feed-config.json
         reverse_proxy https://${browser_pages_origin_host} {

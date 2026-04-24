@@ -280,6 +280,11 @@ enum EdgeCommand {
         edge_base_url: String,
         #[arg(long, default_value = "https://feed.aberration.technology")]
         browser_app_base_url: String,
+        #[arg(
+            long,
+            default_value = "https://feed.aberration.technology/callback/github"
+        )]
+        github_callback_url: String,
         #[arg(long, default_value = "agent-feed-mainnet")]
         network_id: String,
     },
@@ -743,6 +748,7 @@ async fn main() -> Result<(), CliError> {
                 config: _,
                 edge_base_url,
                 browser_app_base_url,
+                github_callback_url,
                 network_id,
             } => {
                 let edge_host = edge_base_url
@@ -753,6 +759,7 @@ async fn main() -> Result<(), CliError> {
                     network_id,
                     edge_domain: edge_base_url.clone(),
                     browser_app_base_url,
+                    github_callback_url,
                     bootstrap_peers: vec![
                         format!("/dns4/{edge_host}/tcp/7747"),
                         format!("/dns4/{edge_host}/udp/7747/quic-v1"),
