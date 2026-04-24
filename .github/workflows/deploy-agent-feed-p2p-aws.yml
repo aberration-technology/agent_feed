@@ -202,7 +202,19 @@ jobs:
 
       - name: edge health canary
         if: ${{ github.event.inputs.apply == 'true' }}
-        run: curl -fsSL "${{ steps.terraform_outputs.outputs.edge_url }}/healthz" | grep -q ok
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${{ steps.terraform_outputs.outputs.edge_url }}/healthz"
+          for attempt in $(seq 1 60); do
+            if curl -fsSL --connect-timeout 5 --max-time 15 "$url" | grep -q ok; then
+              exit 0
+            fi
+            echo "edge health not ready yet; retry ${attempt}/60"
+            sleep 10
+          done
+          echo "edge health canary failed after waiting for ${url}" >&2
+          exit 1
 
       - name: dispatch pages publish
         if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}

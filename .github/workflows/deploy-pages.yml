@@ -139,9 +139,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "${{ needs.build.outputs.canary_url }}" | grep -E '<title>feed</title>|class="brand">FEED<'
+          for attempt in $(seq 1 12); do
+            if curl -fsSL --connect-timeout 5 --max-time 20 "${{ needs.build.outputs.canary_url }}" | grep -E '<title>feed</title>|class="brand">FEED<'; then
+              exit 0
+            fi
+            echo "deep-link shell not ready yet; retry ${attempt}/12"
+            sleep 10
+          done
+          echo "deep-link shell canary failed for ${{ needs.build.outputs.canary_url }}" >&2
+          exit 1
       - name: edge health canary
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL "${{ needs.build.outputs.edge_base_url }}/healthz" | grep -q ok
+          for attempt in $(seq 1 30); do
+            if curl -fsSL --connect-timeout 5 --max-time 15 "${{ needs.build.outputs.edge_base_url }}/healthz" | grep -q ok; then
+              exit 0
+            fi
+            echo "edge health not ready yet; retry ${attempt}/30"
+            sleep 10
+          done
+          echo "edge health canary failed for ${{ needs.build.outputs.edge_base_url }}/healthz" >&2
+          exit 1
