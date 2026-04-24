@@ -273,6 +273,7 @@ function imagesEnabled() {
 function renderRemoteState(route, state, lines = [], nextPublisher = undefined) {
   logInfo("feed.remote.state", {
     state,
+    scope: route.kind || "user",
     login: route.login,
     selection: route.selection,
     feed_mode: route.feedMode,
@@ -285,14 +286,18 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
     liveState,
     state === "live" ? "live" : state === "version-mismatch" ? "update" : "wait",
   );
-  setText(eyebrow, `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`);
+  setText(eyebrow, routeEyebrow(route));
   setText(headline, remoteHeadlineForState(state));
   setText(deck, lines.join(" · "));
-  renderPublisher(nextPublisher || { login: route.login });
+  renderPublisher(nextPublisher || (route.kind === "global" ? undefined : { login: route.login }));
   renderHeadlineImage(undefined);
   clearAuthAction();
   renderChips([
-    route.feedMode === "subscribed" ? "subscribed" : "discovery",
+    route.feedMode === "subscribed"
+      ? "subscribed"
+      : route.kind === "global"
+        ? "discovery"
+        : "selected",
     route.network,
     state === "version-mismatch" ? "version" : "redacted",
   ]);
@@ -300,7 +305,17 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   stopStageProgress();
 }
 
+function routeEyebrow(route) {
+  if (route.kind === "global") {
+    return `feed / ${route.network} / ${route.feedMode}`;
+  }
+  return `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`;
+}
+
 function routeStreamLabel(route) {
+  if (route.kind === "global") {
+    return route.feedMode === "subscribed" ? "explicit subscriptions" : "all public feeds";
+  }
   if (route.feed === "*") {
     return "all feeds";
   }
@@ -346,6 +361,7 @@ function remoteHeadlineForState(state) {
 
 function renderP2pDisabled(route) {
   logInfo("feed.p2p.disabled", {
+    scope: route.kind || "user",
     login: route.login,
     selection: route.selection,
     feed_mode: route.feedMode,
@@ -359,7 +375,7 @@ function renderP2pDisabled(route) {
   setText(headline, "local feed only");
   setText(
     deck,
-    "public user discovery and subscribed remote feeds are unavailable because p2p is disabled.",
+    "network discovery and subscribed remote feeds are unavailable because p2p is disabled.",
   );
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
@@ -463,8 +479,13 @@ async function hydrate() {
 
 function parseRemoteRoute(location) {
   const path = location.pathname.replace(/^\/+|\/+$/g, "");
+  if (!path) {
+    return rootNetworkRouteRequested(location) ? parseGlobalRoute(location) : undefined;
+  }
+  if (path === "reel" && rootNetworkRouteRequested(location)) {
+    return parseGlobalRoute(location);
+  }
   if (
-    !path ||
     path === "reel" ||
     path.startsWith("reel/") ||
     path === "network" ||
@@ -498,11 +519,12 @@ function parseRemoteRoute(location) {
     }
   }
   return {
+    kind: "user",
     login,
     network: params.get("network") || "mainnet",
     feed: feedSegment,
     selection: feedSegment ? `${login}/${feedSegment}` : routeSelection(login, params),
-    feedMode: routeFeedMode(params),
+    feedMode: routeFeedMode(params, "user"),
     subscriptionTargets: routeSubscriptionTargets(login, feedSegment, params),
     interactive:
       params.get("view") === "timeline" ||
@@ -512,7 +534,45 @@ function parseRemoteRoute(location) {
   };
 }
 
-function routeFeedMode(params) {
+function parseGlobalRoute(location) {
+  const params = new URLSearchParams(location.search);
+  for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
+    if (params.has(key)) {
+      logWarn(`ignored privacy-weakening query param: ${key}`);
+    }
+  }
+  return {
+    kind: "global",
+    login: "",
+    network: params.get("network") || "mainnet",
+    feed: "*",
+    selection: "network/*",
+    feedMode: routeFeedMode(params, "global"),
+    subscriptionTargets: routeSubscriptionTargets("", "*", params),
+    interactive:
+      params.get("view") === "timeline" ||
+      params.get("mode") === "timeline" ||
+      ["1", "true", "on"].includes(params.get("timeline") || ""),
+    query: location.search,
+  };
+}
+
+function rootNetworkRouteRequested(location) {
+  const params = new URLSearchParams(location.search);
+  return (
+    document.body.dataset.view === "remote" ||
+    params.has("network") ||
+    params.has("feed_mode") ||
+    params.has("feedMode") ||
+    params.has("subscriptions") ||
+    params.has("subscribed") ||
+    params.has("following") ||
+    params.has("discover") ||
+    params.has("discovery")
+  );
+}
+
+function routeFeedMode(params, scope = "user") {
   const explicit = (
     params.get("feed_mode") ||
     params.get("feedMode") ||
@@ -522,7 +582,7 @@ function routeFeedMode(params) {
   if (["subscribed", "subscriptions", "following"].includes(explicit)) {
     return "subscribed";
   }
-  if (["discovery", "discover", "hero", "public"].includes(explicit)) {
+  if (scope === "global" && ["discovery", "discover", "hero", "public", ""].includes(explicit)) {
     return "discovery";
   }
   if (
@@ -532,7 +592,15 @@ function routeFeedMode(params) {
   ) {
     return "subscribed";
   }
-  return "discovery";
+  if (scope === "global") {
+    return "discovery";
+  }
+  if (["discovery", "discover", "hero", "public"].includes(explicit)) {
+    logInfo("feed.user.discovery_alias", {
+      message: "per-user discovery is represented by user/* wildcard routes",
+    });
+  }
+  return "selected";
 }
 
 function routeSubscriptionTargets(login, feedSegment, params) {
@@ -552,6 +620,9 @@ function routeSubscriptionTargets(login, feedSegment, params) {
   const stored = storedSubscriptions().filter(isSafeSubscriptionTarget);
   if (stored.length) {
     return stored;
+  }
+  if (!login) {
+    return [];
   }
   if (feedSegment) {
     return [`${login}/${feedSegment}`];
@@ -626,7 +697,7 @@ function setupModeSwitcher(route) {
   }
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
   modeSubscribed.setAttribute("href", modeUrl(route, "subscribed"));
-  modeDiscovery.toggleAttribute("aria-current", route.feedMode === "discovery");
+  modeDiscovery.toggleAttribute("aria-current", route.kind === "global" && route.feedMode === "discovery");
   modeSubscribed.toggleAttribute("aria-current", route.feedMode === "subscribed");
   modeSwitcher.hidden = false;
   const reveal = () => revealControls();
@@ -658,7 +729,10 @@ function revealControls() {
 function modeUrl(route, mode) {
   const params = new URLSearchParams(route.query);
   params.set("feed_mode", mode);
-  if (mode === "subscribed" && !params.has("subscriptions")) {
+  if (route.network && route.network !== "mainnet") {
+    params.set("network", route.network);
+  }
+  if (mode === "subscribed" && !params.has("subscriptions") && route.subscriptionTargets.length) {
     params.set("subscriptions", route.subscriptionTargets.join(","));
   }
   if (mode === "discovery") {
@@ -666,11 +740,14 @@ function modeUrl(route, mode) {
     params.delete("subscribed");
     params.delete("following");
   }
+  const query = params.toString();
+  if (mode === "discovery" || route.kind === "global") {
+    return query ? `/?${query}` : "/";
+  }
   const path =
     route.feed && route.feed !== "*"
       ? `/${encodeURIComponent(route.login)}/${encodeURIComponent(route.feed)}`
       : `/${encodeURIComponent(route.login)}${route.feed === "*" ? "/*" : ""}`;
-  const query = params.toString();
   return query ? `${path}?${query}` : path;
 }
 
@@ -839,6 +916,7 @@ function startNetworkView() {
 
 async function startRemoteRoute(route) {
   logInfo("feed.remote.route.start", {
+    scope: route.kind || "user",
     login: route.login,
     selection: route.selection,
     feed_mode: route.feedMode,
@@ -855,10 +933,95 @@ async function startRemoteRoute(route) {
     startSubscribedRoute(route);
     return;
   }
-  await startDiscoveryRoute(route);
+  if (route.kind === "global") {
+    await startGlobalDiscoveryRoute(route);
+    return;
+  }
+  await startUserRoute(route);
 }
 
-async function startDiscoveryRoute(route) {
+async function startGlobalDiscoveryRoute(route) {
+  renderRemoteState(route, "resolving", [
+    "joining p2p network",
+    `searching ${route.network}`,
+    "requesting accessible story snapshots",
+    "waiting for settled story capsules",
+  ]);
+  const endpoint = `${edgeBaseUrl()}/network/snapshot${networkDiscoveryQuery(route)}`;
+  try {
+    logInfo("feed.network.discovery.request", {
+      endpoint,
+      network: route.network,
+      interactive: route.interactive,
+    });
+    const response = await fetch(endpoint, {
+      cache: "no-store",
+      headers: githubAuthHeaders(),
+    });
+    logInfo("feed.network.discovery.response", {
+      status: response.status,
+      ok: response.ok,
+    });
+    if (response.status === 401 || response.status === 403) {
+      renderAuthRequired(route);
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`network snapshot failed: ${response.status}`);
+    }
+    const snapshot = await response.json();
+    const snapshotStatus = compatibilityStatus(snapshot.compatibility || snapshot.browser_seed?.compatibility);
+    if (!snapshotStatus.compatible) {
+      renderRemoteState(route, "version-mismatch", [
+        "feed protocol or data model changed",
+        snapshotStatus.message,
+        "update your peer to the latest version",
+      ]);
+      logWarn("feed.network.discovery.version_mismatch", {
+        compatibility: snapshot.compatibility,
+        message: snapshotStatus.message,
+      });
+      return;
+    }
+    const feeds = snapshotFeeds(snapshot);
+    const headlines = snapshotHeadlines(snapshot);
+    logInfo("feed.network.discovery.snapshot", {
+      network_id: snapshot.network_id,
+      feeds: feeds.length,
+      headlines: headlines.length,
+    });
+    if (route.interactive) {
+      renderGlobalTimeline(route, snapshot);
+      return;
+    }
+    if (headlines.length) {
+      applyRemoteHeadlines(route, headlines);
+      return;
+    }
+    if (feeds.length) {
+      renderRemoteState(route, "waiting", [
+        `network directory found ${feeds.length} feeds`,
+        "connected · waiting for first story",
+        "raw events unavailable",
+      ]);
+      updateSourceCountFromFeeds(feeds);
+      return;
+    }
+    renderRemoteState(route, "no-feeds", [
+      "no visible settled story streams",
+      "network fabric may still be routing peers",
+      "waiting for published headlines",
+    ]);
+  } catch (error) {
+    renderRemoteState(route, "failed", [
+      "edge snapshot mode unavailable",
+      "waiting for p2p live path",
+    ]);
+    logError("network discovery failed", error);
+  }
+}
+
+async function startUserRoute(route) {
   renderRemoteState(route, "resolving", [
     "resolving github identity",
     `finding feeds on ${route.network}`,
@@ -904,7 +1067,7 @@ async function startDiscoveryRoute(route) {
         ticketStatus.message,
         "update your peer to the latest version",
       ], ticket.profile);
-      logWarn("feed.discovery.version_mismatch", {
+      logWarn("feed.user.version_mismatch", {
         login: ticket.profile?.login || route.login,
         compatibility: ticket.compatibility,
         message: ticketStatus.message,
@@ -915,7 +1078,7 @@ async function startDiscoveryRoute(route) {
     const compatibleFeeds = allFeeds.filter((feed) => compatibilityStatus(feed.compatibility).compatible);
     const incompatibleFeeds = allFeeds.length - compatibleFeeds.length;
     if (incompatibleFeeds > 0) {
-      logWarn("feed.discovery.incompatible_feeds_ignored", {
+      logWarn("feed.user.incompatible_feeds_ignored", {
         login: ticket.profile?.login || route.login,
         incompatible_feeds: incompatibleFeeds,
       });
@@ -927,7 +1090,7 @@ async function startDiscoveryRoute(route) {
       ticket.candidate_feeds = compatibleFeeds;
     }
     const feedCount = compatibleFeeds.length;
-    logInfo("feed.discovery.ticket", {
+    logInfo("feed.user.ticket", {
       login: ticket.profile?.login || route.login,
       github_user_id: ticket.github_user_id || ticket.resolved_github_id,
       feeds: feedCount,
@@ -948,7 +1111,7 @@ async function startDiscoveryRoute(route) {
         "github identity found",
         "no visible settled story streams",
       ], ticket.profile);
-      logInfo("feed.discovery.no_visible_streams", {
+      logInfo("feed.user.no_visible_streams", {
         login: ticket.profile?.login || route.login,
         github_user_id: ticket.github_user_id || ticket.resolved_github_id,
       });
@@ -978,6 +1141,14 @@ async function startDiscoveryRoute(route) {
 
 function ticketFeeds(ticket) {
   return ticket.feeds || ticket.candidate_feeds || [];
+}
+
+function snapshotFeeds(snapshot) {
+  return snapshot.feeds || snapshot.candidate_feeds || snapshot.directory || [];
+}
+
+function snapshotHeadlines(snapshot) {
+  return snapshot.headlines || snapshot.stories || snapshot.capsules || [];
 }
 
 function compatibilityStatus(remote) {
@@ -1012,7 +1183,11 @@ function compatibilityStatus(remote) {
 }
 
 function startSubscribedRoute(route) {
-  const targets = route.subscriptionTargets.length ? route.subscriptionTargets : [route.selection];
+  const targets = route.subscriptionTargets.length
+    ? route.subscriptionTargets
+    : route.kind === "global"
+      ? []
+      : [route.selection];
   showStage();
   document.body.dataset.mode = "dispatch";
   setText(liveState, "wait");
@@ -1023,14 +1198,14 @@ function startSubscribedRoute(route) {
     [
       "showing explicit feed subscriptions",
       "waiting for signed story capsules",
-      "public discovery feed is not mixed in",
+      "network discovery feed is not mixed in",
     ].join(" · "),
   );
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   clearAuthAction();
   renderChips(["subscribed", "explicit", route.network, "redacted"]);
-  renderTicker(targets.map((target) => `follow ${target}`));
+  renderTicker(targets.length ? targets.map((target) => `follow ${target}`) : ["no subscriptions selected"]);
   if (route.interactive) {
     renderSubscribedTimeline(route, targets);
   } else {
@@ -1040,6 +1215,19 @@ function startSubscribedRoute(route) {
     network: route.network,
     subscriptions: targets,
   });
+}
+
+function networkDiscoveryQuery(route) {
+  const params = new URLSearchParams(route.query);
+  params.set("network", route.network || "mainnet");
+  params.set("feed_mode", "discovery");
+  params.set("story_only", "true");
+  params.set("settled_only", "true");
+  for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
+    params.delete(key);
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
 }
 
 function resolverQuery(route) {
@@ -1053,6 +1241,165 @@ function resolverQuery(route) {
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+function applyRemoteHeadlines(route, headlines) {
+  bulletins = headlines
+    .map((item, index) => remoteHeadlineToBulletin(route, item, index))
+    .filter(Boolean)
+    .slice(-12);
+  if (!bulletins.length) {
+    renderRemoteState(route, "waiting", [
+      "network directory connected",
+      "waiting for display-safe headlines",
+    ]);
+    return;
+  }
+  activeIndex = bulletins.length - 1;
+  const active = bulletins[activeIndex];
+  renderBulletin(active);
+  scheduleNext(active.dwell_ms || 14000);
+  updateSourceCount();
+  logInfo("feed.network.discovery.headlines.render", {
+    headlines: bulletins.length,
+  });
+}
+
+function remoteHeadlineToBulletin(route, item, index) {
+  const headlineText = item.headline || item.title;
+  if (!headlineText) {
+    return undefined;
+  }
+  const publisherLogin = publisherLoginFromHeadline(item);
+  return {
+    id: item.capsule_id || item.id || `network-headline-${index}`,
+    mode: item.mode || "dispatch",
+    priority: item.priority || item.score || 75,
+    dwell_ms: item.dwell_ms || item.dwellMs || 14000,
+    eyebrow: `feed / ${route.network} / discovery`,
+    headline: headlineText,
+    deck: item.deck || item.summary || "settled story capsule published to the network.",
+    lower_third: item.lower_third || item.lowerThird || item.publisher_label || "verified peer",
+    chips: item.chips || ["verified", "story-only", route.network, "redacted"],
+    ticker: item.ticker || [],
+    image: item.image || item.headline_image,
+    publisher: publisherLogin || item.publisher_avatar
+      ? {
+          github_login: publisherLogin,
+          avatar: item.publisher_avatar || item.avatar,
+        }
+      : undefined,
+  };
+}
+
+function publisherLoginFromHeadline(item) {
+  const value =
+    item.publisher_login ||
+    item.github_login ||
+    item.publisher?.github_login ||
+    item.publisher_label ||
+    "";
+  return String(value).replace(/^@/, "").split(/\s|\//)[0] || "";
+}
+
+function renderGlobalTimeline(route, snapshot) {
+  if (!timeline) {
+    renderRemoteState(route, "failed", ["timeline surface unavailable"]);
+    return;
+  }
+  const feeds = snapshotFeeds(snapshot);
+  const headlines = snapshotHeadlines(snapshot);
+  logInfo("feed.network.timeline.render", {
+    network: route.network,
+    feeds: feeds.length,
+    headlines: headlines.length,
+  });
+  if (stage) {
+    stage.hidden = true;
+  }
+  stopStageProgress();
+  timeline.hidden = false;
+  document.body.dataset.view = "timeline";
+  document.body.dataset.mode = "dispatch";
+  setText(liveState, "browse");
+  setText(sourceCount, `${Math.max(feeds.length, headlines.length)} net`);
+  timeline.replaceChildren();
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "timeline-toolbar";
+  const label = document.createElement("span");
+  label.textContent = `network discovery / ${route.network}`;
+  toolbar.appendChild(label);
+  const nav = document.createElement("nav");
+  nav.className = "timeline-feeds";
+  nav.appendChild(rootModeLink(route, "discovery", "all public feeds", true));
+  nav.appendChild(rootModeLink(route, "subscribed", "subscribed", false));
+  toolbar.appendChild(nav);
+  timeline.appendChild(toolbar);
+
+  if (headlines.length) {
+    for (const item of headlines) {
+      const card = document.createElement("article");
+      card.className = "timeline-card";
+      card.tabIndex = 0;
+      const meta = document.createElement("div");
+      meta.className = "timeline-meta";
+      meta.textContent = item.lower_third || item.publisher_label || "network headline";
+      const title = document.createElement("h2");
+      title.textContent = item.headline || item.title || "settled story";
+      const copy = document.createElement("p");
+      copy.textContent = item.deck || item.summary || "story-only capsule";
+      card.append(meta, title, copy);
+      timeline.appendChild(card);
+    }
+  } else {
+    for (const feed of feeds) {
+      const card = document.createElement("article");
+      card.className = "timeline-card";
+      card.tabIndex = 0;
+      card.appendChild(timelinePublisher(feed, { profile: {} }));
+      const meta = document.createElement("div");
+      meta.className = "timeline-meta";
+      meta.textContent = feed.label || feed.feed_label || "feed";
+      const title = document.createElement("h2");
+      title.textContent = "waiting for published headline";
+      const copy = document.createElement("p");
+      copy.textContent =
+        "this feed is visible on the network. settled story capsules will appear without raw events.";
+      card.append(meta, title, copy, timelineStatus(feed, route));
+      timeline.appendChild(card);
+    }
+  }
+  if (timeline.children.length === 1) {
+    const card = document.createElement("article");
+    card.className = "timeline-card timeline-empty";
+    card.tabIndex = 0;
+    const meta = document.createElement("div");
+    meta.className = "timeline-meta";
+    meta.textContent = "network discovery";
+    const title = document.createElement("h2");
+    title.textContent = "no visible feeds";
+    const copy = document.createElement("p");
+    copy.textContent = "network peers may still be routing without publishing accessible feeds.";
+    card.append(meta, title, copy);
+    timeline.appendChild(card);
+  }
+  renderTicker(["interactive network discovery", "subscribed feeds stay explicit"]);
+}
+
+function rootModeLink(route, mode, label, current = false) {
+  const link = document.createElement("a");
+  const params = new URLSearchParams();
+  params.set("feed_mode", mode);
+  if (route.network && route.network !== "mainnet") {
+    params.set("network", route.network);
+  }
+  link.href = `/?${params.toString()}`;
+  link.textContent = label;
+  if (current) {
+    link.setAttribute("aria-current", "page");
+  }
+  return link;
 }
 
 function renderTimeline(route, ticket) {
@@ -1184,6 +1531,21 @@ function renderSubscribedTimeline(route, targets) {
     status.className = "timeline-status";
     status.append(statusItem("target", target), statusItem("mode", "subscribed only"));
     card.append(meta, title, copy, status);
+    timeline.appendChild(card);
+  }
+  if (!targets.length) {
+    const card = document.createElement("article");
+    card.className = "timeline-card timeline-empty";
+    card.tabIndex = 0;
+    const meta = document.createElement("div");
+    meta.className = "timeline-meta";
+    meta.textContent = "subscribed";
+    const title = document.createElement("h2");
+    title.textContent = "no subscriptions selected";
+    const copy = document.createElement("p");
+    copy.textContent =
+      "choose explicit feeds to follow. network discovery remains separate from subscriptions.";
+    card.append(meta, title, copy);
     timeline.appendChild(card);
   }
   renderTicker(["interactive subscribed timeline", "move mouse for mode switcher"]);

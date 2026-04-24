@@ -99,8 +99,17 @@ the hosted browser shell is:
 https://feed.aberration.technology/
 ```
 
-user paths resolve github usernames through the edge, then subscribe only to
-visible settled story streams:
+with p2p enabled, the root page is the global discovery feed: it asks the edge
+for network bootstrap/snapshot material and displays any visible, settled story
+headlines. it never requests raw events.
+
+```text
+https://feed.aberration.technology/?feed_mode=discovery
+https://feed.aberration.technology/?feed_mode=subscribed&subscriptions=mosure/*
+```
+
+user paths resolve github usernames through the edge. `user/*` is the wildcard
+form for all visible feeds from that user:
 
 ```text
 https://feed.aberration.technology/mosure

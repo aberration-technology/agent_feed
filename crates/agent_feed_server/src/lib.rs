@@ -90,6 +90,7 @@ pub fn app_with_config(bind: SocketAddr, p2p_enabled: bool) -> Router {
     });
 
     Router::new()
+        .route("/", get(root_index))
         .route("/reel", get(reel_index))
         .route("/reel/{view}", get(reel_view))
         .route("/favicon.svg", get(favicon_svg))
@@ -113,6 +114,11 @@ pub fn app_with_config(bind: SocketAddr, p2p_enabled: bool) -> Router {
         .route("/{remote}", get(remote_user_shell))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+async fn root_index(State(state): State<Arc<AppState>>) -> Html<String> {
+    let view = if state.p2p_enabled { "remote" } else { "stage" };
+    Html(render_ui(Some(view), state.p2p_enabled))
 }
 
 async fn reel_index(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -441,10 +447,14 @@ mod tests {
     use agent_feed_core::{EventKind, PrivacyClass, Severity};
 
     fn test_state() -> Arc<AppState> {
+        test_state_with_p2p(false)
+    }
+
+    fn test_state_with_p2p(p2p_enabled: bool) -> Arc<AppState> {
         let (tx, _) = broadcast::channel(16);
         Arc::new(AppState {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-            p2p_enabled: false,
+            p2p_enabled,
             reel: Mutex::new(ReelBuffer::default()),
             store: Mutex::new(InMemoryStore::default()),
             tx,
@@ -452,6 +462,17 @@ mod tests {
             story: Mutex::new(StoryCompiler::default()),
             metrics: Metrics::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn root_index_switches_to_remote_when_p2p_enabled() {
+        let Html(local) = root_index(State(test_state_with_p2p(false))).await;
+        let Html(remote) = root_index(State(test_state_with_p2p(true))).await;
+
+        assert!(local.contains("<body data-view=\"stage\">"));
+        assert!(local.contains("window.FEED_P2P_ENABLED = false;"));
+        assert!(remote.contains("<body data-view=\"remote\">"));
+        assert!(remote.contains("window.FEED_P2P_ENABLED = true;"));
     }
 
     #[tokio::test]

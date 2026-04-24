@@ -952,14 +952,24 @@ async fn browser_seed(State(state): State<Arc<HttpState>>) -> impl IntoResponse 
 }
 
 async fn network_snapshot(State(state): State<Arc<HttpState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+    Json(network_snapshot_value(&state.config))
+}
+
+fn network_snapshot_value(config: &EdgeConfig) -> serde_json::Value {
+    serde_json::json!({
+        "state": "ready",
         "product": "feed",
-        "network_id": state.config.network_id,
+        "network_id": config.network_id,
         "compatibility": ProtocolCompatibility::current(),
-        "edge_base_url": state.config.edge_domain,
-        "browser_app_base_url": state.config.browser_app_base_url,
-        "bootstrap_peers": state.config.bootstrap_peers,
-    }))
+        "edge_base_url": config.edge_domain,
+        "browser_app_base_url": config.browser_app_base_url,
+        "bootstrap_peers": config.bootstrap_peers,
+        "feed_mode": "discovery",
+        "story_only": true,
+        "raw_events": false,
+        "feeds": [],
+        "headlines": [],
+    })
 }
 
 fn edge_error(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
@@ -1465,6 +1475,19 @@ mod tests {
         assert!(payload.contains("\"state\":\"ready\""));
         assert!(!payload.contains("secret"));
         assert!(!payload.contains("token"));
+    }
+
+    #[test]
+    fn network_snapshot_supports_global_discovery_shape() {
+        let snapshot = network_snapshot_value(&config());
+
+        assert_eq!(snapshot["state"], "ready");
+        assert_eq!(snapshot["feed_mode"], "discovery");
+        assert_eq!(snapshot["story_only"], true);
+        assert_eq!(snapshot["raw_events"], false);
+        assert!(snapshot["feeds"].as_array().is_some());
+        assert!(snapshot["headlines"].as_array().is_some());
+        assert_eq!(snapshot["compatibility"]["protocol_version"], 1);
     }
 
     #[test]

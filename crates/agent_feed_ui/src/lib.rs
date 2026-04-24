@@ -99,12 +99,12 @@ mod tests {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
 
         assert!(html.contains("function routeStreamLabel"));
+        assert!(html.contains("function routeEyebrow"));
         assert!(html.contains("function remoteHeadlineForState"));
-        assert!(html.contains(
-            "setText(eyebrow, `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`);"
-        ));
+        assert!(html.contains("setText(eyebrow, routeEyebrow(route));"));
         assert!(html.contains("setText(headline, remoteHeadlineForState(state));"));
-        assert!(html.contains("renderPublisher(nextPublisher || { login: route.login });"));
+        assert!(html
+            .contains("renderPublisher(nextPublisher || (route.kind === \"global\" ? undefined : { login: route.login }));"));
         assert!(!html.contains("`@${route.login} / ${route.selection} / ${route.feedMode}`"));
         assert!(!html.contains("setText(headline, `@${route.login}`);"));
     }
@@ -130,6 +130,7 @@ mod tests {
         assert!(html.contains("function logEvent"));
         assert!(html.contains("feed.remote.route.start"));
         assert!(html.contains("feed.resolver.response"));
+        assert!(html.contains("feed.network.discovery.snapshot"));
         assert!(html.contains("feed.sse.bulletin.incoming"));
     }
 
@@ -141,6 +142,24 @@ mod tests {
         assert!(html.contains("function compatibilityStatus"));
         assert!(html.contains("version-mismatch"));
         assert!(html.contains("update your peer to the latest version"));
-        assert!(html.contains("feed.discovery.incompatible_feeds_ignored"));
+        assert!(html.contains("feed.user.incompatible_feeds_ignored"));
+    }
+
+    #[test]
+    fn root_page_supports_global_network_discovery() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("function parseGlobalRoute"));
+        assert!(html.contains("function startGlobalDiscoveryRoute"));
+        assert!(html.contains("/network/snapshot"));
+        assert!(html.contains("network directory found ${feeds.length} feeds"));
+        assert!(
+            html.contains(
+                "renderPublisher(nextPublisher || (route.kind === \"global\" ? undefined"
+            )
+        );
+        assert!(html.contains("function rootModeLink"));
+        assert!(html.contains("params.set(\"feed_mode\", mode);"));
+        assert!(html.contains("per-user discovery is represented by user/* wildcard routes"));
     }
 }
