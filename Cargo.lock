@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent_feed"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_auth_github",
  "agent_feed_browser",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_adapters"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_ingest",
@@ -41,14 +41,14 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_auth"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "agent_feed_auth_github"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_auth",
  "serde",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_browser"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_p2p_proto",
  "agent_feed_social",
@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_cli"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_adapters",
  "agent_feed_auth_github",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_core"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
  "serde_json",
@@ -104,11 +104,11 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_deploy"
-version = "0.1.17"
+version = "0.1.18"
 
 [[package]]
 name = "agent_feed_directory"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_identity",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_edge"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_auth",
  "agent_feed_core",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_filter"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "serde",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_highlight"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "time",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_identity"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
  "thiserror",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_identity_github"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_identity",
  "serde",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_ingest"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "serde",
@@ -189,21 +189,21 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_install"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "agent_feed_metrics"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "agent_feed_p2p"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_directory",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_p2p_browser"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_auth_github",
  "agent_feed_core",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_p2p_proto"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_story",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_redaction"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "regex",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_reel"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "serde",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_security"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "serde",
  "thiserror",
@@ -274,7 +274,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_server"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_adapters",
  "agent_feed_core",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_social"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_p2p_proto",
  "serde",
@@ -310,14 +310,14 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_store"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
 ]
 
 [[package]]
 name = "agent_feed_story"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_highlight",
@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_summarize"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_story",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_testkit"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "agent_feed_highlight",
@@ -349,14 +349,14 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_ui"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_p2p_proto",
 ]
 
 [[package]]
 name = "agent_feed_views"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_core",
  "serde",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "agent_feed_p2p_proto",
 ]

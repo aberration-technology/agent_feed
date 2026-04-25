@@ -61,6 +61,12 @@ body {
 
 .brand {
   color: var(--secondary);
+  text-decoration: none;
+}
+
+.brand:hover,
+.brand:focus-visible {
+  text-decoration: underline;
 }
 
 .status {

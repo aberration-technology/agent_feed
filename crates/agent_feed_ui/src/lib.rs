@@ -105,7 +105,11 @@ mod tests {
     fn idle_state_avoids_redundant_local_status_chips() {
         let html = render_index_with_config(Some("stage"), &config(false));
 
-        assert!(html.contains("<div class=\"brand\">feed</div>"));
+        assert!(
+            html.contains(
+                "<a class=\"brand\" href=\"https://feed.aberration.technology/\">feed</a>"
+            )
+        );
         assert!(html.contains("id=\"eyebrow\">local feed</div>"));
         assert!(html.contains("<span>privacy on</span>"));
         assert!(!html.contains("LOCAL / QUIET / IDLE"));
@@ -126,7 +130,8 @@ mod tests {
         assert!(!html.contains("ui-sans-serif"));
         assert!(!html.contains("SFMono-Regular"));
         assert!(html.contains("--secondary: #d87c7c;"));
-        assert!(html.contains(".brand {\n  color: var(--secondary);\n}"));
+        assert!(html.contains(".brand {\n  color: var(--secondary);\n  text-decoration: none;\n}"));
+        assert!(html.contains(".brand:hover,\n.brand:focus-visible"));
         assert!(html.contains(".footer-links a {\n  color: var(--secondary);"));
         assert!(html.contains("id=\"footer-rev\">rev dev</span>"));
         assert!(html.contains(".footer-rev"));
