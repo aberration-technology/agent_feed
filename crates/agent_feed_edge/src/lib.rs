@@ -19,6 +19,7 @@ use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{BTreeMap, VecDeque};
@@ -1477,6 +1478,65 @@ fn remote_copy_has_public_quality_issue(copy: &str) -> bool {
         "verification s",
         "command lifecycle captured",
         "without command output",
+        "ci status",
+        "checks ci status",
+        "completed turn",
+        "file-change pass",
+        "planning state advanced",
+        "plan update",
+        "plan-state",
+        "run state",
+        "run state settled",
+        "command event",
+        "safe command",
+        "shell check",
+        "repository state",
+        "records plan update",
+        "shifts feed to edits",
+        "two-file update",
+        "codexci statusrun state",
+        "confirms pass state",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || Regex::new(
+            r"\b(?:[0-9]+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:changed\s+)?files?\b|\bfiles?\s+changed\b",
+        )
+        .expect("file-count regex is valid")
+        .is_match(&normalized)
+        || (normalized.contains("tests passed") && !remote_copy_has_public_context(&normalized))
+}
+
+fn remote_copy_has_public_context(normalized: &str) -> bool {
+    [
+        "auth",
+        "avatar",
+        "browser",
+        "broadcast",
+        "capture",
+        "deployment",
+        "discovery",
+        "edge",
+        "github",
+        "guardrail",
+        "install",
+        "network",
+        "open source",
+        "package",
+        "privacy",
+        "public",
+        "publish",
+        "release",
+        "route",
+        "security",
+        "ship",
+        "shipped",
+        "stream",
+        "subscription",
+        "summarization",
+        "summary",
+        "update",
+        "user",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -2284,11 +2344,25 @@ mod tests {
         let mut capture_placeholder = base.clone();
         capture_placeholder.headline =
             "codex command lifecycle captured without command output".to_string();
+        let mut ci_status = base.clone();
+        ci_status.headline = "codex checks ci status, settles run state".to_string();
+        ci_status.deck =
+            "sixteen command events converged on ci status and left the run state settled."
+                .to_string();
+        let mut file_count = base.clone();
+        file_count.headline = "codex changes two files, shifts feed to edits".to_string();
+        file_count.deck = "two files changed after the prior ci status summary.".to_string();
+        let mut test_status = base.clone();
+        test_status.headline = "codex verifies tests, confirms pass state".to_string();
+        test_status.deck = "tests passed after the two-file change.".to_string();
 
         store.push(local);
         store.push(bad);
         store.push(generic);
         store.push(capture_placeholder);
+        store.push(ci_status);
+        store.push(file_count);
+        store.push(test_status);
         store.push(base);
         let snapshot = network_snapshot_value(&config(), &store);
 

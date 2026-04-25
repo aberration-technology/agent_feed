@@ -855,7 +855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flush_emits_safe_command_burst_story() {
+    async fn flush_suppresses_command_burst_without_work_outcome() {
         let state = test_state();
         for _ in 0..4 {
             let mut event = AgentEvent::new(
@@ -883,12 +883,10 @@ mod tests {
             .await
             .expect("story flushes");
 
-        assert_eq!(flushed, 1);
+        assert_eq!(flushed, 0);
         let snapshot = state.reel.lock().expect("reel lock").snapshot();
-        assert_eq!(snapshot.bulletins.len(), 1);
-        let bulletin = &snapshot.bulletins[0];
-        assert_eq!(bulletin.headline, "codex checked ci status");
-        let display = serde_json::to_string(bulletin).expect("bulletin serializes");
+        assert!(snapshot.bulletins.is_empty());
+        let display = serde_json::to_string(&snapshot).expect("snapshot serializes");
         assert!(!display.contains("gh run view"));
         assert!(!display.contains("--repo"));
     }

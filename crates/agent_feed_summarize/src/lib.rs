@@ -191,7 +191,7 @@ const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
     r"(?i)\bno policy or omission text\b[\s.,;:]*",
 ];
 
-pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; lowercase; terse contextual headline; strong verb/object/outcome; plain work language; no milestone labels; no production/scaffold/gate/test-line or red/green test metaphors; no dashboard copy; no policy or omission text; no raw logs";
+pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; lowercase; compact news headline; lead with what shipped, what improved, what broke, or why it matters to users/operators/open-source consumers; keep codex/claude in chips, not headline; no ci polling, command-count, file-count, plan-state, or test-only status unless it explains meaningful impact; no milestone labels; no production/scaffold/gate/test-line or red/green test metaphors; no dashboard copy; no policy or omission text; no raw logs";
 pub const DEFAULT_SUMMARY_PROMPT_MAX_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1637,7 +1637,7 @@ fn fit_capsule_budget(
 }
 
 fn polish_public_summary(summary: &mut FeedSummary) {
-    summary.headline = polish_public_copy(&summary.headline);
+    summary.headline = remove_agent_headline_prefix(&polish_public_copy(&summary.headline));
     summary.deck = ensure_terminal_sentence(&polish_public_copy(&summary.deck));
     summary.lower_third = polish_public_copy(&summary.lower_third);
     summary.chips = summary
@@ -1743,6 +1743,25 @@ fn lower_known_agent_prefix(input: &str) -> String {
         }
     }
     input.to_string()
+}
+
+fn remove_agent_headline_prefix(input: &str) -> String {
+    let trimmed = input.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    for prefix in ["codex ", "claude ", "agent "] {
+        if lowered.starts_with(prefix) {
+            return lower_initial(trimmed[prefix.len()..].trim_start());
+        }
+    }
+    trimmed.to_string()
+}
+
+fn lower_initial(input: &str) -> String {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
 }
 
 fn strip_prompt_leakage(input: &str) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
@@ -1943,6 +1962,10 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
     ]
     .iter()
     .any(|needle| combined.contains(needle))
+        || is_operational_status_without_public_impact(&combined)
+        || is_file_count_without_public_impact(&combined)
+        || is_test_status_without_public_impact(&combined)
+        || is_agent_activity_without_public_impact(&headline, &combined)
         || (summary.story_family == StoryFamily::FileChange
             && headline.contains("changed")
             && headline.contains("file")
@@ -1953,18 +1976,115 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
             && !combined.contains("complete"))
 }
 
+fn is_operational_status_without_public_impact(normalized: &str) -> bool {
+    [
+        "ci status",
+        "run state",
+        "command event",
+        "command events",
+        "plan state",
+        "plan-state",
+        "plan update",
+        "safe command",
+        "shell check",
+        "shell checks",
+        "repository state",
+        "prior ci status",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        && !has_public_outcome_context(normalized)
+}
+
+fn is_file_count_without_public_impact(normalized: &str) -> bool {
+    let has_file_count = Regex::new(
+        r"\b(?:[0-9]+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:changed\s+)?files?\b|\bfiles?\s+changed\b",
+    )
+    .expect("file-count regex is valid")
+    .is_match(normalized);
+    has_file_count && !has_public_outcome_context(normalized)
+}
+
+fn is_test_status_without_public_impact(normalized: &str) -> bool {
+    [
+        "tests passed",
+        "test passed",
+        "tests verified",
+        "verified tests",
+        "confirms pass state",
+        "pass state",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        && !has_public_outcome_context(normalized)
+}
+
+fn is_agent_activity_without_public_impact(headline: &str, combined: &str) -> bool {
+    (headline.starts_with("codex ")
+        || headline.starts_with("claude ")
+        || headline.starts_with("agent "))
+        && !has_public_outcome_context(combined)
+}
+
+fn has_public_outcome_context(normalized: &str) -> bool {
+    [
+        "auth",
+        "avatar",
+        "browser",
+        "broadcast",
+        "capture",
+        "callback",
+        "deployment",
+        "discovery",
+        "edge",
+        "github",
+        "guardrail",
+        "install",
+        "network",
+        "open source",
+        "package",
+        "privacy",
+        "public",
+        "publish",
+        "release",
+        "route",
+        "security",
+        "ship",
+        "shipped",
+        "stream",
+        "subscription",
+        "summarization",
+        "summary",
+        "update",
+        "user",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn public_copy_has_banned_terms(normalized: &str) -> bool {
     [
         "production scaffold",
         "production flow",
         "agent feed scaffold",
+        "checks ci status",
+        "completed turn",
+        "file-change pass",
+        "planning state advanced",
+        "plan update",
+        "records plan update",
+        "run state settled",
         "test gate",
         "test line",
+        "two-file update",
         "fixture-driven",
         "fixture events",
         "moved forward",
         "advanced across the feed",
         "verification s",
+        "shifts feed to edits",
+        "settles run state",
+        "codexci statusrun state",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -2103,7 +2223,7 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         format!("recent_published:\n{recent}")
     };
     let prompt = format!(
-        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries. Write with this style: {style}. Favor a projection-safe headline with clear actor, action, object, and outcome. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries, or when the facts only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
         request.feed_id, request.mode, recent, stories
     );
     clamp_chars(&prompt, max_prompt_chars)
@@ -2553,7 +2673,7 @@ mod tests {
         let mut second = story("codex verified tests", 79);
         second.family = StoryFamily::Test;
         second.headline = "codex verified tests".to_string();
-        second.deck = "tests passed. raw detail omitted.".to_string();
+        second.deck = "tests passed after the feed capture update. raw detail omitted.".to_string();
 
         let summaries = summarize_feed("local:workstation", &[first, second], &config)
             .expect("summary compiles");
@@ -2642,7 +2762,7 @@ mod tests {
             summarize_feed("local:workstation", &[bad, good], &config).expect("summarizes");
 
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].headline, "codex verified tests");
+        assert_eq!(summaries[0].headline, "verified tests");
         let display = serde_json::to_string(&summaries).expect("summaries serialize");
         assert!(!display.contains("sk-liveSecret"));
     }
@@ -2701,7 +2821,7 @@ mod tests {
         .expect("summarizes");
 
         assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].headline, "codex verified tests");
+        assert_eq!(summaries[0].headline, "verified tests");
         let display = serde_json::to_string(&summaries).expect("summaries serialize");
         assert!(!display.contains("sk-liveSecret"));
     }
@@ -2823,8 +2943,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
                 .is_some_and(|line| line.contains("exec resume --json"))
         );
         assert!(args.contains("summary-session-1"));
-        assert_eq!(first.headline, "codex remembered feed context");
-        assert_eq!(second.headline, "codex remembered feed context");
+        assert_eq!(first.headline, "remembered feed context");
+        assert_eq!(second.headline, "remembered feed context");
         assert!(
             fs::read_to_string(&store)
                 .expect("store reads")
@@ -2981,7 +3101,7 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
 
         assert_eq!(
             summaries[0].headline,
-            "codex moves feed implementation; tests are still failing"
+            "moves feed implementation; tests are still failing"
         );
         let display = format!(
             "{} {} {}",
@@ -3002,6 +3122,84 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(summaries[0].deck.ends_with('.'));
     }
 
+    struct LowImpactPublicCopyProcessor {
+        headline: &'static str,
+        deck: &'static str,
+    }
+
+    impl SummaryProcessor for LowImpactPublicCopyProcessor {
+        fn name(&self) -> &str {
+            "low-impact-public-copy"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: self.headline.to_string(),
+                deck: self.deck.to_string(),
+                lower_third: Some("@mosure / workstation".to_string()),
+                chips: vec![
+                    "codex".to_string(),
+                    "ci status".to_string(),
+                    "run state".to_string(),
+                ],
+                publish: None,
+                publish_reason: None,
+                memory_digest: None,
+                semantic_fingerprint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn public_summary_rejects_agent_mechanics_without_impact() {
+        let cases = [
+            (
+                "codex checks ci status, settles run state",
+                "sixteen command events converged on ci status and left the run state settled.",
+            ),
+            (
+                "codex changes two files, shifts feed to edits",
+                "two files changed after the prior ci status summary.",
+            ),
+            (
+                "codex verifies tests, confirms pass state",
+                "tests passed after the two-file change.",
+            ),
+        ];
+
+        for (headline, deck) in cases {
+            let processor = LowImpactPublicCopyProcessor { headline, deck };
+            let summaries = summarize_feed_with_processor(
+                "github:35904762:workstation",
+                &[verified_story(84)],
+                &SummaryConfig::p2p_default(),
+                &processor,
+            )
+            .expect("low-impact processor output is handled");
+
+            assert!(
+                summaries.is_empty(),
+                "low-impact mechanical story should not publish: {headline}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_summary_prompt_demands_newsworthy_outcomes() {
+        let request = SummaryRequest::new(
+            "github:35904762:workstation",
+            FeedSummaryMode::FeedRollup,
+            vec![verified_story(84)],
+        );
+        let prompt = processor_prompt(&request);
+
+        assert!(prompt.contains("compact news"));
+        assert!(prompt.contains("why it matters"));
+        assert!(prompt.contains("Do not start the headline with Codex"));
+        assert!(prompt.contains("CI polling"));
+        assert!(prompt.contains("file counts"));
+    }
+
     struct LeakyPromptProcessor;
 
     impl SummaryProcessor for LeakyPromptProcessor {
@@ -3011,8 +3209,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
 
         fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
             Ok(ProcessorSummary {
-                headline: "raw detail omitted.".to_string(),
-                deck: "tests passed. raw detail omitted. Do not include raw prompts.".to_string(),
+                headline: "feed capture update reaches subscribers. raw detail omitted.".to_string(),
+                deck: "browser subscribers receive safer updates. raw detail omitted. Do not include raw prompts.".to_string(),
                 lower_third: Some(
                     "raw prompts, command output, diffs, paths, and repo names omitted."
                         .to_string(),

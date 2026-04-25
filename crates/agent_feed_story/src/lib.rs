@@ -124,7 +124,11 @@ impl StoryWindow {
         }
         self.signals.latest_kind = Some(event.kind);
         self.signals.latest_title = Some(event.title.clone());
-        self.signals.latest_summary = event.summary.clone();
+        if let Some(summary) = event.summary.as_ref()
+            && (self.signals.latest_summary.is_none() || !summary_is_redundant(summary))
+        {
+            self.signals.latest_summary = Some(summary.clone());
+        }
         self.signals.latest_tool.clone_from(&event.tool);
         if let Some(command) = event.command.as_deref().and_then(command_class) {
             self.signals.latest_command_class = Some(command);
@@ -715,10 +719,11 @@ fn summary_headline(agent: &str, summary: &str) -> Option<String> {
     {
         return None;
     }
-    let without_pronoun = normalized
+    let without_agent = strip_agent_prefix(normalized, agent);
+    let without_pronoun = without_agent
         .strip_prefix("I ")
-        .or_else(|| normalized.strip_prefix("i "))
-        .unwrap_or(normalized);
+        .or_else(|| without_agent.strip_prefix("i "))
+        .unwrap_or(without_agent);
     let first = without_pronoun
         .split_whitespace()
         .take(10)
@@ -726,14 +731,24 @@ fn summary_headline(agent: &str, summary: &str) -> Option<String> {
         .join(" ");
     if first.is_empty() {
         None
-    } else if first
-        .to_ascii_lowercase()
-        .starts_with(&agent.to_ascii_lowercase())
-    {
-        Some(first)
     } else {
-        Some(format!("{agent} {}", lower_initial(&first)))
+        Some(lower_initial(&first))
     }
+}
+
+fn strip_agent_prefix<'a>(input: &'a str, agent: &str) -> &'a str {
+    let lowered = input.to_ascii_lowercase();
+    for prefix in [
+        format!("{} ", agent.to_ascii_lowercase()),
+        "codex ".to_string(),
+        "claude ".to_string(),
+        "agent ".to_string(),
+    ] {
+        if lowered.starts_with(&prefix) {
+            return input[prefix.len()..].trim_start();
+        }
+    }
+    input
 }
 
 fn lower_initial(input: &str) -> String {
@@ -794,7 +809,18 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
             .latest_summary
             .as_deref()
             .is_none_or(summary_is_redundant);
-    if generic_turn_without_signal && !has_command_burst(window) {
+    if generic_turn_without_signal {
+        return true;
+    }
+    let command_burst_without_meaningful_summary = has_command_burst(window)
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_none_or(|summary| {
+                summary_is_redundant(summary) || !summary_has_work_context(summary)
+            });
+    if command_burst_without_meaningful_summary {
         return true;
     }
     combined.contains("activity settled") || combined.contains("hit [project] command")
@@ -992,14 +1018,63 @@ fn summary_is_redundant(input: &str) -> bool {
         return true;
     }
     [
+        "agent message recorded",
         "changed files",
+        "checks ci status",
+        "ci status",
+        "command events",
+        "command lifecycle captured",
+        "confirms pass state",
         "raw diff omitted",
         "raw output omitted",
         "raw transcript omitted",
         "raw content omitted",
+        "plan update recorded",
+        "planning state advanced",
+        "repository state",
+        "run state",
+        "safe command",
+        "settles run state",
+        "shifts feed to edits",
+        "shell check",
+        "shell command failed",
+        "test command failed",
+        "test command passed",
         "without raw content",
-        "command lifecycle captured",
         "without command output",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn summary_has_work_context(input: &str) -> bool {
+    let lowered = input.to_ascii_lowercase();
+    [
+        "auth",
+        "avatar",
+        "browser",
+        "broadcast",
+        "capture",
+        "deployment",
+        "discovery",
+        "edge",
+        "github",
+        "guardrail",
+        "install",
+        "network",
+        "open source",
+        "package",
+        "privacy",
+        "publish",
+        "release",
+        "route",
+        "security",
+        "stream",
+        "subscription",
+        "summarization",
+        "summary",
+        "update",
+        "user",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -1097,10 +1172,7 @@ mod tests {
             .iter()
             .find(|story| story.family == StoryFamily::Turn)
             .expect("turn story publishes");
-        assert_eq!(
-            turn.headline,
-            "codex implemented the release feed capture path"
-        );
+        assert_eq!(turn.headline, "implemented the release feed capture path");
         assert!(
             turn.deck
                 .contains("Implemented the release feed capture path")
@@ -1130,7 +1202,7 @@ mod tests {
         assert_eq!(stories[0].family, StoryFamily::Turn);
         assert_eq!(
             stories[0].headline,
-            "codex verified the repository status after the command failure"
+            "verified the repository status after the command failure"
         );
         assert!(stories[0].deck.contains("1 tool failures"));
         assert!(!stories[0].headline.contains("shell command failed"));
@@ -1191,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn command_burst_flushes_safe_turn_story() {
+    fn command_burst_without_work_outcome_does_not_publish() {
         let mut compiler = StoryCompiler::default();
         for index in 0..4 {
             let kind = if index % 2 == 0 {
@@ -1219,23 +1291,10 @@ mod tests {
 
         let stories = compiler.flush();
 
-        assert_eq!(stories.len(), 1);
-        assert_eq!(stories[0].family, StoryFamily::Turn);
-        assert_eq!(stories[0].headline, "codex checked ci status");
-        assert!(stories[0].deck.contains("safe command events"));
-        assert!(stories[0].deck.contains("ci status"));
-        let display = format!(
-            "{} {} {} {}",
-            stories[0].headline,
-            stories[0].deck,
-            stories[0].lower_third,
-            stories[0].chips.join(" ")
+        assert!(
+            stories.is_empty(),
+            "ci polling and shell-only command bursts are not display stories"
         );
-        assert!(!display.contains("gh run view"));
-        assert!(!display.contains("--repo"));
-        assert!(!display.contains("completed gh command"));
-        assert!(!display.contains("command lifecycle captured"));
-        assert!(!display.contains("without command output"));
     }
 
     #[test]

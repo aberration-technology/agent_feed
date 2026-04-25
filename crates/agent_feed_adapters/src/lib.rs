@@ -29,6 +29,80 @@ fn is_test_command(command: &str) -> bool {
         || lowered.contains("mvn test")
 }
 
+fn display_safe_content_sentence(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => display_safe_agent_sentence(value),
+        Value::Array(items) => items.iter().find_map(display_safe_content_sentence),
+        Value::Object(map) => {
+            if matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("tool_use" | "server_tool_use" | "tool_result")
+            ) {
+                return None;
+            }
+            map.get("text")
+                .or_else(|| map.get("content"))
+                .and_then(display_safe_content_sentence)
+        }
+        _ => None,
+    }
+}
+
+fn display_safe_agent_sentence(value: &str) -> Option<String> {
+    let sentence = value
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with("```")
+                && !line.starts_with('#')
+                && !line.starts_with("- ")
+                && !line.starts_with("* ")
+        })?
+        .trim_matches(['`', '"', '\''])
+        .trim();
+    if sentence.is_empty() {
+        return None;
+    }
+    let lowered = sentence.to_ascii_lowercase();
+    if [
+        "secret",
+        "token",
+        "password",
+        "api key",
+        "stdout",
+        "stderr",
+        "diff --git",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return None;
+    }
+    Some(clamp_words(sentence, 24))
+}
+
+fn clamp_words(input: &str, max_words: usize) -> String {
+    let mut words = input.split_whitespace();
+    let mut output = Vec::new();
+    for _ in 0..max_words {
+        if let Some(word) = words.next() {
+            output.push(word);
+        }
+    }
+    if output.is_empty() {
+        return String::new();
+    }
+    let mut value = output.join(" ");
+    if words.next().is_some() {
+        value.push_str("...");
+    }
+    if !value.ends_with(['.', '!', '?']) {
+        value.push('.');
+    }
+    value
+}
+
 pub mod codex {
     use super::*;
 
@@ -165,22 +239,36 @@ pub mod codex {
             ("event_msg", "item_completed") => item_completed_event(state, timestamp, payload),
             ("event_msg", "exec_command_end") => command_end_event(state, timestamp, payload),
             ("event_msg", "patch_apply_end") => patch_event(state, timestamp, payload),
-            ("event_msg", "agent_message") => Some(build_event(
-                state,
-                timestamp,
-                TranscriptEvent::new(
-                    EventKind::AgentMessage,
-                    "codex posted an update",
-                    36,
-                    Severity::Info,
-                )
-                .summary("assistant message recorded without raw content."),
-            )),
+            ("event_msg", "agent_message") => agent_message_event(state, timestamp, payload),
             ("response_item", "function_call") | ("response_item", "custom_tool_call") => {
                 tool_start_event(state, timestamp, payload)
             }
+            ("response_item", "message") => agent_message_event(state, timestamp, payload),
             _ => None,
         }
+    }
+
+    fn agent_message_event(
+        state: &TranscriptState,
+        timestamp: Option<&str>,
+        payload: &Value,
+    ) -> Option<AgentEvent> {
+        let summary = payload
+            .get("message")
+            .or_else(|| payload.get("content"))
+            .and_then(display_safe_content_sentence)
+            .unwrap_or_else(|| "assistant message recorded without raw content.".to_string());
+        Some(build_event(
+            state,
+            timestamp,
+            TranscriptEvent::new(
+                EventKind::AgentMessage,
+                "codex posted an update",
+                36,
+                Severity::Info,
+            )
+            .summary(summary),
+        ))
     }
 
     fn task_complete_event(
@@ -535,61 +623,6 @@ pub mod codex {
             return command_from_arguments(Some(&parsed));
         }
         None
-    }
-
-    fn display_safe_agent_sentence(value: &str) -> Option<String> {
-        let sentence = value
-            .lines()
-            .map(str::trim)
-            .find(|line| {
-                !line.is_empty()
-                    && !line.starts_with("```")
-                    && !line.starts_with('#')
-                    && !line.starts_with("- ")
-                    && !line.starts_with("* ")
-            })?
-            .trim_matches(['`', '"', '\''])
-            .trim();
-        if sentence.is_empty() {
-            return None;
-        }
-        let lowered = sentence.to_ascii_lowercase();
-        if [
-            "secret",
-            "token",
-            "password",
-            "api key",
-            "stdout",
-            "stderr",
-            "diff --git",
-        ]
-        .iter()
-        .any(|needle| lowered.contains(needle))
-        {
-            return None;
-        }
-        Some(clamp_words(sentence, 24))
-    }
-
-    fn clamp_words(input: &str, max_words: usize) -> String {
-        let mut words = input.split_whitespace();
-        let mut output = Vec::new();
-        for _ in 0..max_words {
-            if let Some(word) = words.next() {
-                output.push(word);
-            }
-        }
-        if output.is_empty() {
-            return String::new();
-        }
-        let mut value = output.join(" ");
-        if words.next().is_some() {
-            value.push_str("...");
-        }
-        if !value.ends_with(['.', '!', '?']) {
-            value.push('.');
-        }
-        value
     }
 
     fn command_value_to_string(value: &Value) -> Option<String> {
@@ -998,6 +1031,10 @@ pub mod claude {
             ));
         }
 
+        let summary = message
+            .get("content")
+            .and_then(display_safe_content_sentence)
+            .unwrap_or_else(|| "assistant message recorded without raw content.".to_string());
         Some(build_event(
             state,
             timestamp,
@@ -1007,7 +1044,7 @@ pub mod claude {
                 36,
                 Severity::Info,
             )
-            .summary("assistant message recorded without raw content."),
+            .summary(summary),
         ))
     }
 
@@ -1024,10 +1061,15 @@ pub mod claude {
             .get("duration_ms")
             .and_then(Value::as_u64)
             .map(|duration| format!("{duration}ms"));
-        let summary = duration.map_or_else(
-            || "result captured without raw content.".to_string(),
-            |duration| format!("duration {duration}. raw content omitted."),
-        );
+        let summary = value
+            .get("result")
+            .and_then(display_safe_content_sentence)
+            .or_else(|| {
+                duration
+                    .as_deref()
+                    .map(|duration| format!("duration {duration}. raw content omitted."))
+            })
+            .unwrap_or_else(|| "result captured without raw content.".to_string());
         Some(build_event(
             state,
             timestamp,
@@ -1343,6 +1385,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_transcript_extracts_display_safe_agent_message_text() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Browser feed auth now returns to the CLI callback.\n\nsecret token hidden"}]}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::AgentMessage);
+        assert_eq!(
+            events[1].summary.as_deref(),
+            Some("Browser feed auth now returns to the CLI callback.")
+        );
+    }
+
+    #[test]
     fn codex_transcript_prefers_parsed_command_over_shell_wrapper() {
         let transcript = r#"
 {"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
@@ -1429,6 +1489,23 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("raw failing output")
+        );
+    }
+
+    #[test]
+    fn claude_result_extracts_display_safe_turn_summary() {
+        let stream = r#"
+{"type":"system","subtype":"init","session_id":"claude-1","cwd":"/home/mosure/repos/agent_feed","model":"claude-sonnet-4-6"}
+{"type":"result","subtype":"success","duration_ms":1200,"result":"Browser feed subscriptions now explain the public discovery path.\n\nstdout hidden"}
+"#;
+
+        let events = normalize_stream(stream, None).expect("stream normalizes");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::TurnComplete);
+        assert_eq!(
+            events[1].summary.as_deref(),
+            Some("Browser feed subscriptions now explain the public discovery path.")
         );
     }
 

@@ -2777,7 +2777,8 @@ mod tests {
                 json!({
                     "type": "result",
                     "subtype": "success",
-                    "duration_ms": 9000
+                    "duration_ms": 9000,
+                    "result": "Browser feed subscription verification failed before publish. The callback route needs a safer fix before public users rely on it."
                 }),
             ],
         );

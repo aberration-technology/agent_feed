@@ -135,6 +135,7 @@ dependencies = [
  "agent_feed_social",
  "axum",
  "hmac",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
