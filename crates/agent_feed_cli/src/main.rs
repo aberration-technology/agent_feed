@@ -16,20 +16,21 @@ use agent_feed_p2p_proto::{
 };
 use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve_with_ready};
-use agent_feed_story::{CompiledStory, compile_events};
+use agent_feed_story::{CompiledStory, StoryCompiler, compile_events};
 use agent_feed_summarize::{
-    DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummaryMode,
-    GuardrailPattern, ImageDecisionMode, ImageProcessorConfig, SummaryConfig, SummaryError,
-    SummaryProcessorConfig, summarize_feed,
+    DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
+    GuardrailPattern, ImageDecisionMode, ImageProcessorConfig, RecentSummary, SummaryConfig,
+    SummaryError, SummaryProcessorConfig, summarize_feed, summarize_feed_with_recent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -82,6 +83,33 @@ enum Commands {
         p2p: bool,
         #[arg(long)]
         no_p2p: bool,
+        #[arg(
+            long,
+            help = "publish future settled stories while serving; implies --p2p and requires github auth"
+        )]
+        publish: bool,
+        #[arg(
+            long,
+            visible_aliases = ["feed-name", "feed-label"],
+            default_value = "workstation",
+            value_parser = parse_feed_arg,
+            help = "logical feed name for all selected local agent sessions"
+        )]
+        feed: String,
+        #[arg(long, default_value = "https://api.feed.aberration.technology")]
+        edge: String,
+        #[arg(long, default_value = "agent-feed-mainnet")]
+        network_id: String,
+        #[arg(long)]
+        auth_store: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1:0")]
+        auth_callback_bind: SocketAddr,
+        #[arg(long, default_value_t = 120)]
+        auth_timeout_secs: u64,
+        #[arg(long)]
+        no_auth_browser: bool,
+        #[arg(long, default_value_t = 20)]
+        publish_interval_secs: u64,
         #[arg(long, default_value = "codex,claude")]
         agents: String,
         #[arg(long, default_value_t = 4)]
@@ -110,6 +138,34 @@ enum Commands {
         codex_sessions_dir: Option<PathBuf>,
         #[arg(long)]
         claude_projects_dir: Option<PathBuf>,
+        #[arg(long, default_value = "codex-memory")]
+        summarizer: String,
+        #[arg(
+            long,
+            visible_alias = "headline-style",
+            default_value = DEFAULT_SUMMARY_PROMPT_STYLE
+        )]
+        summary_style: String,
+        #[arg(long, default_value_t = DEFAULT_SUMMARY_PROMPT_MAX_CHARS)]
+        summary_prompt_max_chars: usize,
+        #[arg(long)]
+        per_story: bool,
+        #[arg(long)]
+        allow_project_names: bool,
+        #[arg(long)]
+        summary_memory_store: Option<PathBuf>,
+        #[arg(long)]
+        summary_memory_reset: bool,
+        #[arg(long)]
+        summary_endpoint: Option<String>,
+        #[arg(long)]
+        summary_auth_header_env: Option<String>,
+        #[arg(long)]
+        summary_command: Option<String>,
+        #[arg(long = "summary-arg")]
+        summary_args: Vec<String>,
+        #[arg(long)]
+        guardrail_pattern: Vec<String>,
     },
     Open {
         #[arg(default_value = DEFAULT_URL)]
@@ -499,6 +555,15 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             display_token_file,
             p2p,
             no_p2p,
+            publish,
+            feed,
+            edge,
+            network_id,
+            auth_store,
+            auth_callback_bind,
+            auth_timeout_secs,
+            no_auth_browser,
+            publish_interval_secs,
             agents,
             sessions,
             workspace,
@@ -509,6 +574,18 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             codex_history,
             codex_sessions_dir,
             claude_projects_dir,
+            summarizer,
+            summary_style,
+            summary_prompt_max_chars,
+            per_story,
+            allow_project_names,
+            summary_memory_store,
+            summary_memory_reset,
+            summary_endpoint,
+            summary_auth_header_env,
+            summary_command,
+            summary_args,
+            guardrail_pattern,
         } => {
             let display_token = display_token_file
                 .map(fs::read_to_string)
@@ -520,12 +597,90 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 display_token,
                 ..SecurityConfig::default()
             };
-            let p2p_enabled = p2p && !no_p2p;
+            if publish && no_p2p {
+                return Err(CliError::Http(
+                    "`agent-feed serve --publish` cannot be combined with --no-p2p".to_string(),
+                ));
+            }
+            if publish && no_agent_capture {
+                return Err(CliError::Http(
+                    "`agent-feed serve --publish` needs agent capture; remove --no-agent-capture"
+                        .to_string(),
+                ));
+            }
+            let p2p_enabled = (p2p || publish) && !no_p2p;
+            let publish_sink = if publish {
+                let selected_agents = parse_agent_list(&agents);
+                let mut summary_config = summary_config(SummaryCliOptions {
+                    summarizer: &summarizer,
+                    summary_style: &summary_style,
+                    summary_prompt_max_chars,
+                    per_story,
+                    allow_project_names,
+                    summary_memory_store: summary_memory_store.as_deref(),
+                    summary_endpoint: summary_endpoint.as_deref(),
+                    summary_auth_header_env: summary_auth_header_env.as_deref(),
+                    summary_command: summary_command.as_deref(),
+                    summary_args: &summary_args,
+                    guardrail_patterns: &guardrail_pattern,
+                    images: false,
+                    image_processor: "disabled",
+                    image_endpoint: None,
+                    image_command: None,
+                    image_args: &[],
+                    image_style: None,
+                    image_prompt_max_chars: None,
+                    allow_remote_image_urls: false,
+                })?;
+                let workspace_filter_for_memory = if all_workspaces {
+                    None
+                } else {
+                    WorkspaceFilter::from_cli(workspace.clone())?
+                };
+                scope_summary_memory(
+                    &mut summary_config,
+                    &feed,
+                    &selected_agents,
+                    workspace_filter_for_memory.as_ref(),
+                    summary_memory_reset,
+                )?;
+                let session = ensure_publish_session(
+                    auth_store,
+                    &edge,
+                    auth_callback_bind,
+                    Duration::from_secs(auth_timeout_secs),
+                    no_auth_browser,
+                )?;
+                let publisher = PublisherIdentity::github(
+                    session.github_user_id,
+                    session.login.clone(),
+                    session.name.clone(),
+                    session.avatar_url.clone(),
+                );
+                let (sender, receiver) = mpsc::channel();
+                spawn_serve_publisher(ServePublishConfig {
+                    receiver,
+                    edge: edge.clone(),
+                    network_id: network_id.clone(),
+                    feed: feed.clone(),
+                    session,
+                    publisher,
+                    summary_config,
+                    publish_interval: Duration::from_secs(publish_interval_secs.max(1)),
+                });
+                Some(sender)
+            } else {
+                None
+            };
             info!(
                 %bind,
                 p2p_enabled,
                 p2p_requested = p2p,
                 no_p2p,
+                publish,
+                feed_name = %feed,
+                %edge,
+                %network_id,
                 display_token_configured = security.display_token.is_some(),
                 "serving local feed"
             );
@@ -548,6 +703,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     codex_history,
                     codex_sessions_dir,
                     claude_projects_dir,
+                    event_sink: publish_sink,
                 })
             };
             serve_with_ready(
@@ -558,9 +714,15 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 move |bind| {
                     println!("serving http://{bind}/reel");
                     if p2p_enabled {
-                        println!(
-                            "p2p browser discovery ux enabled; publishing still requires `agent-feed auth github` and `agent-feed p2p publish --feed <name>`"
-                        );
+                        if publish {
+                            println!(
+                                "p2p publish enabled: future settled stories publish as feed `{feed}`"
+                            );
+                        } else {
+                            println!(
+                                "p2p browser discovery ux enabled; add --publish --feed <name> to publish future settled stories from this serve process"
+                            );
+                        }
                     }
                     if let Some(capture) = capture {
                         start_serve_agent_capture(bind, capture);
@@ -624,64 +786,14 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 print_url,
                 store,
             } => {
-                let listener = TcpListener::bind(callback_bind)?;
-                let bind = listener.local_addr()?;
-                if !bind.ip().is_loopback() {
-                    return Err(CliError::Http(
-                        "github auth callback must bind to loopback".to_string(),
-                    ));
-                }
-                info!(
-                    edge = %edge,
-                    callback_bind = %bind,
-                    timeout_secs,
+                let session = github_cli_login(
+                    edge,
+                    callback_bind,
+                    Duration::from_secs(timeout_secs),
                     no_browser,
                     print_url,
-                    "github cli auth starting"
-                );
-                let config = GithubCliAuthConfig {
-                    edge_base_url: edge.clone(),
-                    callback_bind,
-                    ..GithubCliAuthConfig::default()
-                };
-                let start = begin_cli_login(&config, bind)?;
-                debug!(authorize_url = %start.authorize_url, callback_url = %start.callback_url, "github auth url prepared");
-                if print_url || no_browser {
-                    println!("{}", start.authorize_url);
-                }
-                if !no_browser && let Err(err) = open_url(&start.authorize_url) {
-                    warn!(error = %err, "failed to open browser for github auth");
-                    eprintln!("agent-feed: failed to open browser: {err}");
-                    eprintln!("agent-feed: open this URL manually:");
-                    eprintln!("{}", start.authorize_url);
-                }
-                println!("waiting for github callback on {}", start.callback_url);
-                let (target, mut stream) =
-                    wait_for_github_callback(&listener, Duration::from_secs(timeout_secs))?;
-                let session = match parse_cli_callback_request(&target)
-                    .and_then(|callback| complete_cli_login(&start, callback, edge.clone()))
-                {
-                    Ok(session) => {
-                        write_auth_callback_response(&mut stream, true, "github sign-in complete")?;
-                        session
-                    }
-                    Err(err) => {
-                        let _ = write_auth_callback_response(
-                            &mut stream,
-                            false,
-                            "github sign-in failed",
-                        );
-                        return Err(CliError::Auth(err));
-                    }
-                };
-                let store = GithubSessionStore::new(auth_store_path(store));
-                store.save(&session)?;
-                info!(
-                    github_login = %session.login,
-                    github_user_id = session.github_user_id,
-                    expires_at = %session.expires_at,
-                    "github cli auth completed"
-                );
+                    store,
+                )?;
                 println!(
                     "github auth: @{} github:{} expires {}",
                     session.login, session.github_user_id, session.expires_at
@@ -765,6 +877,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         poll_ms,
                         workspace_filter.as_ref(),
                         true,
+                        None,
                     )?;
                 } else {
                     import_codex_sessions(&server, &paths, workspace_filter.as_ref())?;
@@ -842,6 +955,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         poll_ms,
                         workspace_filter.as_ref(),
                         true,
+                        None,
                     )?;
                 } else {
                     import_claude_sessions(&server, &paths, workspace_filter.as_ref())?;
@@ -1462,6 +1576,18 @@ struct ServeAgentCapture {
     codex_history: Option<PathBuf>,
     codex_sessions_dir: Option<PathBuf>,
     claude_projects_dir: Option<PathBuf>,
+    event_sink: Option<mpsc::Sender<AgentEvent>>,
+}
+
+struct ServePublishConfig {
+    receiver: mpsc::Receiver<AgentEvent>,
+    edge: String,
+    network_id: String,
+    feed: String,
+    session: GithubAuthSession,
+    publisher: PublisherIdentity,
+    summary_config: SummaryConfig,
+    publish_interval: Duration,
 }
 
 fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
@@ -1488,12 +1614,10 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
         let workspace = capture.workspace.clone();
         let sessions = capture.sessions;
         let poll_ms = capture.poll_ms;
+        let event_sink = capture.event_sink.clone();
         spawn_agent_capture("codex", move || {
-            let paths =
-                active_codex_session_paths(&history, &sessions_dir, sessions, workspace.as_ref())?;
             info!(
                 sessions_requested = sessions,
-                sessions_found = paths.len(),
                 history = %history.display(),
                 sessions_dir = %sessions_dir.display(),
                 workspace = workspace.log_value(),
@@ -1502,21 +1626,20 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 poll_ms,
                 "serve codex active capture starting"
             );
-            if paths.is_empty() {
-                println!(
-                    "codex capture: no active sessions found for {}; use --all-workspaces to scan every local codex session",
-                    capture_scope_message(workspace.as_ref())
-                );
-                return Ok(());
-            }
-            println!("codex capture: watching {} active sessions", paths.len());
-            watch_codex_sessions(
-                &server,
-                &paths,
+            println!(
+                "codex capture: watching future events for {}; use --include-history to replay selected history",
+                capture_scope_message(workspace.as_ref())
+            );
+            watch_codex_active_sessions(CodexActiveWatch {
+                server: &server,
+                history: &history,
+                sessions_dir: &sessions_dir,
+                sessions,
                 poll_ms,
-                workspace.as_ref(),
+                workspace: workspace.as_ref(),
                 include_history,
-            )
+                event_sink: event_sink.as_ref(),
+            })
         });
     }
 
@@ -1528,11 +1651,10 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
         let workspace = capture.workspace;
         let sessions = capture.sessions;
         let poll_ms = capture.poll_ms;
+        let event_sink = capture.event_sink;
         spawn_agent_capture("claude", move || {
-            let paths = active_claude_session_paths(&projects_dir, sessions, workspace.as_ref())?;
             info!(
                 sessions_requested = sessions,
-                sessions_found = paths.len(),
                 projects_dir = %projects_dir.display(),
                 workspace = workspace.log_value(),
                 include_history,
@@ -1540,20 +1662,18 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 poll_ms,
                 "serve claude active capture starting"
             );
-            if paths.is_empty() {
-                println!(
-                    "claude capture: no active sessions found for {}; use --all-workspaces to scan every local claude session",
-                    capture_scope_message(workspace.as_ref())
-                );
-                return Ok(());
-            }
-            println!("claude capture: watching {} active sessions", paths.len());
-            watch_claude_sessions(
+            println!(
+                "claude capture: watching future events for {}; use --include-history to replay selected history",
+                capture_scope_message(workspace.as_ref())
+            );
+            watch_claude_active_sessions(
                 &server,
-                &paths,
+                &projects_dir,
+                sessions,
                 poll_ms,
                 workspace.as_ref(),
                 include_history,
+                event_sink.as_ref(),
             )
         });
     }
@@ -1575,6 +1695,153 @@ where
         warn!(%agent, error = %err, "serve agent capture thread failed to start");
         eprintln!("agent-feed: failed to start {agent} capture: {err}");
     }
+}
+
+fn spawn_serve_publisher(config: ServePublishConfig) {
+    if let Err(err) = std::thread::Builder::new()
+        .name("agent-feed-p2p-publish".to_string())
+        .spawn(move || run_serve_publisher(config))
+    {
+        warn!(error = %err, "serve p2p publisher thread failed to start");
+        eprintln!("agent-feed: failed to start p2p publisher: {err}");
+    }
+}
+
+fn run_serve_publisher(config: ServePublishConfig) {
+    info!(
+        feed_name = %config.feed,
+        edge = %config.edge,
+        network_id = %config.network_id,
+        interval_ms = config.publish_interval.as_millis(),
+        "serve p2p publisher started"
+    );
+    println!(
+        "p2p publish: signed in as @{}; publishing future settled stories to `{}`",
+        config.session.login, config.feed
+    );
+
+    let mut compiler = StoryCompiler::default();
+    let mut pending = Vec::<CompiledStory>::new();
+    let mut recent = VecDeque::<RecentSummary>::new();
+    let mut next_seq = 1u64;
+    let mut last_publish = Instant::now();
+
+    loop {
+        match config.receiver.recv_timeout(Duration::from_millis(500)) {
+            Ok(event) => {
+                debug!(
+                    event_id = %event.id,
+                    kind = ?event.kind,
+                    agent = %event.agent,
+                    "p2p publisher received local event"
+                );
+                let stories = compiler.ingest(event);
+                if !stories.is_empty() {
+                    info!(
+                        stories = stories.len(),
+                        "p2p publisher queued settled stories"
+                    );
+                    pending.extend(stories);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                warn!("p2p publisher event channel disconnected");
+                return;
+            }
+        }
+
+        let should_publish = !pending.is_empty()
+            && (last_publish.elapsed() >= config.publish_interval
+                || pending.iter().any(|story| story.score >= 90)
+                || pending.len() >= 8);
+        if !should_publish {
+            continue;
+        }
+
+        let stories = std::mem::take(&mut pending);
+        match publish_story_batch(&config, &stories, &mut recent, &mut next_seq) {
+            Ok(published) => {
+                last_publish = Instant::now();
+                if published > 0 {
+                    println!(
+                        "p2p publish: sent {published} capsule(s) from {} settled story/stories",
+                        stories.len()
+                    );
+                } else {
+                    println!(
+                        "p2p publish: skipped {} settled story/stories; no meaningful headline change",
+                        stories.len()
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    feed_name = %config.feed,
+                    stories = stories.len(),
+                    error = %err,
+                    "p2p publish batch failed"
+                );
+                eprintln!("agent-feed: p2p publish failed: {err}");
+                pending.extend(stories);
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+fn publish_story_batch(
+    config: &ServePublishConfig,
+    stories: &[CompiledStory],
+    recent: &mut VecDeque<RecentSummary>,
+    next_seq: &mut u64,
+) -> Result<usize, CliError> {
+    let feed_id = format!("local:{}", config.feed);
+    let recent_summaries = recent.iter().cloned().collect::<Vec<_>>();
+    let summaries =
+        summarize_feed_with_recent(&feed_id, stories, &config.summary_config, &recent_summaries)?;
+    for summary in &summaries {
+        recent.push_front(RecentSummary::from(summary));
+    }
+    while recent.len() > config.summary_config.publish.recent_window.max(1) {
+        recent.pop_back();
+    }
+
+    let capsules = signed_capsules_from_summaries(
+        &config.feed,
+        &summaries,
+        Some(&config.publisher),
+        config.session.session_token.as_deref(),
+        *next_seq,
+    )?;
+    *next_seq += capsules.len() as u64;
+
+    if capsules.is_empty() {
+        info!(
+            feed_name = %config.feed,
+            stories = stories.len(),
+            summaries = summaries.len(),
+            "p2p publish skipped empty capsule batch"
+        );
+        return Ok(0);
+    }
+
+    let body = serde_json::to_string(&json!({
+        "network_id": config.network_id,
+        "compatibility": ProtocolCompatibility::current(),
+        "feed_name": config.feed,
+        "capsules": capsules,
+    }))?;
+    let response =
+        post_edge_json_with_bearer(&config.edge, "/network/publish", &body, &config.session)?;
+    info!(
+        feed_name = %config.feed,
+        capsules = capsules.len(),
+        stories = stories.len(),
+        response = %response.trim(),
+        "p2p publish sent to edge"
+    );
+    Ok(capsules.len())
 }
 
 fn capture_scope_message(workspace: Option<&WorkspaceFilter>) -> String {
@@ -2123,6 +2390,43 @@ mod tests {
     }
 
     #[test]
+    fn serve_publish_parses_all_in_one_feed_options() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "serve",
+            "--publish",
+            "--all-workspaces",
+            "--feed-name",
+            "gpu-vm",
+            "--publish-interval-secs",
+            "5",
+            "--summarizer",
+            "deterministic",
+        ])
+        .expect("serve publish flags parse");
+
+        let Commands::Serve {
+            publish,
+            p2p,
+            feed,
+            all_workspaces,
+            publish_interval_secs,
+            summarizer,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+
+        assert!(publish);
+        assert!(!p2p);
+        assert_eq!(feed, "gpu-vm");
+        assert!(all_workspaces);
+        assert_eq!(publish_interval_secs, 5);
+        assert_eq!(summarizer, "deterministic");
+    }
+
+    #[test]
     fn auth_callback_page_uses_aberration_font_stack() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener binds");
         let addr = listener.local_addr().expect("listener addr");
@@ -2439,7 +2743,7 @@ fn import_codex_sessions(
     for path in paths {
         let input = fs::read_to_string(path)?;
         let mut state = TranscriptState::default();
-        let file_stats = import_codex_chunk(server, path, &input, &mut state, workspace);
+        let file_stats = import_codex_chunk(server, path, &input, &mut state, workspace, None);
         total.add(file_stats);
         info!(
             path = %path.display(),
@@ -2722,13 +3026,24 @@ fn signed_capsules(
         summaries = summaries.len(),
         "feed stories summarized"
     );
+    signed_capsules_from_summaries(feed, &summaries, publisher, signing_secret, 1)
+}
+
+fn signed_capsules_from_summaries(
+    feed: &str,
+    summaries: &[FeedSummary],
+    publisher: Option<&PublisherIdentity>,
+    signing_secret: Option<&str>,
+    start_seq: u64,
+) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
+    let feed_id = format!("local:{feed}");
     summaries
         .iter()
         .enumerate()
         .map(|(index, summary)| {
             let mut capsule = StoryCapsule::from_summary(
                 feed_id.clone(),
-                (index + 1) as u64,
+                start_seq + index as u64,
                 "local:codex",
                 summary,
             )?;
@@ -2939,19 +3254,107 @@ fn parse_visibility(value: &str) -> FeedVisibility {
     }
 }
 
+struct CodexActiveWatch<'a> {
+    server: &'a str,
+    history: &'a Path,
+    sessions_dir: &'a Path,
+    sessions: usize,
+    poll_ms: u64,
+    workspace: Option<&'a WorkspaceFilter>,
+    include_history: bool,
+    event_sink: Option<&'a mpsc::Sender<AgentEvent>>,
+}
+
+fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliError> {
+    let mut watchers = Vec::new();
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut reported_empty = false;
+    let rediscover_every = Duration::from_secs(5);
+    let mut last_discovery = Instant::now() - rediscover_every;
+
+    loop {
+        if last_discovery.elapsed() >= rediscover_every {
+            let paths = active_codex_session_paths(
+                config.history,
+                config.sessions_dir,
+                config.sessions,
+                config.workspace,
+            )?;
+            for path in paths {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                let input = fs::read_to_string(&path)?;
+                let mut state = TranscriptState::default();
+                let stats = if config.include_history {
+                    import_codex_chunk(
+                        config.server,
+                        &path,
+                        &input,
+                        &mut state,
+                        config.workspace,
+                        config.event_sink,
+                    )
+                } else {
+                    warm_codex_state(&path, &input, &mut state);
+                    ImportStats::default()
+                };
+                let offset = fs::metadata(&path)?.len();
+                info!(
+                    path = %path.display(),
+                    initial_events = stats.imported,
+                    filtered_events = stats.filtered,
+                    offset,
+                    poll_ms = config.poll_ms,
+                    workspace = config.workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
+                    "codex transcript watcher discovered"
+                );
+                print_watch_started("codex transcript", &path, stats);
+                watchers.push(CodexWatcher {
+                    path,
+                    offset,
+                    state,
+                    pending: String::new(),
+                });
+            }
+
+            if watchers.is_empty() && !reported_empty {
+                println!(
+                    "codex capture: no active sessions found for {}; still watching for new sessions",
+                    capture_scope_message(config.workspace)
+                );
+                reported_empty = true;
+            } else if !watchers.is_empty() {
+                reported_empty = false;
+            }
+            last_discovery = Instant::now();
+        }
+
+        poll_codex_watchers(
+            config.server,
+            &mut watchers,
+            config.poll_ms,
+            config.workspace,
+            config.event_sink,
+        )?;
+        std::thread::sleep(Duration::from_millis(config.poll_ms.max(100)));
+    }
+}
+
 fn watch_codex_sessions(
     server: &str,
     paths: &[PathBuf],
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
     include_history: bool,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
         let input = fs::read_to_string(path)?;
         let mut state = TranscriptState::default();
         let stats = if include_history {
-            import_codex_chunk(server, path, &input, &mut state, workspace)
+            import_codex_chunk(server, path, &input, &mut state, workspace, event_sink)
         } else {
             warm_codex_state(path, &input, &mut state);
             ImportStats::default()
@@ -2977,37 +3380,60 @@ fn watch_codex_sessions(
 
     loop {
         std::thread::sleep(Duration::from_millis(poll_ms.max(100)));
-        for watcher in &mut watchers {
-            let len = fs::metadata(&watcher.path)?.len();
-            if len <= watcher.offset {
-                continue;
-            }
-            let mut file = File::open(&watcher.path)?;
-            file.seek(SeekFrom::Start(watcher.offset))?;
-            let mut chunk = String::new();
-            file.read_to_string(&mut chunk)?;
-            watcher.offset = len;
-            watcher.pending.push_str(&chunk);
-            let complete = split_complete_jsonl(&mut watcher.pending);
-            let stats = import_codex_chunk(
-                server,
-                &watcher.path,
-                &complete,
-                &mut watcher.state,
-                workspace,
+        poll_codex_watchers(server, &mut watchers, poll_ms, workspace, event_sink)?;
+    }
+}
+
+fn poll_codex_watchers(
+    server: &str,
+    watchers: &mut [CodexWatcher],
+    poll_ms: u64,
+    workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<(), CliError> {
+    for watcher in watchers {
+        let len = fs::metadata(&watcher.path)?.len();
+        if len < watcher.offset {
+            warn!(
+                path = %watcher.path.display(),
+                previous_offset = watcher.offset,
+                len,
+                "codex transcript shrank; resetting watcher offset"
             );
-            if stats.imported > 0 || stats.filtered > 0 {
-                info!(
-                    path = %watcher.path.display(),
-                    events = stats.imported,
-                    filtered_events = stats.filtered,
-                    offset = watcher.offset,
-                    "codex transcript appended events imported"
-                );
-                print_watch_appended("codex transcript", &watcher.path, stats);
-            }
+            watcher.offset = 0;
+            watcher.pending.clear();
+        }
+        if len <= watcher.offset {
+            continue;
+        }
+        let mut file = File::open(&watcher.path)?;
+        file.seek(SeekFrom::Start(watcher.offset))?;
+        let mut chunk = String::new();
+        file.read_to_string(&mut chunk)?;
+        watcher.offset = len;
+        watcher.pending.push_str(&chunk);
+        let complete = split_complete_jsonl(&mut watcher.pending);
+        let stats = import_codex_chunk(
+            server,
+            &watcher.path,
+            &complete,
+            &mut watcher.state,
+            workspace,
+            event_sink,
+        );
+        if stats.imported > 0 || stats.filtered > 0 {
+            info!(
+                path = %watcher.path.display(),
+                events = stats.imported,
+                filtered_events = stats.filtered,
+                offset = watcher.offset,
+                poll_ms,
+                "codex transcript appended events imported"
+            );
+            print_watch_appended("codex transcript", &watcher.path, stats);
         }
     }
+    Ok(())
 }
 
 fn import_codex_chunk(
@@ -3016,6 +3442,7 @@ fn import_codex_chunk(
     input: &str,
     state: &mut TranscriptState,
     workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (index, line) in input
@@ -3085,6 +3512,16 @@ fn import_codex_chunk(
             severity = ?event.severity,
             "codex event outgoing"
         );
+        if let Some(sender) = event_sink
+            && let Err(err) = sender.send(event.clone())
+        {
+            warn!(
+                path = %path.display(),
+                event_id = %event.id,
+                error = %err,
+                "codex event publish queue send failed"
+            );
+        }
         stats.imported += 1;
     }
     stats
@@ -3099,19 +3536,86 @@ fn warm_codex_state(path: &Path, input: &str, state: &mut TranscriptState) {
     }
 }
 
+fn watch_claude_active_sessions(
+    server: &str,
+    projects_dir: &Path,
+    limit: usize,
+    poll_ms: u64,
+    workspace: Option<&WorkspaceFilter>,
+    include_history: bool,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<(), CliError> {
+    let mut watchers = Vec::new();
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut reported_empty = false;
+    let rediscover_every = Duration::from_secs(5);
+    let mut last_discovery = Instant::now() - rediscover_every;
+
+    loop {
+        if last_discovery.elapsed() >= rediscover_every {
+            let paths = active_claude_session_paths(projects_dir, limit, workspace)?;
+            for path in paths {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                let input = fs::read_to_string(&path)?;
+                let mut state = ClaudeState::default();
+                let stats = if include_history {
+                    import_claude_chunk(server, &path, &input, &mut state, workspace, event_sink)
+                } else {
+                    warm_claude_state(&path, &input, &mut state);
+                    ImportStats::default()
+                };
+                let offset = fs::metadata(&path)?.len();
+                info!(
+                    path = %path.display(),
+                    initial_events = stats.imported,
+                    filtered_events = stats.filtered,
+                    offset,
+                    poll_ms,
+                    workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
+                    "claude stream watcher discovered"
+                );
+                print_watch_started("claude stream", &path, stats);
+                watchers.push(ClaudeWatcher {
+                    path,
+                    offset,
+                    state,
+                    pending: String::new(),
+                });
+            }
+
+            if watchers.is_empty() && !reported_empty {
+                println!(
+                    "claude capture: no active sessions found for {}; still watching for new sessions",
+                    capture_scope_message(workspace)
+                );
+                reported_empty = true;
+            } else if !watchers.is_empty() {
+                reported_empty = false;
+            }
+            last_discovery = Instant::now();
+        }
+
+        poll_claude_watchers(server, &mut watchers, poll_ms, workspace, event_sink)?;
+        std::thread::sleep(Duration::from_millis(poll_ms.max(100)));
+    }
+}
+
 fn watch_claude_sessions(
     server: &str,
     paths: &[PathBuf],
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
     include_history: bool,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
         let input = fs::read_to_string(path)?;
         let mut state = ClaudeState::default();
         let stats = if include_history {
-            import_claude_chunk(server, path, &input, &mut state, workspace)
+            import_claude_chunk(server, path, &input, &mut state, workspace, event_sink)
         } else {
             warm_claude_state(path, &input, &mut state);
             ImportStats::default()
@@ -3137,37 +3641,60 @@ fn watch_claude_sessions(
 
     loop {
         std::thread::sleep(Duration::from_millis(poll_ms.max(100)));
-        for watcher in &mut watchers {
-            let len = fs::metadata(&watcher.path)?.len();
-            if len <= watcher.offset {
-                continue;
-            }
-            let mut file = File::open(&watcher.path)?;
-            file.seek(SeekFrom::Start(watcher.offset))?;
-            let mut chunk = String::new();
-            file.read_to_string(&mut chunk)?;
-            watcher.offset = len;
-            watcher.pending.push_str(&chunk);
-            let complete = split_complete_jsonl(&mut watcher.pending);
-            let stats = import_claude_chunk(
-                server,
-                &watcher.path,
-                &complete,
-                &mut watcher.state,
-                workspace,
+        poll_claude_watchers(server, &mut watchers, poll_ms, workspace, event_sink)?;
+    }
+}
+
+fn poll_claude_watchers(
+    server: &str,
+    watchers: &mut [ClaudeWatcher],
+    poll_ms: u64,
+    workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<(), CliError> {
+    for watcher in watchers {
+        let len = fs::metadata(&watcher.path)?.len();
+        if len < watcher.offset {
+            warn!(
+                path = %watcher.path.display(),
+                previous_offset = watcher.offset,
+                len,
+                "claude stream shrank; resetting watcher offset"
             );
-            if stats.imported > 0 || stats.filtered > 0 {
-                info!(
-                    path = %watcher.path.display(),
-                    events = stats.imported,
-                    filtered_events = stats.filtered,
-                    offset = watcher.offset,
-                    "claude stream appended events imported"
-                );
-                print_watch_appended("claude stream", &watcher.path, stats);
-            }
+            watcher.offset = 0;
+            watcher.pending.clear();
+        }
+        if len <= watcher.offset {
+            continue;
+        }
+        let mut file = File::open(&watcher.path)?;
+        file.seek(SeekFrom::Start(watcher.offset))?;
+        let mut chunk = String::new();
+        file.read_to_string(&mut chunk)?;
+        watcher.offset = len;
+        watcher.pending.push_str(&chunk);
+        let complete = split_complete_jsonl(&mut watcher.pending);
+        let stats = import_claude_chunk(
+            server,
+            &watcher.path,
+            &complete,
+            &mut watcher.state,
+            workspace,
+            event_sink,
+        );
+        if stats.imported > 0 || stats.filtered > 0 {
+            info!(
+                path = %watcher.path.display(),
+                events = stats.imported,
+                filtered_events = stats.filtered,
+                offset = watcher.offset,
+                poll_ms,
+                "claude stream appended events imported"
+            );
+            print_watch_appended("claude stream", &watcher.path, stats);
         }
     }
+    Ok(())
 }
 
 fn import_claude_stream_input(
@@ -3177,7 +3704,7 @@ fn import_claude_stream_input(
     workspace: Option<&WorkspaceFilter>,
 ) -> ImportStats {
     let mut state = ClaudeState::default();
-    import_claude_chunk(server, path, input, &mut state, workspace)
+    import_claude_chunk(server, path, input, &mut state, workspace, None)
 }
 
 fn import_claude_chunk(
@@ -3186,6 +3713,7 @@ fn import_claude_chunk(
     input: &str,
     state: &mut ClaudeState,
     workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (index, line) in input
@@ -3255,6 +3783,16 @@ fn import_claude_chunk(
             severity = ?event.severity,
             "claude event outgoing"
         );
+        if let Some(sender) = event_sink
+            && let Err(err) = sender.send(event.clone())
+        {
+            warn!(
+                path = %path.display(),
+                event_id = %event.id,
+                error = %err,
+                "claude event publish queue send failed"
+            );
+        }
         stats.imported += 1;
     }
     stats
@@ -3507,6 +4045,102 @@ fn load_publish_session(
             "github auth session is for {actual}; re-run auth with --edge {expected}"
         )));
     }
+    Ok(session)
+}
+
+fn ensure_publish_session(
+    auth_store: Option<PathBuf>,
+    edge: &str,
+    callback_bind: SocketAddr,
+    timeout: Duration,
+    no_browser: bool,
+) -> Result<GithubAuthSession, CliError> {
+    match load_publish_session(auth_store.clone(), edge) {
+        Ok(session) => Ok(session),
+        Err(err) => {
+            warn!(
+                %edge,
+                error = %err,
+                "github publish session unavailable; starting browser auth"
+            );
+            println!("github auth required for p2p publish; starting sign-in");
+            github_cli_login(
+                edge.to_string(),
+                callback_bind,
+                timeout,
+                no_browser,
+                no_browser,
+                auth_store,
+            )
+        }
+    }
+}
+
+fn github_cli_login(
+    edge: String,
+    callback_bind: SocketAddr,
+    timeout: Duration,
+    no_browser: bool,
+    print_url: bool,
+    store: Option<PathBuf>,
+) -> Result<GithubAuthSession, CliError> {
+    let listener = TcpListener::bind(callback_bind)?;
+    let bind = listener.local_addr()?;
+    if !bind.ip().is_loopback() {
+        return Err(CliError::Http(
+            "github auth callback must bind to loopback".to_string(),
+        ));
+    }
+    info!(
+        edge = %edge,
+        callback_bind = %bind,
+        timeout_secs = timeout.as_secs(),
+        no_browser,
+        print_url,
+        "github cli auth starting"
+    );
+    let config = GithubCliAuthConfig {
+        edge_base_url: edge.clone(),
+        callback_bind,
+        ..GithubCliAuthConfig::default()
+    };
+    let start = begin_cli_login(&config, bind)?;
+    debug!(
+        authorize_url = %start.authorize_url,
+        callback_url = %start.callback_url,
+        "github auth url prepared"
+    );
+    if print_url || no_browser {
+        println!("{}", start.authorize_url);
+    }
+    if !no_browser && let Err(err) = open_url(&start.authorize_url) {
+        warn!(error = %err, "failed to open browser for github auth");
+        eprintln!("agent-feed: failed to open browser: {err}");
+        eprintln!("agent-feed: open this URL manually:");
+        eprintln!("{}", start.authorize_url);
+    }
+    println!("waiting for github callback on {}", start.callback_url);
+    let (target, mut stream) = wait_for_github_callback(&listener, timeout)?;
+    let session = match parse_cli_callback_request(&target)
+        .and_then(|callback| complete_cli_login(&start, callback, edge.clone()))
+    {
+        Ok(session) => {
+            write_auth_callback_response(&mut stream, true, "github sign-in complete")?;
+            session
+        }
+        Err(err) => {
+            let _ = write_auth_callback_response(&mut stream, false, "github sign-in failed");
+            return Err(CliError::Auth(err));
+        }
+    };
+    let store = GithubSessionStore::new(auth_store_path(store));
+    store.save(&session)?;
+    info!(
+        github_login = %session.login,
+        github_user_id = session.github_user_id,
+        expires_at = %session.expires_at,
+        "github cli auth completed"
+    );
     Ok(session)
 }
 

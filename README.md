@@ -43,7 +43,9 @@ that is the happy path. `serve` also attaches the latest local codex and claude
 transcripts in the current workspace by default, so active sessions in that tree
 should start producing display-safe stories after the daemon is up. use
 `--workspace /path/to/repo` for another tree, `--all-workspaces` for broad local
-capture, or `--no-agent-capture` if you want to ingest manually.
+capture, or `--no-agent-capture` if you want to ingest manually. by default it
+tails future transcript writes only; add `--include-history` when you explicitly
+want to replay selected existing transcript history.
 
 `agent-feed init --auto` is optional setup for hooks, shims, and future
 sessions. `agent-feed open` only opens the display URL in a browser.
@@ -91,12 +93,22 @@ the feed is a view of agent activity, not an agent control plane.
 p2p is optional. local mode remains the default.
 
 ```sh
-agent-feed serve --p2p
-agent-feed p2p share --feed-name workstation --visibility private
+agent-feed serve --p2p --publish --feed workstation
 ```
 
+`serve --p2p` enables the network-aware browser/discovery UX. add `--publish`
+to make the same long-running process summarize future settled local stories and
+publish signed capsules under the named feed. publication is explicit and
+requires github auth; if there is no valid local auth session, the cli opens the
+github sign-in flow before it starts serving.
+
 p2p publishes signed, settled story capsules. it does not publish raw local
-events by default. subscribers receive already-summarized feed material.
+events by default. subscribers receive already-summarized feed material. to
+publish from every local workspace:
+
+```sh
+agent-feed serve --p2p --publish --feed workstation --all-workspaces
+```
 
 the hosted browser shell is:
 
