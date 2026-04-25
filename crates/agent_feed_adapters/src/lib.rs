@@ -398,9 +398,9 @@ pub mod codex {
 
     fn command_from_payload(payload: &Value) -> Option<String> {
         payload
-            .get("command")
-            .and_then(command_value_to_string)
-            .or_else(|| payload.get("parsed_cmd").and_then(command_value_to_string))
+            .get("parsed_cmd")
+            .and_then(parsed_command_to_string)
+            .or_else(|| payload.get("command").and_then(command_value_to_string))
     }
 
     fn command_from_arguments(arguments: Option<&Value>) -> Option<String> {
@@ -420,18 +420,53 @@ pub mod codex {
     }
 
     fn command_value_to_string(value: &Value) -> Option<String> {
-        match value {
-            Value::String(command) => Some(command.to_string()),
-            Value::Array(parts) => Some(
+        let command = match value {
+            Value::String(command) => command.to_string(),
+            Value::Array(parts) => {
+                if let Some(command) = shell_wrapper_inner_command(parts) {
+                    return Some(command.to_string());
+                }
                 parts
                     .iter()
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
-                    .join(" "),
-            )
-            .filter(|command| !command.is_empty()),
+                    .join(" ")
+            }
+            _ => return None,
+        };
+        Some(command).filter(|command| !command.is_empty())
+    }
+
+    fn parsed_command_to_string(value: &Value) -> Option<String> {
+        match value {
+            Value::Array(items) => items.iter().find_map(parsed_command_to_string),
+            Value::Object(map) => map
+                .get("cmd")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            Value::String(command) => Some(command.to_string()),
             _ => None,
         }
+        .filter(|command| !command.is_empty())
+    }
+
+    fn shell_wrapper_inner_command(parts: &[Value]) -> Option<&str> {
+        let shell = parts.first()?.as_str()?;
+        let shell_name = Path::new(shell)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(shell);
+        if !matches!(
+            shell_name,
+            "bash" | "sh" | "zsh" | "fish" | "pwsh" | "powershell"
+        ) {
+            return None;
+        }
+        parts
+            .windows(2)
+            .find(|window| matches!(window[0].as_str(), Some("-c" | "-lc" | "/c" | "-Command")))
+            .and_then(|window| window[1].as_str())
+            .filter(|command| !command.is_empty())
     }
 
     fn files_from_changes(changes: Option<&Value>) -> Vec<String> {
@@ -1026,6 +1061,48 @@ mod tests {
         );
         assert_eq!(events[3].kind, EventKind::FileChanged);
         assert_eq!(events[3].files, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn codex_transcript_prefers_parsed_command_over_shell_wrapper() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"exec_command_end","status":"failed","exit_code":1,"command":["/usr/bin/zsh","-lc","cargo test --all"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test --all"}]}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events[1].kind, EventKind::ToolFail);
+        assert_eq!(events[1].command.as_deref(), Some("cargo test --all"));
+    }
+
+    #[test]
+    fn codex_transcript_extracts_shell_inner_command_when_parsed_command_missing() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"exec_command_end","status":"failed","exit_code":1,"command":["/usr/bin/zsh","-lc","git status --short"]}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events[1].kind, EventKind::ToolFail);
+        assert_eq!(events[1].command.as_deref(), Some("git status --short"));
+    }
+
+    #[test]
+    fn codex_transcript_keeps_plain_wrapper_when_no_inner_command_exists() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"exec_command_end","status":"failed","exit_code":1,"command":["/usr/bin/zsh"]}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events[1].kind, EventKind::ToolFail);
+        assert_eq!(events[1].command.as_deref(), Some("/usr/bin/zsh"));
     }
 
     #[test]

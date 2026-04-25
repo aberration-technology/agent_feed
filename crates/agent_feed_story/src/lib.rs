@@ -717,7 +717,6 @@ fn command_class(command: &str) -> Option<String> {
         }
         "git" | "gh" => "vcs command",
         "make" | "just" | "task" => "task command",
-        "bash" | "sh" | "zsh" | "fish" | "pwsh" | "powershell" => "shell command",
         "apply_patch" => "patch",
         _ => return None,
     };
@@ -860,6 +859,19 @@ mod tests {
     fn generic_lone_tool_failure_does_not_publish() {
         let mut compiler = StoryCompiler::default();
         let mut failed = event(EventKind::ToolFail, "codex command failed");
+        failed.summary = Some("exit 1. raw output omitted.".to_string());
+        failed.score_hint = Some(94);
+        failed.severity = Severity::Warning;
+
+        assert!(compiler.ingest(failed).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn shell_wrapper_tool_failure_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut failed = event(EventKind::ToolFail, "codex command failed");
+        failed.command = Some("/usr/bin/zsh".to_string());
         failed.summary = Some("exit 1. raw output omitted.".to_string());
         failed.score_hint = Some(94);
         failed.severity = Severity::Warning;

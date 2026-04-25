@@ -1409,6 +1409,9 @@ fn weak_headline(headline: &str, request: &SummaryRequest) -> bool {
     if normalized.is_empty() {
         return true;
     }
+    if normalized.contains("shell command failed") {
+        return true;
+    }
     if request.stories.len() == 1 {
         let story = &request.stories[0];
         return normalized == "feed activity settled"
@@ -1427,7 +1430,7 @@ fn weak_deck(deck: &str) -> bool {
     }
     matches!(
         normalize_text(deck).as_str(),
-        "" | "1 tool failures" | "one tool failures"
+        "" | "1 tool failures" | "one tool failures" | "shell command failed"
     )
 }
 
@@ -1461,8 +1464,6 @@ fn quality_fallback_headline(request: &SummaryRequest) -> String {
                 format!("{agent} build command failed")
             } else if display.contains("vcs command failed") {
                 format!("{agent} vcs command failed")
-            } else if display.contains("shell command failed") {
-                format!("{agent} shell command failed")
             } else if display.contains("task command failed") {
                 format!("{agent} task command failed")
             } else {
@@ -1502,8 +1503,6 @@ fn quality_fallback_deck(request: &SummaryRequest) -> String {
                 "build command failed.".to_string()
             } else if display.contains("vcs command failed") {
                 "vcs command failed.".to_string()
-            } else if display.contains("shell command failed") {
-                "shell command failed.".to_string()
             } else if display.contains("task command failed") {
                 "task command failed.".to_string()
             } else {
@@ -2459,6 +2458,25 @@ mod tests {
         assert!(!display.contains("1 tool failures"));
         assert_eq!(summary.lower_third, "feed · redacted");
         assert_eq!(summary.chips, vec!["redacted"]);
+    }
+
+    #[test]
+    fn shell_command_failed_summary_is_repaired() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut incident = weak_incident_story();
+        incident.headline = "codex shell command failed".to_string();
+        incident.deck = "shell command failed.".to_string();
+
+        let summaries =
+            summarize_feed("local:workstation", &[incident], &config).expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        let display = format!("{} {}", summary.headline, summary.deck);
+        assert!(!display.contains("shell command failed"));
+        assert_eq!(summary.headline, "codex hit a tool failure");
+        assert_eq!(summary.deck, "tool failed during the turn.");
     }
 
     #[test]

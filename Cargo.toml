@@ -46,7 +46,7 @@ rust-version = "1.95"
 
 [workspace.dependencies]
 agent_feed = { path = "crates/agent_feed", version = "0.1.8" }
-agent_feed_adapters = { path = "crates/agent_feed_adapters", version = "0.1.8" }
+agent_feed_adapters = { path = "crates/agent_feed_adapters", version = "0.1.9" }
 agent_feed_auth = { path = "crates/agent_feed_auth", version = "0.1.8" }
 agent_feed_auth_github = { path = "crates/agent_feed_auth_github", version = "0.1.8" }
 agent_feed_browser = { path = "crates/agent_feed_browser", version = "0.1.8" }
@@ -70,8 +70,8 @@ agent_feed_security = { path = "crates/agent_feed_security", version = "0.1.8" }
 agent_feed_server = { path = "crates/agent_feed_server", version = "0.1.8" }
 agent_feed_social = { path = "crates/agent_feed_social", version = "0.1.8" }
 agent_feed_store = { path = "crates/agent_feed_store", version = "0.1.8" }
-agent_feed_story = { path = "crates/agent_feed_story", version = "0.1.9" }
-agent_feed_summarize = { path = "crates/agent_feed_summarize", version = "0.1.9" }
+agent_feed_story = { path = "crates/agent_feed_story", version = "0.1.10" }
+agent_feed_summarize = { path = "crates/agent_feed_summarize", version = "0.1.10" }
 agent_feed_testkit = { path = "crates/agent_feed_testkit", version = "0.1.8" }
 agent_feed_ui = { path = "crates/agent_feed_ui", version = "0.1.8" }
 agent_feed_views = { path = "crates/agent_feed_views", version = "0.1.8" }
