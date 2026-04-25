@@ -60,6 +60,24 @@ enum LogFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum BackfillMode {
+    #[default]
+    None,
+    Recent,
+    All,
+}
+
+impl BackfillMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Recent => "recent",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -114,6 +132,8 @@ enum Commands {
         all_workspaces: bool,
         #[arg(long, visible_aliases = ["no-agent-watch", "no-capture"])]
         no_agent_capture: bool,
+        #[arg(long, value_enum, default_value = "none")]
+        backfill: BackfillMode,
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
         #[arg(long)]
@@ -502,6 +522,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             workspace,
             all_workspaces,
             no_agent_capture,
+            backfill,
             poll_ms,
             codex_history,
             codex_sessions_dir,
@@ -547,6 +568,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     sessions,
                     workspace: workspace_filter.clone(),
                     poll_ms,
+                    backfill,
                     codex_history,
                     codex_sessions_dir,
                     claude_projects_dir,
@@ -556,21 +578,12 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 edge,
                 session,
                 feed,
+                server: bind.to_string(),
                 agents: capture
                     .as_ref()
                     .map(|capture| capture.agents.clone())
                     .unwrap_or_else(|| serve_agents.clone()),
-                sessions,
                 workspace: workspace_filter,
-                codex_history: capture
-                    .as_ref()
-                    .and_then(|capture| capture.codex_history.clone()),
-                codex_sessions_dir: capture
-                    .as_ref()
-                    .and_then(|capture| capture.codex_sessions_dir.clone()),
-                claude_projects_dir: capture
-                    .as_ref()
-                    .and_then(|capture| capture.claude_projects_dir.clone()),
                 interval_secs: publish_interval_secs,
             });
             serve_with_ready(
@@ -593,6 +606,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         println!("agent capture disabled; use `agent-feed codex active --watch` to attach manually");
                     }
                     if let Some(publisher) = publisher {
+                        println!("p2p publish: waiting for new settled stories");
                         start_serve_p2p_publisher(publisher);
                     }
                 },
@@ -738,7 +752,13 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     "codex active session capture starting"
                 );
                 if watch {
-                    watch_codex_sessions(&server, &paths, poll_ms, workspace_filter.as_ref())?;
+                    watch_codex_sessions(
+                        &server,
+                        &paths,
+                        poll_ms,
+                        workspace_filter.as_ref(),
+                        BackfillMode::All,
+                    )?;
                 } else {
                     import_codex_sessions(&server, &paths, workspace_filter.as_ref())?;
                 }
@@ -809,7 +829,13 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     "claude active session capture starting"
                 );
                 if watch {
-                    watch_claude_sessions(&server, &paths, poll_ms, workspace_filter.as_ref())?;
+                    watch_claude_sessions(
+                        &server,
+                        &paths,
+                        poll_ms,
+                        workspace_filter.as_ref(),
+                        BackfillMode::All,
+                    )?;
                 } else {
                     import_claude_sessions(&server, &paths, workspace_filter.as_ref())?;
                 }
@@ -1386,6 +1412,7 @@ struct ServeAgentCapture {
     sessions: usize,
     workspace: Option<WorkspaceFilter>,
     poll_ms: u64,
+    backfill: BackfillMode,
     codex_history: Option<PathBuf>,
     codex_sessions_dir: Option<PathBuf>,
     claude_projects_dir: Option<PathBuf>,
@@ -1396,12 +1423,9 @@ struct ServeP2pPublisher {
     edge: String,
     session: GithubAuthSession,
     feed: String,
+    server: String,
     agents: String,
-    sessions: usize,
     workspace: Option<WorkspaceFilter>,
-    codex_history: Option<PathBuf>,
-    codex_sessions_dir: Option<PathBuf>,
-    claude_projects_dir: Option<PathBuf>,
     interval_secs: u64,
 }
 
@@ -1409,7 +1433,7 @@ struct ServeP2pPublisher {
 struct ServePublishStats {
     capsules: usize,
     stories: usize,
-    sessions: usize,
+    events: usize,
 }
 
 fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
@@ -1426,6 +1450,7 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
     }
 
     let server = bind.to_string();
+    let backfill = capture.backfill;
     if capture_codex {
         let server = server.clone();
         let history = capture.codex_history.unwrap_or_else(default_codex_history);
@@ -1446,6 +1471,7 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 workspace = workspace.log_value(),
                 %server,
                 poll_ms,
+                backfill = backfill.as_str(),
                 "serve codex active capture starting"
             );
             if paths.is_empty() {
@@ -1455,8 +1481,12 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 );
                 return Ok(());
             }
-            println!("codex capture: watching {} active sessions", paths.len());
-            watch_codex_sessions(&server, &paths, poll_ms, workspace.as_ref())
+            println!(
+                "codex capture: tailing {} active sessions from now (backfill={})",
+                paths.len(),
+                backfill.as_str()
+            );
+            watch_codex_sessions(&server, &paths, poll_ms, workspace.as_ref(), backfill)
         });
     }
 
@@ -1477,6 +1507,7 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 workspace = workspace.log_value(),
                 %server,
                 poll_ms,
+                backfill = backfill.as_str(),
                 "serve claude active capture starting"
             );
             if paths.is_empty() {
@@ -1486,8 +1517,12 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 );
                 return Ok(());
             }
-            println!("claude capture: watching {} active sessions", paths.len());
-            watch_claude_sessions(&server, &paths, poll_ms, workspace.as_ref())
+            println!(
+                "claude capture: tailing {} active sessions from now (backfill={})",
+                paths.len(),
+                backfill.as_str()
+            );
+            watch_claude_sessions(&server, &paths, poll_ms, workspace.as_ref(), backfill)
         });
     }
 }
@@ -1516,13 +1551,14 @@ fn start_serve_p2p_publisher(publisher: ServeP2pPublisher) {
         .spawn(move || {
             let interval = Duration::from_secs(publisher.interval_secs.max(10));
             let mut last_fingerprint = String::new();
+            let mut seen_event_ids = HashSet::new();
             loop {
-                match collect_serve_publish_capsules(&publisher) {
+                match collect_serve_publish_capsules(&publisher, &mut seen_event_ids) {
                     Ok((capsules, stats)) if capsules.is_empty() => {
                         debug!(
                             feed_name = %publisher.feed,
                             stories = stats.stories,
-                            local_agent_sessions = stats.sessions,
+                            events = stats.events,
                             "serve p2p publish skipped empty story set"
                         );
                     }
@@ -1547,12 +1583,12 @@ fn start_serve_p2p_publisher(publisher: ServeP2pPublisher) {
                                         feed_name = %publisher.feed,
                                         capsules = stats.capsules,
                                         stories = stats.stories,
-                                        local_agent_sessions = stats.sessions,
+                                        events = stats.events,
                                         "serve p2p capsules published"
                                     );
                                     println!(
-                                        "p2p publish: feed_name={} capsules={} stories={} local_agent_sessions={}",
-                                        publisher.feed, stats.capsules, stats.stories, stats.sessions
+                                        "p2p publish: feed_name={} capsules={} stories={} events={}",
+                                        publisher.feed, stats.capsules, stats.stories, stats.events
                                     );
                                 }
                                 Err(err) => {
@@ -1586,44 +1622,31 @@ fn start_serve_p2p_publisher(publisher: ServeP2pPublisher) {
 
 fn collect_serve_publish_capsules(
     publisher: &ServeP2pPublisher,
+    seen_event_ids: &mut HashSet<String>,
 ) -> Result<(Vec<Signed<StoryCapsule>>, ServePublishStats), CliError> {
     let selected_agents = parse_agent_list(&publisher.agents);
-    let mut captured_paths = Vec::new();
-    let mut stories = Vec::new();
-    if selected_agents.contains("codex") {
-        let history = publisher
-            .codex_history
-            .clone()
-            .unwrap_or_else(default_codex_history);
-        let sessions_dir = publisher
-            .codex_sessions_dir
-            .clone()
-            .unwrap_or_else(default_codex_sessions_dir);
-        let paths = active_codex_session_paths(
-            &history,
-            &sessions_dir,
-            publisher.sessions,
+    let events = fetch_server_events(&publisher.server)?;
+    let mut new_events = Vec::new();
+    for event in events {
+        let event_id = event.id.to_string();
+        if !seen_event_ids.insert(event_id) {
+            continue;
+        }
+        if !selected_agents.contains(event.agent.as_str()) {
+            continue;
+        }
+        if !event_matches_workspace(
+            &event,
             publisher.workspace.as_ref(),
-        )?;
-        stories.extend(compile_codex_stories(&paths, publisher.workspace.as_ref())?);
-        captured_paths.extend(paths);
+            Path::new("<server>"),
+            "p2p",
+        ) {
+            continue;
+        }
+        new_events.push(event);
     }
-    if selected_agents.contains("claude") {
-        let projects_dir = publisher
-            .claude_projects_dir
-            .clone()
-            .unwrap_or_else(default_claude_projects_dir);
-        let paths = active_claude_session_paths(
-            &projects_dir,
-            publisher.sessions,
-            publisher.workspace.as_ref(),
-        )?;
-        stories.extend(compile_claude_stories(
-            &paths,
-            publisher.workspace.as_ref(),
-        )?);
-        captured_paths.extend(paths);
-    }
+    let event_count = new_events.len();
+    let stories = compile_events(new_events);
     let summary_config = SummaryConfig::p2p_default();
     let publisher_identity = PublisherIdentity::github(
         publisher.session.github_user_id,
@@ -1640,7 +1663,7 @@ fn collect_serve_publish_capsules(
     let stats = ServePublishStats {
         capsules: capsules.len(),
         stories: stories.len(),
-        sessions: captured_paths.len(),
+        events: event_count,
     };
     Ok((capsules, stats))
 }
@@ -2013,6 +2036,7 @@ mod tests {
             feed,
             workspace,
             all_workspaces,
+            backfill,
             ..
         } = cli.command
         else {
@@ -2027,6 +2051,24 @@ mod tests {
         assert_eq!(feed, "workstation");
         assert_eq!(workspace, Some(PathBuf::from(".")));
         assert!(!all_workspaces);
+        assert_eq!(backfill, BackfillMode::None);
+    }
+
+    #[test]
+    fn serve_accepts_explicit_backfill_modes() {
+        let recent = Cli::try_parse_from(["agent-feed", "serve", "--backfill", "recent"])
+            .expect("recent backfill parses");
+        let Commands::Serve { backfill, .. } = recent.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(backfill, BackfillMode::Recent);
+
+        let all = Cli::try_parse_from(["agent-feed", "serve", "--backfill", "all"])
+            .expect("all backfill parses");
+        let Commands::Serve { backfill, .. } = all.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(backfill, BackfillMode::All);
     }
 
     #[test]
@@ -2375,6 +2417,132 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
+
+    #[test]
+    fn codex_tail_only_startup_primes_state_without_importing_history() {
+        let root = temp_test_root("codex-tail-only-startup");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "tail-only-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-04-24T03:16:49.697Z",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1", "model": "gpt"}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "duration": "120ms",
+                        "command": ["cargo", "test"]
+                    }
+                }),
+            ],
+        );
+
+        let (watcher, stats) =
+            initial_codex_watch_state("127.0.0.1:9", &transcript, None, BackfillMode::None)
+                .expect("watcher initializes");
+
+        assert_eq!(stats.imported, 0);
+        assert_eq!(stats.filtered, 0);
+        assert_eq!(
+            watcher.offset,
+            fs::metadata(&transcript).expect("metadata").len()
+        );
+        assert_eq!(
+            watcher.state.session_id.as_deref(),
+            Some("tail-only-session")
+        );
+        assert_eq!(watcher.state.turn_id.as_deref(), Some("turn_1"));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn serve_p2p_publisher_reads_incremental_daemon_events_once() {
+        let mut event = AgentEvent::new(
+            agent_feed_core::SourceKind::Codex,
+            agent_feed_core::EventKind::FileChanged,
+            "codex changed files",
+        );
+        event.agent = "codex".to_string();
+        event.project = Some("agent_feed".to_string());
+        event.session_id = Some("session".to_string());
+        event.turn_id = Some("turn".to_string());
+        event.files = vec!["src/lib.rs".to_string()];
+        event.summary = Some("1 changed files. raw diff omitted.".to_string());
+        event.score_hint = Some(82);
+        let server = spawn_events_server(
+            serde_json::to_string(&json!({ "events": [event] })).expect("events serialize"),
+            2,
+        );
+        let now = time::OffsetDateTime::now_utc();
+        let publisher = ServeP2pPublisher {
+            edge: "https://edge.example".to_string(),
+            session: GithubAuthSession {
+                provider: "github".to_string(),
+                github_user_id: 123,
+                login: "mosure".to_string(),
+                name: Some("mosure".to_string()),
+                avatar_url: Some("/avatar/github/123".to_string()),
+                session_token: Some("token".to_string()),
+                issued_at: now,
+                expires_at: now + time::Duration::hours(1),
+                edge_base_url: "https://edge.example".to_string(),
+            },
+            feed: "workstation".to_string(),
+            server,
+            agents: "codex,claude".to_string(),
+            workspace: None,
+            interval_secs: 30,
+        };
+        let mut seen = HashSet::new();
+
+        let (capsules, stats) = collect_serve_publish_capsules(&publisher, &mut seen)
+            .expect("first incremental publish compiles");
+        let (again, again_stats) = collect_serve_publish_capsules(&publisher, &mut seen)
+            .expect("second incremental publish compiles");
+
+        assert_eq!(stats.events, 1);
+        assert_eq!(stats.stories, 1);
+        assert_eq!(capsules.len(), 1);
+        assert_eq!(again_stats.events, 0);
+        assert!(again.is_empty());
+    }
+
+    fn spawn_events_server(body: String, requests: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("events server binds");
+        let addr = listener.local_addr().expect("events server addr");
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().expect("events request accepts");
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buffer = [0_u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("events response writes");
+            }
+        });
+        addr.to_string()
+    }
 }
 
 fn endpoint_for_source(source: &str) -> &'static str {
@@ -2612,6 +2780,224 @@ fn collect_claude_events(
     Ok(collected)
 }
 
+fn prime_codex_state(path: &Path, input: &str, state: &mut TranscriptState) {
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => {
+                let _ = normalize_transcript_value(value, state, Some(path));
+            }
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "codex transcript parse failed during tail-state priming"
+                );
+            }
+        }
+    }
+}
+
+fn prime_claude_state(path: &Path, input: &str, state: &mut ClaudeState) {
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => {
+                let _ = normalize_stream_value(value, state, Some(path));
+            }
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "claude stream parse failed during tail-state priming"
+                );
+            }
+        }
+    }
+}
+
+fn import_recent_codex_story(
+    server: &str,
+    path: &Path,
+    input: &str,
+    workspace: Option<&WorkspaceFilter>,
+) -> ImportStats {
+    let collected = collect_codex_events_from_input(path, input, workspace);
+    import_latest_story_events(server, "/ingest/codex/jsonl", path, "codex", collected)
+}
+
+fn import_recent_claude_story(
+    server: &str,
+    path: &Path,
+    input: &str,
+    workspace: Option<&WorkspaceFilter>,
+) -> ImportStats {
+    let collected = collect_claude_events_from_input(path, input, workspace);
+    import_latest_story_events(
+        server,
+        "/ingest/claude/stream-json",
+        path,
+        "claude",
+        collected,
+    )
+}
+
+fn collect_codex_events_from_input(
+    path: &Path,
+    input: &str,
+    workspace: Option<&WorkspaceFilter>,
+) -> CollectedEvents {
+    let mut state = TranscriptState::default();
+    let mut collected = CollectedEvents::default();
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "codex transcript parse failed during recent backfill"
+                );
+                continue;
+            }
+        };
+        if let Some(event) = normalize_transcript_value(value, &mut state, Some(path)) {
+            if event_matches_workspace(&event, workspace, path, "codex") {
+                collected.events.push(event);
+            } else {
+                collected.filtered += 1;
+            }
+        }
+    }
+    collected
+}
+
+fn collect_claude_events_from_input(
+    path: &Path,
+    input: &str,
+    workspace: Option<&WorkspaceFilter>,
+) -> CollectedEvents {
+    let mut state = ClaudeState::default();
+    let mut collected = CollectedEvents::default();
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "claude stream parse failed during recent backfill"
+                );
+                continue;
+            }
+        };
+        if let Some(event) = normalize_stream_value(value, &mut state, Some(path)) {
+            if event_matches_workspace(&event, workspace, path, "claude") {
+                collected.events.push(event);
+            } else {
+                collected.filtered += 1;
+            }
+        }
+    }
+    collected
+}
+
+fn import_latest_story_events(
+    server: &str,
+    endpoint: &str,
+    path: &Path,
+    source: &str,
+    collected: CollectedEvents,
+) -> ImportStats {
+    let mut stats = ImportStats {
+        imported: 0,
+        filtered: collected.filtered,
+    };
+    let stories = compile_events(collected.events.clone());
+    let Some(story) = stories.last() else {
+        return stats;
+    };
+    let evidence = story
+        .evidence_event_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    for (index, event) in collected.events.iter().enumerate() {
+        if !evidence.contains(&event.id.to_string()) {
+            continue;
+        }
+        if post_agent_event(server, endpoint, path, source, index, event) {
+            stats.imported += 1;
+        }
+    }
+    stats
+}
+
+fn post_agent_event(
+    server: &str,
+    endpoint: &str,
+    path: &Path,
+    source: &str,
+    index: usize,
+    event: &AgentEvent,
+) -> bool {
+    let body = match serde_json::to_string(event) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                %source,
+                "agent event encode failed"
+            );
+            eprintln!(
+                "agent-feed: failed to encode {source} event from {}: {err}",
+                path.display()
+            );
+            return false;
+        }
+    };
+    if let Err(err) = post_json(server, endpoint, &body) {
+        warn!(
+            path = %path.display(),
+            %server,
+            endpoint,
+            index,
+            error = %err,
+            %source,
+            "agent event post failed"
+        );
+        eprintln!(
+            "agent-feed: failed to post {source} event from {}: {err}",
+            path.display()
+        );
+        return false;
+    }
+    true
+}
+
 fn print_import_file(label: &str, path: &Path, stats: ImportStats) {
     if stats.filtered == 0 {
         println!(
@@ -2629,20 +3015,28 @@ fn print_import_file(label: &str, path: &Path, stats: ImportStats) {
     }
 }
 
-fn print_watch_started(label: &str, path: &Path, stats: ImportStats) {
-    if stats.filtered == 0 {
-        println!(
-            "{label} watching: {} ({} initial events)",
-            path.display(),
-            stats.imported
-        );
-    } else {
-        println!(
-            "{label} watching: {} ({} initial events; {} filtered outside workspace)",
-            path.display(),
-            stats.imported,
-            stats.filtered
-        );
+fn print_watch_started(label: &str, path: &Path, stats: ImportStats, backfill: BackfillMode) {
+    match backfill {
+        BackfillMode::None => {
+            println!("{label} watching: {} (tailing from now)", path.display());
+        }
+        BackfillMode::Recent | BackfillMode::All if stats.filtered == 0 => {
+            println!(
+                "{label} watching: {} ({} initial events; backfill={})",
+                path.display(),
+                stats.imported,
+                backfill.as_str()
+            );
+        }
+        BackfillMode::Recent | BackfillMode::All => {
+            println!(
+                "{label} watching: {} ({} initial events; {} filtered outside workspace; backfill={})",
+                path.display(),
+                stats.imported,
+                stats.filtered,
+                backfill.as_str()
+            );
+        }
     }
 }
 
@@ -2872,29 +3266,24 @@ fn watch_codex_sessions(
     paths: &[PathBuf],
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
+    backfill: BackfillMode,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let input = fs::read_to_string(path)?;
-        let mut state = TranscriptState::default();
-        let stats = import_codex_chunk(server, path, &input, &mut state, workspace);
-        let offset = fs::metadata(path)?.len();
+        let (watcher, stats) = initial_codex_watch_state(server, path, workspace, backfill)?;
+        let offset = watcher.offset;
         info!(
             path = %path.display(),
             initial_events = stats.imported,
             filtered_events = stats.filtered,
             offset,
             poll_ms,
+            backfill = backfill.as_str(),
             workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "codex transcript watcher started"
         );
-        print_watch_started("codex transcript", path, stats);
-        watchers.push(CodexWatcher {
-            path: path.clone(),
-            offset,
-            state,
-            pending: String::new(),
-        });
+        print_watch_started("codex transcript", path, stats, backfill);
+        watchers.push(watcher);
     }
 
     loop {
@@ -2971,32 +3360,7 @@ fn import_codex_chunk(
             stats.filtered += 1;
             continue;
         }
-        let body = match serde_json::to_string(&event) {
-            Ok(body) => body,
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "codex event encode failed"
-                );
-                eprintln!(
-                    "agent-feed: failed to encode codex event from {}: {err}",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        if let Err(err) = post_json(server, "/ingest/codex/jsonl", &body) {
-            warn!(
-                path = %path.display(),
-                %server,
-                error = %err,
-                "codex event post failed"
-            );
-            eprintln!(
-                "agent-feed: failed to post codex event from {}: {err}",
-                path.display()
-            );
+        if !post_agent_event(server, "/ingest/codex/jsonl", path, "codex", index, &event) {
             continue;
         }
         debug!(
@@ -3017,29 +3381,24 @@ fn watch_claude_sessions(
     paths: &[PathBuf],
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
+    backfill: BackfillMode,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let input = fs::read_to_string(path)?;
-        let mut state = ClaudeState::default();
-        let stats = import_claude_chunk(server, path, &input, &mut state, workspace);
-        let offset = fs::metadata(path)?.len();
+        let (watcher, stats) = initial_claude_watch_state(server, path, workspace, backfill)?;
+        let offset = watcher.offset;
         info!(
             path = %path.display(),
             initial_events = stats.imported,
             filtered_events = stats.filtered,
             offset,
             poll_ms,
+            backfill = backfill.as_str(),
             workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "claude stream watcher started"
         );
-        print_watch_started("claude stream", path, stats);
-        watchers.push(ClaudeWatcher {
-            path: path.clone(),
-            offset,
-            state,
-            pending: String::new(),
-        });
+        print_watch_started("claude stream", path, stats, backfill);
+        watchers.push(watcher);
     }
 
     loop {
@@ -3126,32 +3485,14 @@ fn import_claude_chunk(
             stats.filtered += 1;
             continue;
         }
-        let body = match serde_json::to_string(&event) {
-            Ok(body) => body,
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    error = %err,
-                    "claude event encode failed"
-                );
-                eprintln!(
-                    "agent-feed: failed to encode claude event from {}: {err}",
-                    path.display()
-                );
-                continue;
-            }
-        };
-        if let Err(err) = post_json(server, "/ingest/claude/stream-json", &body) {
-            warn!(
-                path = %path.display(),
-                %server,
-                error = %err,
-                "claude event post failed"
-            );
-            eprintln!(
-                "agent-feed: failed to post claude event from {}: {err}",
-                path.display()
-            );
+        if !post_agent_event(
+            server,
+            "/ingest/claude/stream-json",
+            path,
+            "claude",
+            index,
+            &event,
+        ) {
             continue;
         }
         debug!(
@@ -3195,6 +3536,70 @@ struct ClaudeWatcher {
     offset: u64,
     state: ClaudeState,
     pending: String,
+}
+
+fn initial_codex_watch_state(
+    server: &str,
+    path: &Path,
+    workspace: Option<&WorkspaceFilter>,
+    backfill: BackfillMode,
+) -> Result<(CodexWatcher, ImportStats), CliError> {
+    let input = fs::read_to_string(path)?;
+    let mut state = TranscriptState::default();
+    let stats = match backfill {
+        BackfillMode::All => import_codex_chunk(server, path, &input, &mut state, workspace),
+        BackfillMode::Recent => {
+            let stats = import_recent_codex_story(server, path, &input, workspace);
+            prime_codex_state(path, &input, &mut state);
+            stats
+        }
+        BackfillMode::None => {
+            prime_codex_state(path, &input, &mut state);
+            ImportStats::default()
+        }
+    };
+    let offset = fs::metadata(path)?.len();
+    Ok((
+        CodexWatcher {
+            path: path.to_path_buf(),
+            offset,
+            state,
+            pending: String::new(),
+        },
+        stats,
+    ))
+}
+
+fn initial_claude_watch_state(
+    server: &str,
+    path: &Path,
+    workspace: Option<&WorkspaceFilter>,
+    backfill: BackfillMode,
+) -> Result<(ClaudeWatcher, ImportStats), CliError> {
+    let input = fs::read_to_string(path)?;
+    let mut state = ClaudeState::default();
+    let stats = match backfill {
+        BackfillMode::All => import_claude_chunk(server, path, &input, &mut state, workspace),
+        BackfillMode::Recent => {
+            let stats = import_recent_claude_story(server, path, &input, workspace);
+            prime_claude_state(path, &input, &mut state);
+            stats
+        }
+        BackfillMode::None => {
+            prime_claude_state(path, &input, &mut state);
+            ImportStats::default()
+        }
+    };
+    let offset = fs::metadata(path)?.len();
+    Ok((
+        ClaudeWatcher {
+            path: path.to_path_buf(),
+            offset,
+            state,
+            pending: String::new(),
+        },
+        stats,
+    ))
 }
 
 fn active_codex_session_paths(
@@ -3374,6 +3779,46 @@ fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {
     }
 
     Err(CliError::Http(response))
+}
+
+fn fetch_server_events(server: &str) -> Result<Vec<AgentEvent>, CliError> {
+    let body = get_json_body(server, "/api/events")?;
+    let value = serde_json::from_str::<Value>(&body)?;
+    let Some(events) = value.get("events").and_then(Value::as_array) else {
+        return Err(CliError::Http(
+            "local server /api/events response did not contain events".to_string(),
+        ));
+    };
+    events
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<AgentEvent>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(CliError::from)
+}
+
+fn get_json_body(server: &str, path: &str) -> Result<String, CliError> {
+    let addr = server
+        .parse()
+        .map_err(|err| CliError::Http(format!("invalid server address: {err}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(700))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {server}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
+    )?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    if !(response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2")) {
+        return Err(CliError::Http(response));
+    }
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .ok_or_else(|| CliError::Http("http response missing body separator".to_string()))
 }
 
 struct GithubLoginOptions<'a> {
