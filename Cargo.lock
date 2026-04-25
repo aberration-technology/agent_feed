@@ -1353,6 +1353,9 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.17"
+dependencies = [
+ "agent_feed_p2p_proto",
+]
 
 [[package]]
 name = "zmij"

@@ -9,3 +9,6 @@ publish = false
 
 [lints]
 workspace = true
+
+[dependencies]
+agent_feed_p2p_proto = { workspace = true }

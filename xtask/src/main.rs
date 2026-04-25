@@ -111,10 +111,11 @@ fn build_browser_site(args: Vec<String>) -> Result<()> {
     fs::write(
         out_dir.join("feed-config.json"),
         format!(
-            "{{\n  \"edge_base_url\": {},\n  \"site_base_url\": {},\n  \"network_id\": {}\n}}\n",
+            "{{\n  \"edge_base_url\": {},\n  \"site_base_url\": {},\n  \"network_id\": {},\n  \"compatibility\": {}\n}}\n",
             js_string(&edge_url),
             js_string(&site_base_url),
-            js_string(&network_id)
+            js_string(&network_id),
+            compatibility_js()
         ),
     )
     .map_err(XtaskError::Io)?;
@@ -147,11 +148,12 @@ fn render_browser_shell(
     let favicon = fs::read_to_string(ui_dir.join("favicon.svg")).map_err(XtaskError::Io)?;
     let revision = current_git_commit(root);
     let config = format!(
-        "window.FEED_P2P_ENABLED = true;\nwindow.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.FEED_BUILD_REV = {};\nwindow.AGENT_FEED_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
+        "window.FEED_P2P_ENABLED = true;\nwindow.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.FEED_BUILD_REV = {};\nwindow.FEED_COMPATIBILITY = {};\nwindow.AGENT_FEED_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
         js_string(edge_url),
         js_string(site_base_url),
         js_string(network_id),
         js_string(&revision),
+        compatibility_js(),
     );
     let rendered = index
         .replace("/*__REEL_CSS__*/", &css)
@@ -163,6 +165,17 @@ fn render_browser_shell(
             &format!("<script>\n{config}\n    </script>\n    <script type=\"module\">"),
         );
     Ok((rendered, favicon))
+}
+
+fn compatibility_js() -> String {
+    format!(
+        "{{\"product\":{},\"release_version\":{},\"protocol_version\":{},\"model_version\":{},\"min_model_version\":{}}}",
+        js_string(agent_feed_p2p_proto::AGENT_FEED_PRODUCT),
+        js_string(agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION),
+        agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
+        agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
+        agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION
+    )
 }
 
 fn current_git_commit(root: &Path) -> String {
