@@ -1050,8 +1050,20 @@ async fn browser_seed(State(state): State<Arc<HttpState>>) -> impl IntoResponse 
 }
 
 async fn network_snapshot(State(state): State<Arc<HttpState>>) -> Json<serde_json::Value> {
+    let feeds = match state.directory.lock() {
+        Ok(directory) => directory
+            .visible_public_entries()
+            .iter()
+            .map(|feed| resolve_feed_view(feed, &state.config))
+            .collect(),
+        Err(_) => {
+            tracing::warn!("network snapshot directory lock poisoned");
+            Vec::new()
+        }
+    };
     Json(network_snapshot_value(
         &state.config,
+        feeds,
         state.snapshot.headlines(),
     ))
 }
@@ -1190,6 +1202,7 @@ async fn network_publish(
 
 fn network_snapshot_value(
     config: &EdgeConfig,
+    feeds: Vec<ResolveFeedView>,
     headlines: Vec<RemoteHeadlineView>,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -1203,7 +1216,7 @@ fn network_snapshot_value(
         "feed_mode": "discovery",
         "story_only": true,
         "raw_events": false,
-        "feeds": [],
+        "feeds": feeds,
         "headlines": headlines,
     })
 }
@@ -1804,13 +1817,29 @@ mod tests {
 
     #[test]
     fn network_snapshot_supports_global_discovery_shape() {
-        let snapshot = network_snapshot_value(&config(), Vec::new());
+        let snapshot = network_snapshot_value(
+            &config(),
+            vec![ResolveFeedView {
+                feed_id: "github:123:workstation".to_string(),
+                label: "workstation".to_string(),
+                compatibility: ProtocolCompatibility::current(),
+                visibility: "public".to_string(),
+                publisher_login: "mosure".to_string(),
+                publisher_display_name: Some("mosure".to_string()),
+                publisher_avatar: Some("/avatar/github/123".to_string()),
+                publisher_verified: true,
+                last_seen_at: OffsetDateTime::UNIX_EPOCH,
+            }],
+            Vec::new(),
+        );
 
         assert_eq!(snapshot["state"], "ready");
         assert_eq!(snapshot["feed_mode"], "discovery");
         assert_eq!(snapshot["story_only"], true);
         assert_eq!(snapshot["raw_events"], false);
         assert!(snapshot["feeds"].as_array().is_some());
+        assert_eq!(snapshot["feeds"][0]["label"], "workstation");
+        assert_eq!(snapshot["feeds"][0]["publisher_login"], "mosure");
         assert!(snapshot["headlines"].as_array().is_some());
         assert_eq!(snapshot["compatibility"]["protocol_version"], 1);
     }
@@ -1855,7 +1884,7 @@ mod tests {
 
         store.push(headline.clone());
         store.push(headline);
-        let snapshot = network_snapshot_value(&config(), store.headlines());
+        let snapshot = network_snapshot_value(&config(), Vec::new(), store.headlines());
 
         assert_eq!(
             snapshot["headlines"].as_array().expect("headlines").len(),

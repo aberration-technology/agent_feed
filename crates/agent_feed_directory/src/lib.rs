@@ -962,6 +962,15 @@ impl DirectoryStore {
     }
 
     #[must_use]
+    pub fn visible_public_entries(&self) -> Vec<FeedDirectoryEntry> {
+        self.entries
+            .values()
+            .filter(|entry| entry.is_publicly_visible())
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
     pub fn logical_feeds_for_github_user(
         &self,
         github_user_id: GithubUserId,
