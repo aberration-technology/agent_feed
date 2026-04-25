@@ -9,9 +9,9 @@ use agent_feed_identity_github::{
     GithubUserResponse, StaticGithubResolver,
 };
 use agent_feed_p2p_proto::{
-    ProtocolCompatibility, Signature, Signed, StoryCapsule, github_org_provider_key,
-    github_org_topic, github_provider_key, github_team_provider_key, github_team_topic,
-    github_user_topic,
+    ProtocolCompatibility, PublisherIdentity, Signature, Signed, StoryCapsule,
+    github_org_provider_key, github_org_topic, github_provider_key, github_team_provider_key,
+    github_team_topic, github_user_topic,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -333,6 +333,8 @@ pub struct ResolveFeedView {
     pub label: String,
     pub compatibility: ProtocolCompatibility,
     pub visibility: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher_github_user_id: Option<u64>,
     pub publisher_login: String,
     pub publisher_display_name: Option<String>,
     pub publisher_avatar: Option<String>,
@@ -435,6 +437,7 @@ fn resolve_feed_view(
         label: feed.feed_label.clone(),
         compatibility: feed.compatibility.clone(),
         visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
+        publisher_github_user_id: Some(feed.owner.github_user_id.get()),
         publisher_login: feed.owner.current_login.clone(),
         publisher_display_name: feed.owner.display_name.clone(),
         publisher_avatar: Some(config.github_avatar_url(feed.owner.github_user_id.get())),
@@ -457,6 +460,7 @@ fn feed_views_from_headlines(headlines: Vec<RemoteHeadlineView>) -> Vec<ResolveF
             label: headline.feed_label,
             compatibility: headline.compatibility,
             visibility: "public".to_string(),
+            publisher_github_user_id: headline.publisher_github_user_id,
             publisher_login: headline.publisher_login,
             publisher_display_name: headline.publisher_display_name,
             publisher_avatar: headline.publisher_avatar,
@@ -599,8 +603,24 @@ struct HttpState {
 
 #[derive(Clone, Default)]
 struct SnapshotStore {
+    feeds: Arc<Mutex<VecDeque<ResolveFeedView>>>,
     headlines: Arc<Mutex<VecDeque<RemoteHeadlineView>>>,
     path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    #[serde(default)]
+    feeds: Vec<ResolveFeedView>,
+    #[serde(default)]
+    headlines: Vec<RemoteHeadlineView>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum PersistedSnapshotDisk {
+    Current(PersistedSnapshot),
+    LegacyHeadlines(Vec<RemoteHeadlineView>),
 }
 
 impl SnapshotStore {
@@ -614,18 +634,47 @@ impl SnapshotStore {
     }
 
     fn from_path(path: PathBuf) -> Self {
-        let headlines = fs::read_to_string(&path)
+        let persisted = fs::read_to_string(&path)
             .ok()
-            .and_then(|input| serde_json::from_str::<Vec<RemoteHeadlineView>>(&input).ok())
-            .map(VecDeque::from)
+            .and_then(|input| serde_json::from_str::<PersistedSnapshotDisk>(&input).ok())
+            .map(|disk| match disk {
+                PersistedSnapshotDisk::Current(snapshot) => snapshot,
+                PersistedSnapshotDisk::LegacyHeadlines(headlines) => PersistedSnapshot {
+                    feeds: feed_views_from_headlines(headlines.clone()),
+                    headlines,
+                },
+            })
             .unwrap_or_default();
         Self {
-            headlines: Arc::new(Mutex::new(headlines)),
+            feeds: Arc::new(Mutex::new(VecDeque::from(persisted.feeds))),
+            headlines: Arc::new(Mutex::new(VecDeque::from(persisted.headlines))),
             path: Some(path),
         }
     }
 
+    fn upsert_feed(&self, feed: ResolveFeedView) {
+        let feeds = {
+            let Ok(mut feeds) = self.feeds.lock() else {
+                tracing::warn!("network snapshot feed store lock poisoned");
+                return;
+            };
+            upsert_feed_view(&mut feeds, feed);
+            while feeds.len() > SNAPSHOT_HEADLINE_LIMIT {
+                feeds.pop_front();
+            }
+            feeds.iter().cloned().collect()
+        };
+        let headlines = self.headlines();
+        self.persist_snapshot(feeds, headlines);
+    }
+
     fn push(&self, headline: RemoteHeadlineView) {
+        if let Some(feed) = feed_views_from_headlines(vec![headline.clone()])
+            .into_iter()
+            .next()
+        {
+            self.upsert_feed(feed);
+        }
         let Ok(mut headlines) = self.headlines.lock() else {
             tracing::warn!("network snapshot headline store lock poisoned");
             return;
@@ -641,7 +690,12 @@ impl SnapshotStore {
         while headlines.len() > SNAPSHOT_HEADLINE_LIMIT {
             headlines.pop_front();
         }
-        self.persist_locked(&headlines);
+        let feeds = self
+            .feeds
+            .lock()
+            .map(|feeds| feeds.iter().cloned().collect())
+            .unwrap_or_default();
+        self.persist_snapshot(feeds, headlines.iter().cloned().collect());
     }
 
     fn headlines(&self) -> Vec<RemoteHeadlineView> {
@@ -652,10 +706,16 @@ impl SnapshotStore {
     }
 
     fn feeds(&self) -> Vec<ResolveFeedView> {
-        feed_views_from_headlines(self.headlines())
+        let mut feeds = self
+            .feeds
+            .lock()
+            .map(|feeds| feeds.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        merge_resolve_feed_views(&mut feeds, feed_views_from_headlines(self.headlines()));
+        feeds
     }
 
-    fn persist_locked(&self, headlines: &VecDeque<RemoteHeadlineView>) {
+    fn persist_snapshot(&self, feeds: Vec<ResolveFeedView>, headlines: Vec<RemoteHeadlineView>) {
         let Some(path) = &self.path else {
             return;
         };
@@ -666,7 +726,7 @@ impl SnapshotStore {
             return;
         }
         let tmp = path.with_extension("json.tmp");
-        let payload: Vec<_> = headlines.iter().cloned().collect();
+        let payload = PersistedSnapshot { feeds, headlines };
         match serde_json::to_vec_pretty(&payload)
             .map_err(std::io::Error::other)
             .and_then(|bytes| fs::write(&tmp, bytes))
@@ -679,6 +739,17 @@ impl SnapshotStore {
             }
         }
     }
+}
+
+fn upsert_feed_view(feeds: &mut VecDeque<ResolveFeedView>, feed: ResolveFeedView) {
+    if let Some(existing) = feeds
+        .iter_mut()
+        .find(|existing| existing.feed_id == feed.feed_id)
+    {
+        *existing = feed;
+        return;
+    }
+    feeds.push_back(feed);
 }
 
 pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> {
@@ -1013,6 +1084,19 @@ async fn resolve_github(
     );
     match resolver.resolve_github_user(&route) {
         Ok(ticket) => {
+            let feeds = state
+                .snapshot
+                .feeds()
+                .into_iter()
+                .filter(|feed| {
+                    feed_matches_github_route(
+                        feed,
+                        ticket.resolved_github_id.get(),
+                        ticket.profile.login.as_str(),
+                        &route,
+                    )
+                })
+                .collect::<Vec<_>>();
             let headlines = state
                 .snapshot
                 .headlines()
@@ -1026,12 +1110,10 @@ async fn resolve_github(
                     )
                 })
                 .collect();
-            Json(ResolveGithubResponse::from_ticket_and_headlines(
-                &ticket,
-                &state.config,
-                headlines,
-            ))
-            .into_response()
+            let mut response =
+                ResolveGithubResponse::from_ticket_and_headlines(&ticket, &state.config, headlines);
+            merge_resolve_feed_views(&mut response.feeds, feeds);
+            Json(response).into_response()
         }
         Err(EdgeError::Github(GithubResolveError::NotFound(_))) => {
             edge_error(StatusCode::NOT_FOUND, "github user not found")
@@ -1148,6 +1230,10 @@ struct NetworkPublishRequest {
     #[serde(default)]
     feed_name: Option<String>,
     #[serde(default)]
+    feed_id: Option<String>,
+    #[serde(default)]
+    publisher: Option<PublisherIdentity>,
+    #[serde(default)]
     capsules: Vec<Signed<StoryCapsule>>,
 }
 
@@ -1156,6 +1242,7 @@ struct NetworkPublishResponse {
     state: &'static str,
     compatibility: ProtocolCompatibility,
     accepted: usize,
+    feeds: usize,
     headlines: usize,
 }
 
@@ -1167,6 +1254,14 @@ async fn network_publish(
     let Some(bearer) = verify_bearer_session(&headers) else {
         return edge_error(StatusCode::UNAUTHORIZED, "github session required");
     };
+    network_publish_verified(state, bearer, request).await
+}
+
+async fn network_publish_verified(
+    state: Arc<HttpState>,
+    bearer: VerifiedBearer,
+    request: NetworkPublishRequest,
+) -> axum::response::Response {
     let session = bearer.session;
     let Some(network_id) = request.network_id.as_deref() else {
         return edge_error(
@@ -1186,11 +1281,36 @@ async fn network_publish(
     if let Err(err) = ensure_current_compatibility(compatibility) {
         return edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string());
     }
+    let feed_name = request
+        .feed_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("workstation");
+    let feed_id = request
+        .feed_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("local:{feed_name}"));
+    if let Some(publisher) = request.publisher.as_ref() {
+        if publisher.github_user_id != Some(session.github_user_id) || !publisher.verified {
+            return edge_error(StatusCode::FORBIDDEN, "publisher identity mismatch");
+        }
+        state.snapshot.upsert_feed(feed_view_from_publish(
+            &feed_id,
+            feed_name,
+            compatibility,
+            publisher,
+        ));
+    }
     if request.capsules.is_empty() {
         return Json(NetworkPublishResponse {
             state: "accepted",
             compatibility: ProtocolCompatibility::current(),
             accepted: 0,
+            feeds: state.snapshot.feeds().len(),
             headlines: state.snapshot.headlines().len(),
         })
         .into_response();
@@ -1201,13 +1321,6 @@ async fn network_publish(
             format!("publish batch exceeds {MAX_PUBLISH_CAPSULES} capsules"),
         );
     }
-
-    let feed_name = request
-        .feed_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("workstation");
     let mut accepted = 0usize;
     for capsule in request.capsules {
         if let Err(err) = ensure_current_compatibility(&capsule.value.compatibility) {
@@ -1260,9 +1373,38 @@ async fn network_publish(
         state: "accepted",
         compatibility: ProtocolCompatibility::current(),
         accepted,
+        feeds: state.snapshot.feeds().len(),
         headlines: state.snapshot.headlines().len(),
     })
     .into_response()
+}
+
+fn feed_view_from_publish(
+    feed_id: &str,
+    feed_name: &str,
+    compatibility: &ProtocolCompatibility,
+    publisher: &PublisherIdentity,
+) -> ResolveFeedView {
+    let publisher_login =
+        publisher
+            .github_login
+            .clone()
+            .unwrap_or_else(|| match publisher.github_user_id {
+                Some(id) => format!("github:{id}"),
+                None => "verified-peer".to_string(),
+            });
+    ResolveFeedView {
+        feed_id: feed_id.to_string(),
+        label: feed_name.to_string(),
+        compatibility: compatibility.clone(),
+        visibility: "public".to_string(),
+        publisher_github_user_id: publisher.github_user_id,
+        publisher_login,
+        publisher_display_name: publisher.display_name.clone(),
+        publisher_avatar: publisher.avatar.clone(),
+        publisher_verified: publisher.verified,
+        last_seen_at: OffsetDateTime::now_utc(),
+    }
 }
 
 fn headline_matches_github_route(
@@ -1275,6 +1417,17 @@ fn headline_matches_github_route(
         || (headline.publisher_github_user_id.is_none()
             && headline.publisher_login.eq_ignore_ascii_case(github_login));
     identity_matches && route.stream_filter.permits_label(&headline.feed_label)
+}
+
+fn feed_matches_github_route(
+    feed: &ResolveFeedView,
+    github_user_id: u64,
+    github_login: &str,
+    route: &RemoteUserRoute,
+) -> bool {
+    let identity_matches = feed.publisher_github_user_id == Some(github_user_id)
+        || feed.publisher_login.eq_ignore_ascii_case(github_login);
+    identity_matches && route.stream_filter.permits_label(&feed.label)
 }
 
 fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serde_json::Value {
@@ -2044,6 +2197,87 @@ mod tests {
         assert_eq!(
             snapshot["headlines"][0]["headline"],
             serde_json::json!("codex finished release pass")
+        );
+        assert_eq!(
+            snapshot["feeds"][0]["publisher_login"],
+            serde_json::json!("mosure")
+        );
+    }
+
+    #[test]
+    fn network_snapshot_store_exposes_feed_presence_before_headline() {
+        let store = SnapshotStore::default();
+        store.upsert_feed(ResolveFeedView {
+            feed_id: "local:workstation".to_string(),
+            label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            publisher_verified: true,
+            last_seen_at: OffsetDateTime::now_utc(),
+        });
+
+        let snapshot = network_snapshot_value(&config(), &store);
+
+        assert_eq!(
+            snapshot["headlines"].as_array().expect("headlines").len(),
+            0
+        );
+        assert_eq!(snapshot["feeds"].as_array().expect("feeds").len(), 1);
+        assert_eq!(
+            snapshot["feeds"][0]["publisher_github_user_id"],
+            serde_json::json!(123)
+        );
+        assert_eq!(
+            snapshot["feeds"][0]["publisher_login"],
+            serde_json::json!("mosure")
+        );
+    }
+
+    #[tokio::test]
+    async fn network_publish_presence_registers_verified_feed_without_headline() {
+        let state = Arc::new(HttpState {
+            config: config(),
+            snapshot: SnapshotStore::default(),
+        });
+        let request = NetworkPublishRequest {
+            network_id: Some("agent-feed-mainnet".to_string()),
+            compatibility: Some(ProtocolCompatibility::current()),
+            feed_name: Some("workstation".to_string()),
+            feed_id: Some("github:123:workstation".to_string()),
+            publisher: Some(PublisherIdentity::github(
+                123,
+                "mosure",
+                Some("mosure".to_string()),
+                Some("/avatar/github/123".to_string()),
+            )),
+            capsules: Vec::new(),
+        };
+        let response = network_publish_verified(
+            state.clone(),
+            VerifiedBearer {
+                session: VerifiedSession {
+                    github_user_id: 123,
+                },
+                token: "test-session-token".to_string(),
+            },
+            request,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = network_snapshot_value(&state.config, &state.snapshot);
+        assert_eq!(
+            snapshot["headlines"].as_array().expect("headlines").len(),
+            0
+        );
+        assert_eq!(snapshot["feeds"].as_array().expect("feeds").len(), 1);
+        assert_eq!(
+            snapshot["feeds"][0]["feed_id"],
+            serde_json::json!("github:123:workstation")
         );
         assert_eq!(
             snapshot["feeds"][0]["publisher_login"],

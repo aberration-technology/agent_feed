@@ -525,10 +525,45 @@ async function hydrate() {
     }
     applySnapshot(await response.json());
     logInfo("feed.snapshot.applied", { bulletins: bulletins.length });
+    await hydrateStatus();
   } catch (error) {
     setText(liveState, "wait");
     stopStageProgress();
     logError("snapshot hydration failed", error);
+  }
+}
+
+async function hydrateStatus() {
+  try {
+    const response = await fetch("/api/status", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`status failed: ${response.status}`);
+    }
+    const status = await response.json();
+    logInfo("feed.status.applied", {
+      captured_sources: status.captured_sources?.length || 0,
+      stored_events: status.stored_events,
+      stored_bulletins: status.stored_bulletins,
+      last_event_kind: status.last_event_kind,
+    });
+    if (bulletins.length) {
+      return;
+    }
+    const captures = status.captured_sources || [];
+    if (captures.length) {
+      setText(liveState, "capture");
+      setText(sourceCount, `${captures.length} ${captures.length === 1 ? "capture" : "captures"}`);
+      setText(eyebrow, "local feed / capture live");
+      setText(headline, "waiting for settled story");
+      const last = status.last_event_kind ? `last event ${status.last_event_kind}` : "future transcript events are being watched";
+      setText(deck, `${last}. headlines publish after completion, test, file-change, or incident signals.`);
+      renderChips(["capture live", "future-only", "redacted"]);
+      renderTicker(captures.map((capture) => `${capture.agent} ${capture.adapter}`));
+    } else {
+      setText(sourceCount, "0 captures");
+    }
+  } catch (error) {
+    logError("status hydration failed", error);
   }
 }
 
@@ -1475,7 +1510,7 @@ async function startFollowingRoute(route) {
     "connected · waiting for first story",
     "move mouse for controls",
   ]);
-  setText(sourceCount, `${targets.length} src`);
+  setText(sourceCount, `${targets.length} following`);
 }
 
 async function fetchFollowingTarget(route, target) {
@@ -1891,7 +1926,7 @@ function renderFollowingTimeline(route, targets, results) {
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "follow");
-  setText(sourceCount, `${targets.length} src`);
+  setText(sourceCount, `${targets.length} following`);
   timeline.replaceChildren();
 
   const toolbar = document.createElement("div");
@@ -2183,7 +2218,11 @@ function updateSourceCount() {
       sources.add(label);
     }
   }
-  setText(sourceCount, `${sources.size} src`);
+  if (sources.size > 0) {
+    setText(sourceCount, `${sources.size} ${sources.size === 1 ? "story source" : "story sources"}`);
+  } else {
+    setText(sourceCount, "0 stories");
+  }
 }
 
 updateClock();
@@ -2197,4 +2236,5 @@ if (githubAuthCallback) {
 } else {
   hydrate();
   connectSse();
+  window.setInterval(hydrateStatus, 5000);
 }

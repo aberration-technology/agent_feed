@@ -11,7 +11,7 @@ use agent_feed_story::StoryCompiler;
 use agent_feed_ui::UiConfig;
 use agent_feed_views::{
     AdaptersView, AgentsView, BulletinsView, EventsView, HealthView, IngestView, SessionsView,
-    SseBulletin,
+    SseBulletin, StatusView,
 };
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -22,7 +22,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -128,6 +128,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         .route("/api/sessions", get(sessions))
         .route("/api/adapters", get(adapters))
         .route("/api/health", get(health))
+        .route("/api/status", get(status))
         .route("/ingest/codex/jsonl", post(ingest_codex))
         .route("/ingest/codex/hook", post(ingest_codex))
         .route("/ingest/claude/stream-json", post(ingest_claude))
@@ -357,6 +358,98 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthView> {
         emitted_bulletins: metrics.emitted_bulletins,
         dropped_events: metrics.dropped_events,
     })
+}
+
+async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, AppError> {
+    let metrics = state.metrics.snapshot();
+    let events = state
+        .store
+        .lock()
+        .map_err(|_| AppError::StatePoisoned)?
+        .events();
+    let snapshot = state
+        .reel
+        .lock()
+        .map_err(|_| AppError::StatePoisoned)?
+        .snapshot();
+    let mut sources = BTreeMap::<(String, String, String), SourceStatus>::new();
+    for event in &events {
+        let key = (
+            event.source.as_str().to_string(),
+            event.agent.clone(),
+            event.adapter.clone(),
+        );
+        let occurred_at = event.occurred_at.unwrap_or(event.received_at);
+        sources
+            .entry(key)
+            .and_modify(|status| status.observe(event, occurred_at))
+            .or_insert_with(|| SourceStatus::new(event, occurred_at));
+    }
+    let last_event = events
+        .iter()
+        .max_by_key(|event| event.occurred_at.unwrap_or(event.received_at));
+    let captured_sources = sources
+        .into_iter()
+        .map(
+            |((source, agent, adapter), status)| agent_feed_views::CapturedSourceView {
+                source,
+                agent,
+                adapter,
+                events: status.events,
+                sessions: status.sessions.len(),
+                last_event_kind: status.last_event_kind,
+                last_event_at: status.last_event_at,
+            },
+        )
+        .collect();
+    Ok(Json(StatusView {
+        status: "ok",
+        bind: state.bind.to_string(),
+        p2p_enabled: state.p2p_enabled,
+        ingested_events: metrics.ingested_events,
+        emitted_bulletins: metrics.emitted_bulletins,
+        dropped_events: metrics.dropped_events,
+        stored_events: events.len(),
+        stored_bulletins: snapshot.bulletins.len(),
+        captured_sources,
+        last_event_kind: last_event.map(|event| event.kind.as_str().to_string()),
+        last_event_at: last_event.map(|event| event.occurred_at.unwrap_or(event.received_at)),
+        last_bulletin_at: snapshot.active.map(|bulletin| bulletin.created_at),
+    }))
+}
+
+#[derive(Debug)]
+struct SourceStatus {
+    events: usize,
+    sessions: BTreeSet<String>,
+    last_event_kind: String,
+    last_event_at: time::OffsetDateTime,
+}
+
+impl SourceStatus {
+    fn new(event: &AgentEvent, occurred_at: time::OffsetDateTime) -> Self {
+        let mut sessions = BTreeSet::new();
+        if let Some(session_id) = &event.session_id {
+            sessions.insert(session_id.clone());
+        }
+        Self {
+            events: 1,
+            sessions,
+            last_event_kind: event.kind.as_str().to_string(),
+            last_event_at: occurred_at,
+        }
+    }
+
+    fn observe(&mut self, event: &AgentEvent, occurred_at: time::OffsetDateTime) {
+        self.events += 1;
+        if let Some(session_id) = &event.session_id {
+            self.sessions.insert(session_id.clone());
+        }
+        if occurred_at >= self.last_event_at {
+            self.last_event_kind = event.kind.as_str().to_string();
+            self.last_event_at = occurred_at;
+        }
+    }
 }
 
 async fn ingest_generic(
@@ -664,5 +757,31 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::TurnComplete);
         assert_eq!(events[0].adapter, "codex.exec-json");
+    }
+
+    #[tokio::test]
+    async fn status_reports_capture_health_without_story() {
+        let state = test_state();
+        let mut event = AgentEvent::new(
+            SourceKind::Codex,
+            EventKind::AdapterHealth,
+            "codex capture active",
+        );
+        event.agent = "codex".to_string();
+        event.adapter = "codex.transcript".to_string();
+        event.session_id = Some("session-1".to_string());
+        event.score_hint = Some(5);
+
+        let _ = ingest_event(state.clone(), event)
+            .await
+            .expect("event ingests");
+        let Json(view) = status(State(state)).await.expect("status renders");
+
+        assert_eq!(view.stored_events, 1);
+        assert_eq!(view.stored_bulletins, 0);
+        assert_eq!(view.captured_sources.len(), 1);
+        assert_eq!(view.captured_sources[0].agent, "codex");
+        assert_eq!(view.captured_sources[0].sessions, 1);
+        assert_eq!(view.last_event_kind.as_deref(), Some("adapter.health"));
     }
 }

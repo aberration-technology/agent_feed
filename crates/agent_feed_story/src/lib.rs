@@ -445,6 +445,7 @@ fn is_never_publish_event(event: &AgentEvent) -> bool {
             | EventKind::McpCall
             | EventKind::WebSearch
             | EventKind::AgentMessage
+            | EventKind::AdapterHealth
     )
 }
 

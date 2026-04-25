@@ -12,6 +12,36 @@ pub struct HealthView {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct StatusView {
+    pub status: &'static str,
+    pub bind: String,
+    pub p2p_enabled: bool,
+    pub ingested_events: u64,
+    pub emitted_bulletins: u64,
+    pub dropped_events: u64,
+    pub stored_events: usize,
+    pub stored_bulletins: usize,
+    pub captured_sources: Vec<CapturedSourceView>,
+    pub last_event_kind: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_event_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_bulletin_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CapturedSourceView {
+    pub source: String,
+    pub agent: String,
+    pub adapter: String,
+    pub events: usize,
+    pub sessions: usize,
+    pub last_event_kind: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_event_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct AgentsView {
     pub agents: Vec<String>,
 }

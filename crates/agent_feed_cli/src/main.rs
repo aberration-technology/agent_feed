@@ -112,7 +112,7 @@ enum Commands {
         publish_interval_secs: u64,
         #[arg(long, default_value = "codex,claude")]
         agents: String,
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 12)]
         sessions: usize,
         #[arg(
             long,
@@ -1725,6 +1725,8 @@ fn run_serve_publisher(config: ServePublishConfig) {
     let mut recent = VecDeque::<RecentSummary>::new();
     let mut next_seq = 1u64;
     let mut last_publish = Instant::now();
+    let mut last_flush = Instant::now();
+    let mut last_presence = Instant::now() - Duration::from_secs(60);
 
     loop {
         match config.receiver.recv_timeout(Duration::from_millis(500)) {
@@ -1748,6 +1750,34 @@ fn run_serve_publisher(config: ServePublishConfig) {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 warn!("p2p publisher event channel disconnected");
                 return;
+            }
+        }
+
+        if last_presence.elapsed() >= Duration::from_secs(60) {
+            match publish_feed_presence(&config) {
+                Ok(()) => {
+                    last_presence = Instant::now();
+                    info!(feed_name = %config.feed, "p2p feed presence registered");
+                }
+                Err(err) => {
+                    warn!(
+                        feed_name = %config.feed,
+                        error = %err,
+                        "p2p feed presence registration failed"
+                    );
+                }
+            }
+        }
+
+        if last_flush.elapsed() >= config.publish_interval {
+            let flushed = compiler.flush();
+            last_flush = Instant::now();
+            if !flushed.is_empty() {
+                info!(
+                    stories = flushed.len(),
+                    "p2p publisher flushed settled story windows"
+                );
+                pending.extend(flushed);
             }
         }
 
@@ -1790,13 +1820,33 @@ fn run_serve_publisher(config: ServePublishConfig) {
     }
 }
 
+fn publish_feed_presence(config: &ServePublishConfig) -> Result<(), CliError> {
+    let feed_id = publish_feed_id(config);
+    let body = serde_json::to_string(&json!({
+        "network_id": config.network_id,
+        "compatibility": ProtocolCompatibility::current(),
+        "feed_id": feed_id,
+        "feed_name": config.feed,
+        "publisher": config.publisher,
+        "capsules": [],
+    }))?;
+    let response =
+        post_edge_json_with_bearer(&config.edge, "/network/publish", &body, &config.session)?;
+    debug!(
+        feed_name = %config.feed,
+        response = %response.trim(),
+        "p2p feed presence sent to edge"
+    );
+    Ok(())
+}
+
 fn publish_story_batch(
     config: &ServePublishConfig,
     stories: &[CompiledStory],
     recent: &mut VecDeque<RecentSummary>,
     next_seq: &mut u64,
 ) -> Result<usize, CliError> {
-    let feed_id = format!("local:{}", config.feed);
+    let feed_id = publish_feed_id(config);
     let recent_summaries = recent.iter().cloned().collect::<Vec<_>>();
     let summaries =
         summarize_feed_with_recent(&feed_id, stories, &config.summary_config, &recent_summaries)?;
@@ -1807,8 +1857,8 @@ fn publish_story_batch(
         recent.pop_back();
     }
 
-    let capsules = signed_capsules_from_summaries(
-        &config.feed,
+    let capsules = signed_capsules_from_summaries_with_feed_id(
+        &feed_id,
         &summaries,
         Some(&config.publisher),
         config.session.session_token.as_deref(),
@@ -1829,7 +1879,9 @@ fn publish_story_batch(
     let body = serde_json::to_string(&json!({
         "network_id": config.network_id,
         "compatibility": ProtocolCompatibility::current(),
+        "feed_id": feed_id,
         "feed_name": config.feed,
+        "publisher": config.publisher,
         "capsules": capsules,
     }))?;
     let response =
@@ -1842,6 +1894,17 @@ fn publish_story_batch(
         "p2p publish sent to edge"
     );
     Ok(capsules.len())
+}
+
+fn local_feed_id(feed: &str) -> String {
+    format!("local:{feed}")
+}
+
+fn publish_feed_id(config: &ServePublishConfig) -> String {
+    match config.publisher.github_user_id {
+        Some(github_user_id) => format!("github:{github_user_id}:{}", config.feed),
+        None => local_feed_id(&config.feed),
+    }
 }
 
 fn capture_scope_message(workspace: Option<&WorkspaceFilter>) -> String {
@@ -2345,7 +2408,7 @@ mod tests {
         };
 
         assert_eq!(agents, "codex,claude");
-        assert_eq!(sessions, 4);
+        assert_eq!(sessions, 12);
         assert!(!no_agent_capture);
         assert_eq!(workspace, Some(PathBuf::from(".")));
         assert!(!all_workspaces);
@@ -2681,6 +2744,129 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
+
+    #[test]
+    fn active_codex_sessions_fall_back_to_session_mtime_without_history() {
+        let root = temp_test_root("active-codex-mtime");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let first = sessions.join("first-session.jsonl");
+        let second = sessions.join("second-session.jsonl");
+        write_jsonl(
+            &first,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "first-session", "cwd": root}
+            })],
+        );
+        write_jsonl(
+            &second,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:50.696Z",
+                "payload": {"id": "second-session", "cwd": root}
+            })],
+        );
+
+        let paths =
+            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 2, None)
+                .expect("active sessions resolve from session files");
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&first));
+        assert!(paths.contains(&second));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn active_codex_sessions_skip_agent_feed_internal_summarizer_sessions() {
+        let root = temp_test_root("active-codex-internal");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let internal = sessions.join("internal-summary.jsonl");
+        let real = sessions.join("real-coding-session.jsonl");
+        write_jsonl(
+            &internal,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "internal-summary", "cwd": root}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:16:50.000Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "You are the private local headline memory for one agent feed. summary_memory_key=feed:test"
+                    }
+                }),
+            ],
+        );
+        write_jsonl(
+            &real,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:51.696Z",
+                "payload": {"id": "real-coding-session", "cwd": root}
+            })],
+        );
+
+        let paths =
+            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 4, None)
+                .expect("active sessions resolve");
+
+        assert_eq!(paths, vec![real]);
+        assert!(
+            collect_codex_events(&internal, None)
+                .expect("internal collection succeeds")
+                .events
+                .is_empty()
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn active_claude_sessions_skip_agent_feed_internal_summarizer_sessions() {
+        let root = temp_test_root("active-claude-internal");
+        let projects = root.join("projects");
+        fs::create_dir_all(&projects).expect("projects dir");
+        let internal = projects.join("internal-summary.jsonl");
+        let real = projects.join("real-coding-session.jsonl");
+        write_jsonl(
+            &internal,
+            [json!({
+                "type": "user",
+                "message": {
+                    "content": "Return one JSON object with headline, deck, lower_third, chips. Use only the redacted story facts below."
+                }
+            })],
+        );
+        write_jsonl(
+            &real,
+            [json!({
+                "type": "system",
+                "session_id": "real-claude-session",
+                "cwd": root
+            })],
+        );
+
+        let paths =
+            active_claude_session_paths(&projects, 4, None).expect("active sessions resolve");
+
+        assert_eq!(paths, vec![real]);
+        assert!(
+            collect_claude_events(&internal, None)
+                .expect("internal collection succeeds")
+                .events
+                .is_empty()
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
 }
 
 fn endpoint_for_source(source: &str) -> &'static str {
@@ -2742,6 +2928,13 @@ fn import_codex_sessions(
     let mut total = ImportStats::default();
     for path in paths {
         let input = fs::read_to_string(path)?;
+        if is_agent_feed_internal_transcript(&input) {
+            debug!(
+                path = %path.display(),
+                "codex transcript import skipped agent-feed internal processor session"
+            );
+            continue;
+        }
         let mut state = TranscriptState::default();
         let file_stats = import_codex_chunk(server, path, &input, &mut state, workspace, None);
         total.add(file_stats);
@@ -2861,6 +3054,13 @@ fn collect_codex_events(
     workspace: Option<&WorkspaceFilter>,
 ) -> Result<CollectedEvents, CliError> {
     let input = fs::read_to_string(path)?;
+    if is_agent_feed_internal_transcript(&input) {
+        debug!(
+            path = %path.display(),
+            "codex transcript collection skipped agent-feed internal processor session"
+        );
+        return Ok(CollectedEvents::default());
+    }
     let mut state = TranscriptState::default();
     let mut collected = CollectedEvents::default();
     for (index, line) in input
@@ -2902,6 +3102,13 @@ fn collect_claude_events(
     workspace: Option<&WorkspaceFilter>,
 ) -> Result<CollectedEvents, CliError> {
     let input = fs::read_to_string(path)?;
+    if is_agent_feed_internal_transcript(&input) {
+        debug!(
+            path = %path.display(),
+            "claude stream collection skipped agent-feed internal processor session"
+        );
+        return Ok(CollectedEvents::default());
+    }
     let mut state = ClaudeState::default();
     let mut collected = CollectedEvents::default();
     for (index, line) in input
@@ -2972,6 +3179,46 @@ fn print_watch_started(label: &str, path: &Path, stats: ImportStats) {
     }
 }
 
+fn post_capture_health(server: &str, agent: &str, adapter: &str, path: &Path) {
+    let session_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(ToString::to_string);
+    let body = match serde_json::to_string(&json!({
+        "source": agent,
+        "agent": agent,
+        "adapter": adapter,
+        "session_id": session_id,
+        "kind": "adapter.health",
+        "severity": "debug",
+        "title": format!("{agent} capture active"),
+        "summary": "watching future transcript events; history replay is disabled unless --include-history is set",
+        "tags": ["capture", "future-only"],
+        "score_hint": 5,
+    })) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                %agent,
+                %adapter,
+                path = %path.display(),
+                error = %err,
+                "capture health encode failed"
+            );
+            return;
+        }
+    };
+    if let Err(err) = post_json(server, "/ingest/generic", &body) {
+        warn!(
+            %agent,
+            %adapter,
+            path = %path.display(),
+            error = %err,
+            "capture health post failed"
+        );
+    }
+}
+
 fn print_watch_appended(label: &str, path: &Path, stats: ImportStats) {
     if stats.filtered == 0 {
         println!(
@@ -3037,12 +3284,28 @@ fn signed_capsules_from_summaries(
     start_seq: u64,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
     let feed_id = format!("local:{feed}");
+    signed_capsules_from_summaries_with_feed_id(
+        &feed_id,
+        summaries,
+        publisher,
+        signing_secret,
+        start_seq,
+    )
+}
+
+fn signed_capsules_from_summaries_with_feed_id(
+    feed_id: &str,
+    summaries: &[FeedSummary],
+    publisher: Option<&PublisherIdentity>,
+    signing_secret: Option<&str>,
+    start_seq: u64,
+) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
     summaries
         .iter()
         .enumerate()
         .map(|(index, summary)| {
             let mut capsule = StoryCapsule::from_summary(
-                feed_id.clone(),
+                feed_id.to_string(),
                 start_seq + index as u64,
                 "local:codex",
                 summary,
@@ -3310,6 +3573,7 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                     "codex transcript watcher discovered"
                 );
                 print_watch_started("codex transcript", &path, stats);
+                post_capture_health(config.server, "codex", "codex.transcript", &path);
                 watchers.push(CodexWatcher {
                     path,
                     offset,
@@ -3370,6 +3634,7 @@ fn watch_codex_sessions(
             "codex transcript watcher started"
         );
         print_watch_started("codex transcript", path, stats);
+        post_capture_health(server, "codex", "codex.transcript", path);
         watchers.push(CodexWatcher {
             path: path.clone(),
             offset,
@@ -3445,6 +3710,13 @@ fn import_codex_chunk(
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
+    if is_agent_feed_internal_transcript(input) {
+        debug!(
+            path = %path.display(),
+            "codex transcript chunk skipped agent-feed internal processor session"
+        );
+        return stats;
+    }
     for (index, line) in input
         .lines()
         .map(str::trim)
@@ -3577,6 +3849,7 @@ fn watch_claude_active_sessions(
                     "claude stream watcher discovered"
                 );
                 print_watch_started("claude stream", &path, stats);
+                post_capture_health(server, "claude", "claude.stream-json", &path);
                 watchers.push(ClaudeWatcher {
                     path,
                     offset,
@@ -3631,6 +3904,7 @@ fn watch_claude_sessions(
             "claude stream watcher started"
         );
         print_watch_started("claude stream", path, stats);
+        post_capture_health(server, "claude", "claude.stream-json", path);
         watchers.push(ClaudeWatcher {
             path: path.clone(),
             offset,
@@ -3703,6 +3977,13 @@ fn import_claude_stream_input(
     input: &str,
     workspace: Option<&WorkspaceFilter>,
 ) -> ImportStats {
+    if is_agent_feed_internal_transcript(input) {
+        debug!(
+            path = %path.display(),
+            "claude stream import skipped agent-feed internal processor session"
+        );
+        return ImportStats::default();
+    }
     let mut state = ClaudeState::default();
     import_claude_chunk(server, path, input, &mut state, workspace, None)
 }
@@ -3716,6 +3997,13 @@ fn import_claude_chunk(
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
+    if is_agent_feed_internal_transcript(input) {
+        debug!(
+            path = %path.display(),
+            "claude stream chunk skipped agent-feed internal processor session"
+        );
+        return stats;
+    }
     for (index, line) in input
         .lines()
         .map(str::trim)
@@ -3843,33 +4131,53 @@ fn active_codex_session_paths(
     limit: usize,
     workspace: Option<&WorkspaceFilter>,
 ) -> Result<Vec<PathBuf>, CliError> {
-    if limit == 0 || !history.exists() || !sessions_dir.exists() {
+    if limit == 0 || !sessions_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let input = fs::read_to_string(history)?;
-    let mut seen = HashSet::new();
-    let mut paths = Vec::new();
-    for line in input.lines().rev() {
-        let value = serde_json::from_str::<Value>(line)?;
-        let Some(session_id) = value.get("session_id").and_then(Value::as_str) else {
-            continue;
-        };
-        if !seen.insert(session_id.to_string()) {
-            continue;
-        }
-        if let Some(path) = find_session_path(sessions_dir, session_id)? {
-            if session_matches_workspace(&path, workspace, collect_codex_events)? {
-                paths.push(path);
-            } else if let Some(workspace) = workspace {
-                debug!(
-                    session_id,
-                    path = %path.display(),
-                    workspace = %workspace.display(),
-                    "codex active session skipped by workspace filter"
-                );
+    let mut candidates = jsonl_files_by_mtime(sessions_dir)?;
+    if history.exists() {
+        let input = fs::read_to_string(history)?;
+        let mut seen_history = HashSet::new();
+        for line in input.lines().rev() {
+            let value = serde_json::from_str::<Value>(line)?;
+            let Some(session_id) = value.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !seen_history.insert(session_id.to_string()) {
+                continue;
+            }
+            if let Some(path) = find_session_path(sessions_dir, session_id)? {
+                candidates.push(path);
+            }
+            if seen_history.len() >= limit.saturating_mul(4).max(limit) {
+                break;
             }
         }
+    }
+
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut paths = Vec::new();
+    for path in candidates {
+        if !seen.insert(path.clone()) {
+            continue;
+        };
+        if is_agent_feed_internal_transcript_path(&path)? {
+            debug!(
+                path = %path.display(),
+                "codex active session skipped agent-feed internal processor session"
+            );
+            continue;
+        }
+        if session_matches_workspace(&path, workspace, collect_codex_events)? {
+            paths.push(path);
+        } else if let Some(workspace) = workspace {
+            debug!(
+                path = %path.display(),
+                workspace = %workspace.display(),
+                "codex active session skipped by workspace filter"
+            );
+        };
         if paths.len() >= limit {
             break;
         }
@@ -3888,6 +4196,13 @@ fn active_claude_session_paths(
 
     let mut paths = Vec::new();
     for path in jsonl_files_by_mtime(root)? {
+        if is_agent_feed_internal_transcript_path(&path)? {
+            debug!(
+                path = %path.display(),
+                "claude active session skipped agent-feed internal processor session"
+            );
+            continue;
+        }
         if session_matches_workspace(&path, workspace, collect_claude_events)? {
             paths.push(path);
         } else if let Some(workspace) = workspace {
@@ -3902,6 +4217,51 @@ fn active_claude_session_paths(
         }
     }
     Ok(paths)
+}
+
+const AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES: usize = 256 * 1024;
+
+const AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS: &[&str] = &[
+    "private local headline memory for one agent feed",
+    "summary_memory_key=",
+    "Return one JSON object with headline, deck, lower_third, chips",
+    "Use only the redacted story facts below",
+    "Return one JSON object. Either return",
+    "headline image exists",
+];
+
+fn is_agent_feed_internal_transcript_path(path: &Path) -> Result<bool, CliError> {
+    let sample = transcript_sample(path, AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES)?;
+    Ok(is_agent_feed_internal_transcript(&sample))
+}
+
+fn transcript_sample(path: &Path, max_bytes: usize) -> Result<String, CliError> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= max_bytes as u64 {
+        let mut input = String::new();
+        file.read_to_string(&mut input)?;
+        return Ok(input);
+    }
+
+    let mut prefix = vec![0u8; max_bytes / 2];
+    let prefix_len = file.read(&mut prefix)?;
+    prefix.truncate(prefix_len);
+
+    file.seek(SeekFrom::Start(len.saturating_sub((max_bytes / 2) as u64)))?;
+    let mut suffix = Vec::with_capacity(max_bytes / 2);
+    file.take((max_bytes / 2) as u64).read_to_end(&mut suffix)?;
+
+    let mut sample = String::from_utf8_lossy(&prefix).to_string();
+    sample.push('\n');
+    sample.push_str(&String::from_utf8_lossy(&suffix));
+    Ok(sample)
+}
+
+fn is_agent_feed_internal_transcript(input: &str) -> bool {
+    AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS
+        .iter()
+        .any(|marker| input.contains(marker))
 }
 
 fn session_matches_workspace(
