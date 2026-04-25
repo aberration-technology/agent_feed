@@ -380,6 +380,14 @@ enum P2pCommand {
         #[arg(long)]
         summary_memory_reset: bool,
         #[arg(long)]
+        summary_endpoint: Option<String>,
+        #[arg(long)]
+        summary_auth_header_env: Option<String>,
+        #[arg(long)]
+        summary_command: Option<String>,
+        #[arg(long = "summary-arg")]
+        summary_args: Vec<String>,
+        #[arg(long)]
         guardrail_pattern: Vec<String>,
         #[arg(long)]
         images: bool,
@@ -1070,6 +1078,10 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 allow_project_names,
                 summary_memory_store,
                 summary_memory_reset,
+                summary_endpoint,
+                summary_auth_header_env,
+                summary_command,
+                summary_args,
                 guardrail_pattern,
                 images,
                 image_processor,
@@ -1136,6 +1148,10 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     per_story,
                     allow_project_names,
                     summary_memory_store: summary_memory_store.as_deref(),
+                    summary_endpoint: summary_endpoint.as_deref(),
+                    summary_auth_header_env: summary_auth_header_env.as_deref(),
+                    summary_command: summary_command.as_deref(),
+                    summary_args: &summary_args,
                     guardrail_patterns: &guardrail_pattern,
                     images,
                     image_processor: &image_processor,
@@ -1761,6 +1777,10 @@ mod tests {
             per_story: false,
             allow_project_names: false,
             summary_memory_store: Some(&store),
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: None,
+            summary_args: &[],
             guardrail_patterns: &[],
             images: false,
             image_processor: "codex-exec",
@@ -1800,6 +1820,10 @@ mod tests {
             per_story: true,
             allow_project_names: false,
             summary_memory_store: None,
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: None,
+            summary_args: &[],
             guardrail_patterns: &guardrail_patterns,
             images: false,
             image_processor: "http-endpoint",
@@ -1826,6 +1850,71 @@ mod tests {
     }
 
     #[test]
+    fn summary_config_exposes_external_summary_processors() {
+        let command_config = summary_config(SummaryCliOptions {
+            summarizer: "process",
+            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
+            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+            per_story: false,
+            allow_project_names: false,
+            summary_memory_store: None,
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: Some("summarize-feed"),
+            summary_args: &["--json".to_string()],
+            guardrail_patterns: &[],
+            images: false,
+            image_processor: "codex-exec",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect("process summarizer config builds");
+
+        assert_eq!(
+            command_config.processor,
+            SummaryProcessorConfig::Process {
+                command: "summarize-feed".to_string(),
+                args: vec!["--json".to_string()],
+            }
+        );
+
+        let endpoint_config = summary_config(SummaryCliOptions {
+            summarizer: "http-endpoint",
+            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
+            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+            per_story: false,
+            allow_project_names: false,
+            summary_memory_store: None,
+            summary_endpoint: Some("http://127.0.0.1:8181/summarize"),
+            summary_auth_header_env: Some("FEED_SUMMARY_AUTH"),
+            summary_command: None,
+            summary_args: &[],
+            guardrail_patterns: &[],
+            images: false,
+            image_processor: "codex-exec",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect("http summarizer config builds");
+
+        assert_eq!(
+            endpoint_config.processor,
+            SummaryProcessorConfig::HttpEndpoint {
+                url: "http://127.0.0.1:8181/summarize".to_string(),
+                auth_header_env: Some("FEED_SUMMARY_AUTH".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn summary_config_rejects_unknown_routes_and_unsafe_image_config() {
         let unknown = summary_config(SummaryCliOptions {
             summarizer: "random-llm",
@@ -1834,6 +1923,10 @@ mod tests {
             per_story: false,
             allow_project_names: false,
             summary_memory_store: None,
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: None,
+            summary_args: &[],
             guardrail_patterns: &[],
             images: false,
             image_processor: "codex-exec",
@@ -1854,6 +1947,10 @@ mod tests {
             per_story: false,
             allow_project_names: false,
             summary_memory_store: None,
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: None,
+            summary_args: &[],
             guardrail_patterns: &[],
             images: true,
             image_processor: "http-endpoint",
@@ -1869,6 +1966,34 @@ mod tests {
             missing_endpoint
                 .to_string()
                 .contains("--image-endpoint is required")
+        );
+
+        let missing_summary_endpoint = summary_config(SummaryCliOptions {
+            summarizer: "http-endpoint",
+            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
+            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+            per_story: false,
+            allow_project_names: false,
+            summary_memory_store: None,
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: None,
+            summary_args: &[],
+            guardrail_patterns: &[],
+            images: false,
+            image_processor: "codex-exec",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect_err("http summary processor requires endpoint");
+        assert!(
+            missing_summary_endpoint
+                .to_string()
+                .contains("--summary-endpoint is required")
         );
     }
 
@@ -2583,6 +2708,10 @@ struct SummaryCliOptions<'a> {
     per_story: bool,
     allow_project_names: bool,
     summary_memory_store: Option<&'a Path>,
+    summary_endpoint: Option<&'a str>,
+    summary_auth_header_env: Option<&'a str>,
+    summary_command: Option<&'a str>,
+    summary_args: &'a [String],
     guardrail_patterns: &'a [String],
     images: bool,
     image_processor: &'a str,
@@ -2618,9 +2747,29 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
             }
         }
         "claude" | "claude-code" | "claude-code-exec" => SummaryProcessorConfig::ClaudeCodeExec,
+        "process" | "command" => SummaryProcessorConfig::Process {
+            command: options
+                .summary_command
+                .ok_or_else(|| {
+                    CliError::Http(
+                        "--summary-command is required for process summarizer".to_string(),
+                    )
+                })?
+                .to_string(),
+            args: options.summary_args.to_vec(),
+        },
+        "http" | "http-endpoint" => SummaryProcessorConfig::HttpEndpoint {
+            url: options
+                .summary_endpoint
+                .ok_or_else(|| {
+                    CliError::Http("--summary-endpoint is required for http summarizer".to_string())
+                })?
+                .to_string(),
+            auth_header_env: options.summary_auth_header_env.map(str::to_string),
+        },
         other => {
             return Err(CliError::Http(format!(
-                "unknown summarizer {other}; use codex-memory, aesthetic, codex-exec, claude-code, or deterministic"
+                "unknown summarizer {other}; use codex-memory, aesthetic, codex-exec, claude-code, process, http-endpoint, or deterministic"
             )));
         }
     };
