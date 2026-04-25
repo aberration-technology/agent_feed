@@ -198,10 +198,13 @@ mod tests {
         let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("const FEED_PROTOCOL_VERSION = 1;"));
+        assert!(html.contains("const FEED_MODEL_VERSION = 2;"));
         assert!(html.contains("function compatibilityStatus"));
+        assert!(html.contains("function networkCompatibilityStatus"));
         assert!(html.contains("version-mismatch"));
         assert!(html.contains("update your peer to the latest version"));
         assert!(html.contains("feed.user.incompatible_feeds_ignored"));
+        assert!(html.contains("feed.network.discovery.network_mismatch"));
     }
 
     #[test]

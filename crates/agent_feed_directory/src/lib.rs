@@ -43,6 +43,8 @@ pub enum DirectoryError {
     AccessPolicyMismatch,
     #[error("p2p compatibility rejected: {0}")]
     IncompatibleProtocol(String),
+    #[error("p2p network rejected: expected {expected}, got {actual}")]
+    NetworkMismatch { expected: String, actual: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,6 +673,7 @@ impl FeedDirectoryEntry {
 pub struct RemoteHeadlineView {
     pub feed_id: FeedId,
     pub feed_label: String,
+    pub compatibility: ProtocolCompatibility,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_github_user_id: Option<u64>,
     pub publisher_login: String,
@@ -689,6 +692,8 @@ impl RemoteHeadlineView {
         entry: &FeedDirectoryEntry,
         capsule: &Signed<StoryCapsule>,
     ) -> Result<Self, DirectoryError> {
+        ensure_current_compatibility(&entry.compatibility)?;
+        ensure_current_compatibility(&capsule.value.compatibility)?;
         if !capsule.verify_capsule()? {
             return Err(DirectoryError::InvalidSignature);
         }
@@ -708,6 +713,7 @@ impl RemoteHeadlineView {
         Ok(Self {
             feed_id: entry.feed_id.clone(),
             feed_label: entry.feed_label.clone(),
+            compatibility: capsule.value.compatibility.clone(),
             publisher_github_user_id: publisher
                 .github_user_id
                 .or(Some(entry.owner.github_user_id.get())),
@@ -887,6 +893,15 @@ impl DirectoryStore {
         Ok(())
     }
 
+    pub fn publish_for_network(
+        &mut self,
+        expected_network_id: &str,
+        entry: FeedDirectoryEntry,
+    ) -> Result<(), DirectoryError> {
+        ensure_network_id(expected_network_id, &entry.network_id)?;
+        self.publish(entry)
+    }
+
     #[must_use]
     pub fn entries_for_github_user(&self, github_user_id: GithubUserId) -> Vec<FeedDirectoryEntry> {
         self.entries
@@ -925,6 +940,9 @@ impl DirectoryStore {
     ) -> Result<Vec<FeedDirectoryEntry>, DirectoryError> {
         let mut entries = Vec::new();
         for entry in self.entries_for_github_user(github_user_id) {
+            if entry.network_id != route.network.network_id() {
+                continue;
+            }
             if entry.owner.github_user_id != github_user_id {
                 return Err(DirectoryError::GithubIdMismatch);
             }
@@ -1029,6 +1047,17 @@ pub fn ensure_current_compatibility(remote: &ProtocolCompatibility) -> Result<()
         Err(DirectoryError::IncompatibleProtocol(
             local.status_with(remote).message,
         ))
+    }
+}
+
+pub fn ensure_network_id(expected: &str, actual: &str) -> Result<(), DirectoryError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(DirectoryError::NetworkMismatch {
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
     }
 }
 
@@ -1500,7 +1529,7 @@ mod tests {
     #[test]
     fn directory_rejects_incompatible_feed_model() {
         let mut bad = entry("workstation", FeedVisibility::Public, 1);
-        bad.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        bad.compatibility = ProtocolCompatibility::current().with_model_version(4, 4);
         bad = bad.sign("peer-a").expect("entry resigns");
         let mut store = DirectoryStore::new();
 
@@ -1510,6 +1539,33 @@ mod tests {
 
         assert!(matches!(err, DirectoryError::IncompatibleProtocol(_)));
         assert!(err.to_string().contains("update your peer"));
+    }
+
+    #[test]
+    fn directory_rejects_records_from_wrong_network() {
+        let record = entry("workstation", FeedVisibility::Public, 1);
+        let mut store = DirectoryStore::new();
+
+        assert!(matches!(
+            store.publish_for_network("agent-feed-lab", record),
+            Err(DirectoryError::NetworkMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn route_visibility_ignores_records_from_other_networks() {
+        let mut record = entry("workstation", FeedVisibility::Public, 1);
+        record.network_id = "agent-feed-lab".to_string();
+        record = record.sign("peer-a").expect("record resigns");
+        let mut store = DirectoryStore::new();
+        store.publish(record).expect("record publishes");
+        let route = RemoteUserRoute::parse("/mosure", Some("all")).expect("route parses");
+
+        let visible = store
+            .visible_entries_for_route(GithubUserId::new(123), &route)
+            .expect("visibility filters");
+
+        assert!(visible.is_empty());
     }
 
     #[test]
@@ -1681,10 +1737,24 @@ mod tests {
         let view =
             RemoteHeadlineView::from_entry_and_capsule(&entry, &capsule).expect("view builds");
 
+        assert_eq!(view.compatibility, ProtocolCompatibility::current());
         assert_eq!(view.publisher_login, "mosure");
         assert_eq!(view.publisher_avatar.as_deref(), Some("/avatar/github/123"));
         assert!(view.verified);
         assert_eq!(view.lower_third, "@mosure / workstation");
+    }
+
+    #[test]
+    fn remote_headline_view_rejects_stale_capsule_model() {
+        let entry = entry("workstation", FeedVisibility::Public, 1);
+        let mut capsule = signed_capsule("feed-workstation", &entry).value;
+        capsule.compatibility = ProtocolCompatibility::current().with_model_version(1, 1);
+        let capsule = Signed::sign_capsule(capsule, "peer-a").expect("capsule resigns");
+
+        assert!(matches!(
+            RemoteHeadlineView::from_entry_and_capsule(&entry, &capsule),
+            Err(DirectoryError::IncompatibleProtocol(_))
+        ));
     }
 
     #[test]

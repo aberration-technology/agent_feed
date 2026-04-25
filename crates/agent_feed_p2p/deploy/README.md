@@ -68,18 +68,13 @@ AGENT_FEED_P2P_STACK_NAME=agent-feed-p2p-production
 AGENT_FEED_P2P_EDGE_DOMAIN_NAME=api.feed.aberration.technology
 AGENT_FEED_P2P_EDGE_BASE_URL=https://api.feed.aberration.technology
 AGENT_FEED_P2P_BROWSER_APP_BASE_URL=https://feed.aberration.technology
-AGENT_FEED_P2P_GITHUB_CALLBACK_URL=https://feed.aberration.technology/callback/github
+AGENT_FEED_P2P_GITHUB_CALLBACK_URL=https://api.feed.aberration.technology/callback/github
 AGENT_FEED_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET=aberration-technology.github.io
 AGENT_FEED_P2P_ROUTE53_ZONE_NAME=aberration.technology
 AGENT_FEED_P2P_NETWORK_ID=agent-feed-mainnet
 AGENT_FEED_P2P_CANARY_GITHUB_LOGIN=mosure
 AGENT_FEED_P2P_CANARY_FEED_LABEL=workstation
 ```
-
-the github oauth app callback may stay on the browser host:
-`https://feed.aberration.technology/callback/github`. the static shell forwards
-raw oauth `code` callbacks to the edge, then the edge exchanges the code and
-redirects to the local cli callback or the browser session callback.
 
 optional variables:
 
@@ -118,8 +113,8 @@ one ec2 edge host
 one elastic ip
 one small public vpc/subnet
 route53 A record for api.feed.aberration.technology
-route53 A record for feed.aberration.technology -> edge caddy
-caddy tls termination for the edge and browser hosts
+route53 CNAME for feed.aberration.technology -> github pages
+caddy tls termination for the edge host
 tcp/udp p2p fabric probes on 7747
 udp browser handoff probe on 443
 ssm-enabled instance role
@@ -140,8 +135,8 @@ is explicitly disabled.
 deploy is not considered green until these pass:
 
 ```text
-https://feed.aberration.technology/{canary_github_login}?all loads the static shell with a 200 response
-https://feed.aberration.technology/callback/github is the github oauth callback URL
+https://feed.aberration.technology/{canary_github_login}?all loads the static shell
+https://api.feed.aberration.technology/callback/github is the github oauth callback URL
 https://api.feed.aberration.technology/healthz returns ok
 api.feed.aberration.technology:7747 accepts tcp p2p fabric probes
 api.feed.aberration.technology:7747 answers udp p2p fabric probes

@@ -9,7 +9,12 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(45);
+const PROCESSOR_MAX_OUTPUT_BYTES: usize = 128 * 1024;
+const HTTP_MAX_RESPONSE_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SummaryError {
@@ -761,9 +766,37 @@ fn run_process(command: &str, args: &[String], stdin_text: &str) -> Result<Strin
         .map_err(|err| SummaryError::Processor(format!("write stdin failed: {err}")))?;
     drop(stdin);
 
+    let deadline = Instant::now() + PROCESSOR_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .map_err(|err| SummaryError::Processor(format!("wait failed: {err}")))?
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SummaryError::Processor(format!(
+                "{command} timed out after {} seconds",
+                PROCESSOR_TIMEOUT.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
     let output = child
         .wait_with_output()
         .map_err(|err| SummaryError::Processor(format!("wait failed: {err}")))?;
+    if output.stdout.len() > PROCESSOR_MAX_OUTPUT_BYTES
+        || output.stderr.len() > PROCESSOR_MAX_OUTPUT_BYTES
+    {
+        return Err(SummaryError::Processor(format!(
+            "{command} output exceeded {} bytes",
+            PROCESSOR_MAX_OUTPUT_BYTES
+        )));
+    }
     if !output.status.success() {
         return Err(SummaryError::Processor(format!(
             "{command} exited with {}: {}",
@@ -924,8 +957,14 @@ fn post_http_json(
 
     let mut response = String::new();
     stream
+        .take((HTTP_MAX_RESPONSE_BYTES + 1) as u64)
         .read_to_string(&mut response)
         .map_err(|err| SummaryError::Processor(format!("http response read failed: {err}")))?;
+    if response.len() > HTTP_MAX_RESPONSE_BYTES {
+        return Err(SummaryError::Processor(format!(
+            "http endpoint response exceeded {HTTP_MAX_RESPONSE_BYTES} bytes"
+        )));
+    }
     let (status, text) = parse_http_response(&response)?;
     if !(200..300).contains(&status) {
         return Err(SummaryError::Processor(format!(

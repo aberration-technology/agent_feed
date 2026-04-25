@@ -3,7 +3,9 @@ use agent_feed_ingest::normalize_value;
 use agent_feed_metrics::Metrics;
 use agent_feed_redaction::Redactor;
 use agent_feed_reel::{ReelBuffer, ReelSnapshot};
-use agent_feed_security::{SecurityConfig, SecurityError, validate_bind};
+use agent_feed_security::{
+    SecurityConfig, SecurityError, requires_display_token, token_matches, validate_bind,
+};
 use agent_feed_store::InMemoryStore;
 use agent_feed_story::StoryCompiler;
 use agent_feed_ui::UiConfig;
@@ -11,8 +13,10 @@ use agent_feed_views::{
     AdaptersView, AgentsView, BulletinsView, EventsView, HealthView, IngestView, SessionsView,
     SseBulletin,
 };
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -54,6 +58,7 @@ pub enum ServerError {
 struct AppState {
     bind: SocketAddr,
     p2p_enabled: bool,
+    security: SecurityConfig,
     reel: Mutex<ReelBuffer>,
     store: Mutex<InMemoryStore>,
     tx: broadcast::Sender<Bulletin>,
@@ -73,7 +78,7 @@ where
     validate_bind(&config.security)?;
     let bind = config.bind();
     let listener = TcpListener::bind(bind).await?;
-    let app = app_with_config(bind, config.p2p_enabled);
+    let app = app_with_server_config(config.clone());
     tracing::info!(%bind, "agent_feed serving");
     ready(bind);
     axum::serve(listener, app).await?;
@@ -85,10 +90,21 @@ pub fn app(bind: SocketAddr) -> Router {
 }
 
 pub fn app_with_config(bind: SocketAddr, p2p_enabled: bool) -> Router {
+    app_with_server_config(ServerConfig {
+        security: SecurityConfig {
+            bind,
+            ..SecurityConfig::default()
+        },
+        p2p_enabled,
+    })
+}
+
+pub fn app_with_server_config(config: ServerConfig) -> Router {
     let (tx, _) = broadcast::channel(128);
     let state = Arc::new(AppState {
-        bind,
-        p2p_enabled,
+        bind: config.security.bind,
+        p2p_enabled: config.p2p_enabled,
+        security: config.security,
         reel: Mutex::new(ReelBuffer::default()),
         store: Mutex::new(InMemoryStore::default()),
         tx,
@@ -120,8 +136,64 @@ pub fn app_with_config(bind: SocketAddr, p2p_enabled: bool) -> Router {
         .route("/ingest/otel", post(ingest_otel))
         .route("/ingest/generic", post(ingest_generic))
         .route("/{remote}", get(remote_user_shell))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            display_token_auth,
+        ))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+async fn display_token_auth(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !requires_display_token(&state.security) || display_auth_is_public(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let Some(expected) = state.security.display_token.as_deref() else {
+        return next.run(request).await;
+    };
+    if request_display_token(&request).is_some_and(|actual| token_matches(expected, &actual)) {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer realm=\"agent-feed\"")],
+        "display token required",
+    )
+        .into_response()
+}
+
+fn display_auth_is_public(path: &str) -> bool {
+    matches!(path, "/api/health" | "/favicon.svg")
+}
+
+fn request_display_token(request: &Request<Body>) -> Option<String> {
+    request
+        .headers()
+        .get("x-agent-feed-display-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().strip_prefix("Bearer "))
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .or_else(|| query_param(request.uri().query().unwrap_or_default(), "display_token"))
+        .or_else(|| query_param(request.uri().query().unwrap_or_default(), "token"))
+}
+
+fn query_param(query: &str, needle: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        (key == needle && !value.is_empty()).then(|| value.to_string())
+    })
 }
 
 async fn root_index(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -475,6 +547,10 @@ mod tests {
         Arc::new(AppState {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             p2p_enabled,
+            security: SecurityConfig {
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                ..SecurityConfig::default()
+            },
             reel: Mutex::new(ReelBuffer::default()),
             store: Mutex::new(InMemoryStore::default()),
             tx,

@@ -537,7 +537,7 @@ mod tests {
     fn route_model_surfaces_version_mismatch() {
         let route = RemoteUserRoute::parse("/mosure", Some("all")).expect("route parses");
         let mut entry = public_entry();
-        entry.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        entry.compatibility = ProtocolCompatibility::current().with_model_version(4, 4);
         let model = RemoteRouteViewModel::waiting(route).with_ticket(discovery_ticket(entry));
 
         assert_eq!(model.state, RemoteRouteState::VersionMismatch);

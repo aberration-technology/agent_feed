@@ -1,6 +1,6 @@
 [package]
 name = "agent_feed_p2p_proto"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 license.workspace = true
 description.workspace = true
@@ -14,6 +14,8 @@ agent_feed_story = { workspace = true }
 agent_feed_summarize = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["serde", "formatting"] }
 

@@ -42,6 +42,24 @@ pub fn is_loopback(ip: IpAddr) -> bool {
     }
 }
 
+#[must_use]
+pub fn requires_display_token(config: &SecurityConfig) -> bool {
+    !is_loopback(config.bind.ip()) && config.display_token.is_some()
+}
+
+#[must_use]
+pub fn token_matches(expected: &str, actual: &str) -> bool {
+    let left = expected.as_bytes();
+    let right = actual.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +98,12 @@ mod tests {
         };
 
         validate_bind(&config).expect("token gates non-loopback display");
+    }
+
+    #[test]
+    fn display_token_matching_is_constant_time_shape_and_exact() {
+        assert!(token_matches("display-token", "display-token"));
+        assert!(!token_matches("display-token", "display-t0ken"));
+        assert!(!token_matches("display-token", "display-token-extra"));
     }
 }

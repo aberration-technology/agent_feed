@@ -1,5 +1,6 @@
 use agent_feed_directory::{
     DirectoryError, FeedAccessPolicy, FeedDirectoryEntry, ensure_current_compatibility,
+    ensure_network_id,
 };
 use agent_feed_identity::{GithubOrgName, GithubTeamSlug, GithubUserId};
 use agent_feed_p2p_proto::{
@@ -195,6 +196,7 @@ impl PeerNode {
 
     pub fn announce_feed(&self, profile: FeedProfile) -> Result<(), P2pError> {
         self.ensure_compatible()?;
+        ensure_network_id(&self.network_id, &profile.network_id)?;
         ensure_current_compatibility(&profile.compatibility)?;
         let feed_id = profile.feed_id.clone();
         let network_id = profile.network_id.clone();
@@ -234,6 +236,7 @@ impl PeerNode {
 
     pub fn announce_directory_entry(&self, entry: FeedDirectoryEntry) -> Result<(), P2pError> {
         self.ensure_compatible()?;
+        ensure_network_id(&self.network_id, &entry.network_id)?;
         ensure_current_compatibility(&entry.compatibility)?;
         if !entry.verify_signature()? {
             return Err(P2pError::Directory(DirectoryError::InvalidSignature));
@@ -277,6 +280,7 @@ impl PeerNode {
 
     pub fn cache_directory_entry(&self, entry: FeedDirectoryEntry) -> Result<(), P2pError> {
         self.ensure_compatible()?;
+        ensure_network_id(&self.network_id, &entry.network_id)?;
         ensure_current_compatibility(&entry.compatibility)?;
         if !entry.verify_signature()? {
             return Err(P2pError::Directory(DirectoryError::InvalidSignature));
@@ -496,6 +500,7 @@ impl PeerNode {
 
     pub fn publish_capsule(&self, signed: Signed<StoryCapsule>) -> Result<usize, P2pError> {
         self.ensure_compatible()?;
+        ensure_current_compatibility(&signed.value.compatibility)?;
         if !signed.verify_capsule()? {
             tracing::warn!(
                 peer_id = %self.peer_id,
@@ -1066,7 +1071,7 @@ mod tests {
             "agent-feed-mainnet",
             "peer-old",
             "github:1",
-            ProtocolCompatibility::current().with_model_version(2, 2),
+            ProtocolCompatibility::current().with_model_version(4, 4),
         );
 
         let err = stale
@@ -1082,7 +1087,7 @@ mod tests {
         let network = InMemoryNetwork::new();
         let publisher = network.peer("agent-feed-mainnet", "peer-a", "github:1");
         let mut feed = profile("feed-public", FeedVisibility::Public)?;
-        feed.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        feed.compatibility = ProtocolCompatibility::current().with_model_version(4, 4);
         feed = feed.sign("peer-a")?;
 
         let err = publisher
@@ -1102,7 +1107,7 @@ mod tests {
         let network = InMemoryNetwork::new();
         let fabric = network.peer("agent-feed-mainnet", "peer-fabric", "fabric:edge");
         let mut entry = directory_entry("feed-public", "workstation", FeedVisibility::Public)?;
-        entry.compatibility = ProtocolCompatibility::current().with_model_version(2, 2);
+        entry.compatibility = ProtocolCompatibility::current().with_model_version(4, 4);
         entry = entry.sign("peer-a")?;
 
         let err = fabric
@@ -1112,6 +1117,30 @@ mod tests {
         assert!(matches!(
             err,
             P2pError::Directory(DirectoryError::IncompatibleProtocol(_))
+        ));
+        assert!(
+            fabric
+                .discover_github_user(GithubUserId::new(1))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_network_directory_entry_is_not_cached() -> Result<(), Box<dyn std::error::Error>> {
+        let network = InMemoryNetwork::new();
+        let fabric = network.peer("agent-feed-mainnet", "peer-fabric", "fabric:edge");
+        let mut entry = directory_entry("feed-public", "workstation", FeedVisibility::Public)?;
+        entry.network_id = "agent-feed-lab".to_string();
+        entry = entry.sign("peer-a")?;
+
+        let err = fabric
+            .cache_directory_entry(entry)
+            .expect_err("wrong network entry is rejected");
+
+        assert!(matches!(
+            err,
+            P2pError::Directory(DirectoryError::NetworkMismatch { .. })
         ));
         assert!(
             fabric

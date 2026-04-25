@@ -77,8 +77,10 @@ jobs:
           aws_region="${VAR_AWS_REGION:-us-east-2}"
           aws_role_arn="${VAR_AWS_ROLE_ARN:-}"
           stack_name="${VAR_STACK_NAME:-agent-feed-p2p-production}"
+          edge_domain_name="${VAR_EDGE_DOMAIN_NAME:-api.feed.aberration.technology}"
+          edge_base_url="https://${edge_domain_name}"
           browser_app_base_url="${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}"
-          github_callback_url="${VAR_GITHUB_CALLBACK_URL:-${browser_app_base_url%/}/callback/github}"
+          github_callback_url="${VAR_GITHUB_CALLBACK_URL:-${edge_base_url%/}/callback/github}"
           aws_account_id="$(cut -d: -f5 <<<"$aws_role_arn")"
           state_bucket="${VAR_TERRAFORM_STATE_BUCKET:-agent-feed-p2p-tfstate-${aws_account_id}-${aws_region}}"
           binary_s3_key="${VAR_BINARY_S3_KEY:-releases/${GITHUB_SHA}/agent-feed}"
@@ -102,7 +104,7 @@ jobs:
             echo "TF_VAR_agent_feed_binary_s3_uri=s3://${state_bucket}/${binary_s3_key}"
             echo "TF_VAR_agent_feed_binary_s3_bucket=$state_bucket"
             echo "TF_VAR_agent_feed_binary_s3_key=$binary_s3_key"
-            echo "TF_VAR_edge_domain_name=${VAR_EDGE_DOMAIN_NAME:-api.feed.aberration.technology}"
+            echo "TF_VAR_edge_domain_name=$edge_domain_name"
             echo "TF_VAR_browser_app_base_url=$browser_app_base_url"
             echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
             echo "TF_VAR_github_callback_url=$github_callback_url"
@@ -159,8 +161,9 @@ jobs:
           client_id="${SECRET_GITHUB_CLIENT_ID:-${LEGACY_OAUTH_CLIENT_ID:-}}"
           client_secret="${SECRET_GITHUB_CLIENT_SECRET:-${LEGACY_OAUTH_CLIENT_SECRET:-}}"
           if [ -z "$client_id" ] || [ -z "$client_secret" ]; then
-            echo "GitHub OAuth secrets were not present; skipping SSM sync." >&2
-            exit 0
+            echo "GitHub OAuth secrets are required for production edge auth." >&2
+            echo "Set AGENT_FEED_P2P_GITHUB_CLIENT_ID and AGENT_FEED_P2P_GITHUB_CLIENT_SECRET on the selected environment." >&2
+            exit 1
           fi
           aws ssm put-parameter \
             --name "$GITHUB_CLIENT_ID_PARAMETER_NAME" \
@@ -385,6 +388,26 @@ jobs:
             echo "p2p udp fabric canary failed for ${edge_host}:7747" >&2
             exit 1
           fi
+
+      - name: browser and resolver canary
+        if: ${{ github.event.inputs.apply == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          edge_url="${{ steps.terraform_outputs.outputs.edge_url }}"
+          browser_url="${TF_VAR_browser_app_base_url%/}"
+          canary="${TF_VAR_canary_github_login:-mosure}"
+
+          curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/readyz" \
+            | grep -q '"state":"ready"'
+          curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/browser-seed" \
+            | grep -q '"signature"'
+          curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/network/snapshot?network=mainnet" \
+            | grep -q '"feed_mode":"discovery"'
+          curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/resolve/github/${canary}?feed_mode=discovery" \
+            | grep -q '"github_user_id"'
+          curl -fsSL --connect-timeout 5 --max-time 20 "${browser_url}/${canary}?feed_mode=discovery" \
+            | grep -q '<title>feed</title>'
 
       - name: dispatch pages publish
         if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}

@@ -41,7 +41,7 @@ locals {
   )[0]
   browser_app_hostname_normalized   = trimsuffix(lower(local.browser_app_hostname), ".")
   browser_app_pages_domain_target   = trimsuffix(trimspace(var.browser_app_pages_domain_target), ".")
-  github_callback_url               = trimspace(var.github_callback_url) == "" ? "${local.browser_app_base_url}/callback/github" : trimspace(var.github_callback_url)
+  github_callback_url               = trimspace(var.github_callback_url) == "" ? "${local.edge_url}/callback/github" : trimspace(var.github_callback_url)
   claiming_edge_apex                = local.edge_domain_name_normalized == local.route53_zone_apex
   claiming_browser_apex             = local.browser_app_hostname_normalized == local.route53_zone_apex
   cloudwatch_alarm_actions          = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
@@ -93,7 +93,7 @@ locals {
     github_required_teams = var.github_required_teams
   })
   caddyfile = templatefile("${path.module}/templates/Caddyfile.tftpl", {
-    browser_app_hostname            = local.browser_app_hostname_normalized
+    browser_app_hostname            = local.browser_app_hostname
     browser_app_origin              = local.browser_app_base_url
     browser_app_pages_domain_target = local.browser_app_pages_domain_target
     edge_domain_name                = var.edge_domain_name
@@ -377,9 +377,9 @@ resource "aws_route53_record" "edge" {
 resource "aws_route53_record" "browser" {
   zone_id         = data.aws_route53_zone.selected.zone_id
   name            = local.browser_app_hostname_normalized
-  type            = "A"
-  ttl             = 60
-  records         = [aws_eip.edge.public_ip]
+  type            = "CNAME"
+  ttl             = 300
+  records         = [local.browser_app_pages_domain_target]
   allow_overwrite = true
 }
 

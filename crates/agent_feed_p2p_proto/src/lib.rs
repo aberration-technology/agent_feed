@@ -3,10 +3,13 @@ use agent_feed_story::{CompiledStory, StoryFamily};
 use agent_feed_summarize::{
     FeedSummary, SummaryConfig, SummaryError, SummaryMetadata, summarize_feed,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+type HmacSha256 = Hmac<Sha256>;
+const SIGNATURE_DOMAIN: &[u8] = b"agent-feed-signature-v1";
 
 pub type FeedId = String;
 pub type NetworkId = String;
@@ -18,9 +21,12 @@ pub type CapsuleId = String;
 pub type StoryWindowRef = String;
 pub type AgentKind = String;
 
+pub const AGENT_FEED_PRODUCT: &str = "feed";
+pub const AGENT_FEED_PROTOCOL_NAME: &str = "agent-feed";
 pub const AGENT_FEED_PROTOCOL_VERSION: u16 = 1;
-pub const AGENT_FEED_MODEL_VERSION: u16 = 1;
-pub const AGENT_FEED_MIN_MODEL_VERSION: u16 = 1;
+pub const AGENT_FEED_MODEL_VERSION: u16 = 3;
+pub const AGENT_FEED_MIN_MODEL_VERSION: u16 = 3;
+pub const AGENT_FEED_EDGE_PROTOCOL: &str = "agent-feed.edge/1";
 pub const AGENT_FEED_RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +52,7 @@ impl ProtocolCompatibility {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            product: "feed".to_string(),
+            product: AGENT_FEED_PRODUCT.to_string(),
             release_version: AGENT_FEED_RELEASE_VERSION.to_string(),
             protocol_version: AGENT_FEED_PROTOCOL_VERSION,
             model_version: AGENT_FEED_MODEL_VERSION,
@@ -143,8 +149,35 @@ impl Signature {
     pub fn for_value<T: Serialize>(key_id: &str, value: &T) -> Result<Self, ProtoError> {
         Ok(Self {
             key_id: key_id.to_string(),
-            digest: stable_digest(&serde_json::to_vec(value)?),
+            digest: sha256_signature_digest(key_id, &serde_json::to_vec(value)?),
         })
+    }
+
+    pub fn for_value_hmac<T: Serialize>(
+        key_id: &str,
+        secret: &str,
+        value: &T,
+    ) -> Result<Self, ProtoError> {
+        Ok(Self {
+            key_id: key_id.to_string(),
+            digest: hmac_signature_digest(key_id, secret, &serde_json::to_vec(value)?),
+        })
+    }
+
+    pub fn verify_value<T: Serialize>(&self, value: &T) -> Result<bool, ProtoError> {
+        Ok(Signature::for_value(&self.key_id, value)? == *self)
+    }
+
+    pub fn verify_value_hmac<T: Serialize>(
+        &self,
+        secret: &str,
+        value: &T,
+    ) -> Result<bool, ProtoError> {
+        let expected = Signature::for_value_hmac(&self.key_id, secret, value)?;
+        Ok(constant_time_eq(
+            expected.digest.as_bytes(),
+            self.digest.as_bytes(),
+        ))
     }
 }
 
@@ -170,7 +203,16 @@ impl<T: Serialize> Signed<T> {
     }
 
     pub fn verify(&self) -> Result<bool, ProtoError> {
-        Ok(Signature::for_value(&self.signature.key_id, &self.value)? == self.signature)
+        self.signature.verify_value(&self.value)
+    }
+
+    pub fn sign_with_secret(value: T, key_id: &str, secret: &str) -> Result<Self, ProtoError> {
+        let signature = Signature::for_value_hmac(key_id, secret, &value)?;
+        Ok(Self { value, signature })
+    }
+
+    pub fn verify_with_secret(&self, secret: &str) -> Result<bool, ProtoError> {
+        self.signature.verify_value_hmac(secret, &self.value)
     }
 }
 
@@ -184,7 +226,27 @@ impl Signed<StoryCapsule> {
     }
 
     pub fn verify_capsule(&self) -> Result<bool, ProtoError> {
-        Ok(self.signature == self.value.signature && self.value.verify_signature()?)
+        Ok(self.signature == self.value.signature
+            && ProtocolCompatibility::current().is_compatible_with(&self.value.compatibility)
+            && self.value.verify_signature()?)
+    }
+
+    pub fn sign_capsule_with_secret(
+        capsule: StoryCapsule,
+        key_id: &str,
+        secret: &str,
+    ) -> Result<Self, ProtoError> {
+        let value = capsule.sign_with_secret(key_id, secret)?;
+        Ok(Self {
+            signature: value.signature.clone(),
+            value,
+        })
+    }
+
+    pub fn verify_capsule_with_secret(&self, secret: &str) -> Result<bool, ProtoError> {
+        Ok(self.signature == self.value.signature
+            && ProtocolCompatibility::current().is_compatible_with(&self.value.compatibility)
+            && self.value.verify_signature_with_secret(secret)?)
     }
 }
 
@@ -259,7 +321,7 @@ impl FeedProfile {
     pub fn verify_signature(&self) -> Result<bool, ProtoError> {
         let mut unsigned = self.clone();
         unsigned.signature = Signature::unsigned();
-        Ok(Signature::for_value(&self.signature.key_id, &unsigned)? == self.signature)
+        self.signature.verify_value(&unsigned)
     }
 }
 
@@ -350,6 +412,8 @@ impl PublisherIdentity {
 pub struct StoryCapsule {
     pub capsule_id: CapsuleId,
     pub feed_id: FeedId,
+    #[serde(default)]
+    pub compatibility: ProtocolCompatibility,
     pub seq: u64,
     pub story_window: StoryWindowRef,
     #[serde(with = "time::serde::rfc3339")]
@@ -401,6 +465,7 @@ impl StoryCapsule {
         let mut capsule = Self {
             capsule_id: format!("cap_{seq:016x}_{}", compact_digest(&summary.headline)),
             feed_id: feed_id.into(),
+            compatibility: ProtocolCompatibility::current(),
             seq,
             story_window: summary.story_window.clone(),
             created_at: OffsetDateTime::now_utc(),
@@ -446,7 +511,20 @@ impl StoryCapsule {
     pub fn verify_signature(&self) -> Result<bool, ProtoError> {
         let mut unsigned = self.clone();
         unsigned.signature = Signature::unsigned();
-        Ok(Signature::for_value(&self.signature.key_id, &unsigned)? == self.signature)
+        self.signature.verify_value(&unsigned)
+    }
+
+    pub fn sign_with_secret(mut self, key_id: &str, secret: &str) -> Result<Self, ProtoError> {
+        self.signature = Signature::unsigned();
+        self.content_hash = ContentHash::for_value(&CapsuleContent::from(&self))?;
+        self.signature = Signature::for_value_hmac(key_id, secret, &self)?;
+        Ok(self)
+    }
+
+    pub fn verify_signature_with_secret(&self, secret: &str) -> Result<bool, ProtoError> {
+        let mut unsigned = self.clone();
+        unsigned.signature = Signature::unsigned();
+        self.signature.verify_value_hmac(secret, &unsigned)
     }
 }
 
@@ -481,6 +559,7 @@ pub struct SubscriptionGrant {
 #[derive(Clone, Debug, Serialize)]
 struct CapsuleContent<'a> {
     feed_id: &'a str,
+    compatibility: &'a ProtocolCompatibility,
     seq: u64,
     headline: &'a str,
     deck: &'a str,
@@ -498,6 +577,7 @@ impl<'a> From<&'a StoryCapsule> for CapsuleContent<'a> {
     fn from(value: &'a StoryCapsule) -> Self {
         Self {
             feed_id: &value.feed_id,
+            compatibility: &value.compatibility,
             seq: value.seq,
             headline: &value.headline,
             deck: &value.deck,
@@ -516,25 +596,35 @@ impl<'a> From<&'a StoryCapsule> for CapsuleContent<'a> {
 #[must_use]
 pub fn feed_topic(network_id: &str, feed_id: &str) -> String {
     format!(
-        "agent-feed.v1.{network_id}.feed.{}",
+        "{}.v{}.{network_id}.feed.{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(feed_id)
     )
 }
 
 #[must_use]
 pub fn directory_topic(network_id: &str) -> String {
-    format!("agent-feed.v1.{network_id}.directory")
+    format!(
+        "{}.v{}.{network_id}.directory",
+        AGENT_FEED_PROTOCOL_NAME, AGENT_FEED_PROTOCOL_VERSION
+    )
 }
 
 #[must_use]
 pub fn presence_topic(network_id: &str) -> String {
-    format!("agent-feed.v1.{network_id}.presence")
+    format!(
+        "{}.v{}.{network_id}.presence",
+        AGENT_FEED_PROTOCOL_NAME, AGENT_FEED_PROTOCOL_VERSION
+    )
 }
 
 #[must_use]
 pub fn github_user_topic(network_id: &str, github_user_id: u64) -> String {
     format!(
-        "agent-feed.v1.{network_id}.github.{}",
+        "{}.v{}.{network_id}.github.{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(&github_user_id.to_string())
     )
 }
@@ -542,7 +632,9 @@ pub fn github_user_topic(network_id: &str, github_user_id: u64) -> String {
 #[must_use]
 pub fn github_org_topic(network_id: &str, org: &str) -> String {
     format!(
-        "agent-feed.v1.{network_id}.github-org.{}",
+        "{}.v{}.{network_id}.github-org.{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(&org.to_ascii_lowercase())
     )
 }
@@ -550,7 +642,9 @@ pub fn github_org_topic(network_id: &str, org: &str) -> String {
 #[must_use]
 pub fn github_team_topic(network_id: &str, org: &str, team: &str) -> String {
     format!(
-        "agent-feed.v1.{network_id}.github-team.{}",
+        "{}.v{}.{network_id}.github-team.{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(
             format!("{}:{}", org.to_ascii_lowercase(), team.to_ascii_lowercase()).as_str()
         )
@@ -560,7 +654,9 @@ pub fn github_team_topic(network_id: &str, org: &str, team: &str) -> String {
 #[must_use]
 pub fn github_provider_key(network_id: &str, github_user_id: u64) -> String {
     format!(
-        "/agent-feed/1/github/{}",
+        "/{}/{}/github/{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(format!("{network_id}:{github_user_id}").as_str())
     )
 }
@@ -568,7 +664,9 @@ pub fn github_provider_key(network_id: &str, github_user_id: u64) -> String {
 #[must_use]
 pub fn github_org_provider_key(network_id: &str, org: &str) -> String {
     format!(
-        "/agent-feed/1/github-org/{}",
+        "/{}/{}/github-org/{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(format!("{network_id}:{}", org.to_ascii_lowercase()).as_str())
     )
 }
@@ -576,7 +674,9 @@ pub fn github_org_provider_key(network_id: &str, org: &str) -> String {
 #[must_use]
 pub fn github_team_provider_key(network_id: &str, org: &str, team: &str) -> String {
     format!(
-        "/agent-feed/1/github-team/{}",
+        "/{}/{}/github-team/{}",
+        AGENT_FEED_PROTOCOL_NAME,
+        AGENT_FEED_PROTOCOL_VERSION,
         compact_digest(
             format!(
                 "{network_id}:{}:{}",
@@ -590,14 +690,53 @@ pub fn github_team_provider_key(network_id: &str, org: &str, team: &str) -> Stri
 
 #[must_use]
 pub fn stable_digest(input: &[u8]) -> String {
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hex_lower(&Sha256::digest(input))
 }
 
 #[must_use]
 pub fn compact_digest(input: &str) -> String {
-    stable_digest(input.as_bytes())
+    stable_digest(input.as_bytes()).chars().take(16).collect()
+}
+
+fn sha256_signature_digest(key_id: &str, payload: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SIGNATURE_DOMAIN);
+    hasher.update(b"\0sha256\0");
+    hasher.update(key_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(payload);
+    format!("sha256:{}", hex_lower(&hasher.finalize()))
+}
+
+fn hmac_signature_digest(key_id: &str, secret: &str, payload: &[u8]) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts arbitrary key lengths");
+    mac.update(SIGNATURE_DOMAIN);
+    mac.update(b"\0hmac-sha256\0");
+    mac.update(key_id.as_bytes());
+    mac.update(b"\0");
+    mac.update(payload);
+    format!("hmac-sha256:{}", hex_lower(&mac.finalize().into_bytes()))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 #[cfg(test)]
@@ -640,12 +779,35 @@ mod tests {
     #[test]
     fn story_capsule_signature_detects_tamper() -> Result<(), ProtoError> {
         let capsule = StoryCapsule::from_story("feed-workstation", 1, "github:1", &story())?;
+        assert_eq!(capsule.compatibility, ProtocolCompatibility::current());
         let signed = Signed::sign_capsule(capsule, "peer-a")?;
         assert!(signed.verify_capsule()?);
 
         let mut tampered = signed.clone();
         tampered.value.headline = "raw prompt leaked".to_string();
         assert!(!tampered.verify_capsule()?);
+        Ok(())
+    }
+
+    #[test]
+    fn story_capsule_hmac_signature_requires_publish_secret() -> Result<(), ProtoError> {
+        let capsule = StoryCapsule::from_story("feed-workstation", 1, "github:1", &story())?;
+        let signed = Signed::sign_capsule_with_secret(capsule, "github:123", "session-secret")?;
+
+        assert!(signed.verify_capsule_with_secret("session-secret")?);
+        assert!(!signed.verify_capsule()?);
+        assert!(!signed.verify_capsule_with_secret("wrong-secret")?);
+        assert!(signed.signature.digest.starts_with("hmac-sha256:"));
+        Ok(())
+    }
+
+    #[test]
+    fn story_capsule_rejects_stale_data_model() -> Result<(), ProtoError> {
+        let mut capsule = StoryCapsule::from_story("feed-workstation", 1, "github:1", &story())?;
+        capsule.compatibility = ProtocolCompatibility::current().with_model_version(1, 1);
+        let signed = Signed::sign_capsule(capsule, "peer-a")?;
+
+        assert!(!signed.verify_capsule()?);
         Ok(())
     }
 
@@ -805,5 +967,16 @@ mod tests {
 
         assert!(!status.compatible);
         assert!(status.message.contains("protocol changed"));
+    }
+
+    #[test]
+    fn compatibility_rejects_stale_required_model() {
+        let local = ProtocolCompatibility::current();
+        let remote = ProtocolCompatibility::current().with_model_version(1, 1);
+
+        let status = local.status_with(&remote);
+
+        assert!(!status.compatible);
+        assert!(status.message.contains("older data model"));
     }
 }

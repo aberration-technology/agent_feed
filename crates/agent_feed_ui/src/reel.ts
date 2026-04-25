@@ -26,8 +26,8 @@ let dwellTimer = undefined;
 let controlsTimer = undefined;
 
 const FEED_PROTOCOL_VERSION = 1;
-const FEED_MODEL_VERSION = 1;
-const FEED_MIN_MODEL_VERSION = 1;
+const FEED_MODEL_VERSION = 2;
+const FEED_MIN_MODEL_VERSION = 2;
 
 const githubAuthCallback = parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
@@ -105,6 +105,15 @@ function logError(context, error) {
 
 function logWarn(context, detail) {
   logEvent("warn", context, detail);
+}
+
+async function responseErrorMessage(response, fallback) {
+  try {
+    const body = await response.clone().json();
+    return body?.error || body?.message || fallback;
+  } catch (_error) {
+    return fallback;
+  }
 }
 
 function setText(node, value) {
@@ -557,7 +566,11 @@ function parseRemoteRoute(location) {
   if (feedSegment === undefined) {
     return undefined;
   }
-  const params = new URLSearchParams(location.search);
+  const params = new URLSearchParams(
+    location.hash && location.hash.length > 1
+      ? location.hash.slice(1)
+      : location.search,
+  );
   for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
     if (params.has(key)) {
       logWarn(`ignored privacy-weakening query param: ${key}`);
@@ -1091,6 +1104,16 @@ async function startGlobalDiscoveryRoute(route) {
       renderAuthRequired(route);
       return;
     }
+    if (response.status === 426) {
+      const message = await responseErrorMessage(response, "update your peer to the latest version");
+      renderRemoteState(route, "version-mismatch", [
+        "feed protocol network or data model changed",
+        message,
+        "update your peer or choose the matching network",
+      ]);
+      logWarn("feed.network.discovery.upgrade_required", { message });
+      return;
+    }
     if (!response.ok) {
       throw new Error(`network snapshot failed: ${response.status}`);
     }
@@ -1108,12 +1131,33 @@ async function startGlobalDiscoveryRoute(route) {
       });
       return;
     }
+    const snapshotNetworkStatus = networkCompatibilityStatus(route, snapshot);
+    if (!snapshotNetworkStatus.compatible) {
+      renderRemoteState(route, "version-mismatch", [
+        "feed network changed",
+        snapshotNetworkStatus.message,
+        "update your peer or choose the matching network",
+      ]);
+      logWarn("feed.network.discovery.network_mismatch", {
+        expected: snapshotNetworkStatus.expected,
+        actual: snapshotNetworkStatus.actual,
+      });
+      return;
+    }
     const feeds = snapshotFeeds(snapshot);
-    const headlines = snapshotHeadlines(snapshot);
+    const allHeadlines = snapshotHeadlines(snapshot);
+    const headlines = allHeadlines.filter((item) => compatibilityStatus(item.compatibility).compatible);
+    const incompatibleHeadlines = allHeadlines.length - headlines.length;
+    if (incompatibleHeadlines > 0) {
+      logWarn("feed.network.discovery.incompatible_headlines_ignored", {
+        incompatible_headlines: incompatibleHeadlines,
+      });
+    }
     logInfo("feed.network.discovery.snapshot", {
       network_id: snapshot.network_id,
       feeds: feeds.length,
       headlines: headlines.length,
+      incompatible_headlines: incompatibleHeadlines,
     });
     if (route.interactive) {
       renderGlobalTimeline(route, snapshot);
@@ -1181,6 +1225,16 @@ async function startUserRoute(route) {
       });
       return;
     }
+    if (response.status === 426) {
+      const message = await responseErrorMessage(response, "update your peer to the latest version");
+      renderRemoteState(route, "version-mismatch", [
+        "feed protocol network or data model changed",
+        message,
+        "update your peer or choose the matching network",
+      ]);
+      logWarn("feed.user.upgrade_required", { login: route.login, message });
+      return;
+    }
     if (!response.ok) {
       throw new Error(`resolver failed: ${response.status}`);
     }
@@ -1196,6 +1250,20 @@ async function startUserRoute(route) {
         login: ticket.profile?.login || route.login,
         compatibility: ticket.compatibility,
         message: ticketStatus.message,
+      });
+      return;
+    }
+    const ticketNetworkStatus = networkCompatibilityStatus(route, ticket);
+    if (!ticketNetworkStatus.compatible) {
+      renderRemoteState(route, "version-mismatch", [
+        "feed network changed",
+        ticketNetworkStatus.message,
+        "update your peer or choose the matching network",
+      ], ticket.profile);
+      logWarn("feed.user.network_mismatch", {
+        login: ticket.profile?.login || route.login,
+        expected: ticketNetworkStatus.expected,
+        actual: ticketNetworkStatus.actual,
       });
       return;
     }
@@ -1215,15 +1283,19 @@ async function startUserRoute(route) {
       ticket.candidate_feeds = compatibleFeeds;
     }
     const feedCount = compatibleFeeds.length;
-    const headlines = snapshotHeadlines(ticket)
+    const allHeadlines = snapshotHeadlines(ticket);
+    const headlines = allHeadlines
+      .filter((item) => compatibilityStatus(item.compatibility || ticket.compatibility).compatible)
       .filter((item) => headlineMatchesRoute(item, route))
       .map((item) => enrichHeadlineFromTicket(item, ticket));
+    const incompatibleHeadlines = allHeadlines.length - allHeadlines.filter((item) => compatibilityStatus(item.compatibility || ticket.compatibility).compatible).length;
     logInfo("feed.user.ticket", {
       login: ticket.profile?.login || route.login,
       github_user_id: ticket.github_user_id || ticket.resolved_github_id,
       feeds: feedCount,
       headlines: headlines.length,
       incompatible_feeds: incompatibleFeeds,
+      incompatible_headlines: incompatibleHeadlines,
       expires_at: ticket.expires_at,
     });
     if (allFeeds.length > 0 && feedCount === 0) {
@@ -1326,6 +1398,38 @@ function compatibilityStatus(remote) {
   };
 }
 
+function expectedNetworkId(route) {
+  const network = String(route?.network || "mainnet").trim();
+  return !network || network === "mainnet" ? "agent-feed-mainnet" : network;
+}
+
+function networkCompatibilityStatus(route, payload) {
+  const expected = expectedNetworkId(route);
+  const actual = String(payload?.network_id || payload?.networkId || "").trim();
+  if (!actual) {
+    return {
+      compatible: false,
+      expected,
+      actual: "",
+      message: "network metadata unavailable; update your peer to the latest version",
+    };
+  }
+  if (actual === expected) {
+    return {
+      compatible: true,
+      expected,
+      actual,
+      message: "compatible",
+    };
+  }
+  return {
+    compatible: false,
+    expected,
+    actual,
+    message: `network mismatch; expected ${expected}, got ${actual}`,
+  };
+}
+
 async function startFollowingRoute(route) {
   const targets = route.followingTargets.map(normalizeFollowTarget).filter(Boolean);
   logInfo("feed.following.selected", {
@@ -1389,6 +1493,10 @@ async function fetchFollowingTarget(route, target) {
       ok: response.ok,
     });
     if (!response.ok) {
+      if (response.status === 426) {
+        const message = await responseErrorMessage(response, "update your peer to the latest version");
+        return { target: clean, ticket: undefined, headlines: [], error: message };
+      }
       throw new Error(`following target failed: ${response.status}`);
     }
     const ticket = await response.json();
@@ -1396,6 +1504,15 @@ async function fetchFollowingTarget(route, target) {
     if (!status.compatible) {
       logWarn("feed.following.target.version_mismatch", { target: clean, message: status.message });
       return { target: clean, ticket, headlines: [], error: status.message };
+    }
+    const networkStatus = networkCompatibilityStatus(route, ticket);
+    if (!networkStatus.compatible) {
+      logWarn("feed.following.target.network_mismatch", {
+        target: clean,
+        expected: networkStatus.expected,
+        actual: networkStatus.actual,
+      });
+      return { target: clean, ticket, headlines: [], error: networkStatus.message };
     }
     const targetRoute = {
       ...route,
@@ -1408,6 +1525,7 @@ async function fetchFollowingTarget(route, target) {
       target: clean,
       ticket,
       headlines: snapshotHeadlines(ticket)
+        .filter((item) => compatibilityStatus(item.compatibility || ticket.compatibility).compatible)
         .filter((item) => headlineMatchesRoute(item, targetRoute))
         .map((item) => enrichHeadlineFromTicket(item, ticket)),
       error: undefined,

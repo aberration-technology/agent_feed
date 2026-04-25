@@ -1,6 +1,7 @@
 use agent_feed_directory::{
     DirectoryError, DirectoryStore, GithubDiscoveryTicket, GithubProfileView, OrgDiscoveryTicket,
     OrgRouteFilter, RemoteHeadlineView, RemoteUserRoute, SignedBrowserSeed,
+    ensure_current_compatibility, ensure_network_id,
 };
 use agent_feed_identity::{GithubLogin, GithubOrgName, GithubTeamSlug};
 use agent_feed_identity_github::{
@@ -22,12 +23,15 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
 const SNAPSHOT_HEADLINE_LIMIT: usize = 64;
+const MAX_PUBLISH_CAPSULES: usize = 16;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,7 +52,8 @@ impl EdgeConfig {
             network_id: "agent-feed-mainnet".to_string(),
             edge_domain: "https://api.feed.aberration.technology".to_string(),
             browser_app_base_url: "https://feed.aberration.technology".to_string(),
-            github_callback_url: "https://feed.aberration.technology/callback/github".to_string(),
+            github_callback_url: "https://api.feed.aberration.technology/callback/github"
+                .to_string(),
             bootstrap_peers: vec![
                 "/dns4/api.feed.aberration.technology/tcp/7747".to_string(),
                 "/dns4/api.feed.aberration.technology/udp/7747/quic-v1".to_string(),
@@ -192,6 +197,7 @@ impl<R: GithubResolver, A: GithubAccessResolver> EdgeResolver<R, A> {
         &self,
         route: &RemoteUserRoute,
     ) -> Result<GithubDiscoveryTicket, EdgeError> {
+        ensure_network_id(&self.config.network_id, &route.network.network_id())?;
         let profile = self.github.resolve_login(&route.login)?;
         self.authorize_profile(profile.id)?;
         let feeds = self
@@ -353,6 +359,12 @@ impl ResolveGithubResponse {
         config: &EdgeConfig,
         headlines: Vec<RemoteHeadlineView>,
     ) -> Self {
+        let mut feeds: Vec<_> = ticket
+            .candidate_feeds
+            .iter()
+            .map(|feed| resolve_feed_view(feed, config))
+            .collect();
+        merge_resolve_feed_views(&mut feeds, feed_views_from_headlines(headlines.clone()));
         Self {
             state: "resolved".to_string(),
             network_id: ticket.network_id.clone(),
@@ -364,11 +376,7 @@ impl ResolveGithubResponse {
                 config,
                 ticket.resolved_github_id.get(),
             ),
-            feeds: ticket
-                .candidate_feeds
-                .iter()
-                .map(|feed| resolve_feed_view(feed, config))
-                .collect(),
+            feeds,
             headlines,
             browser_seed_url: "/browser-seed".to_string(),
             expires_at: ticket.expires_at,
@@ -432,6 +440,42 @@ fn resolve_feed_view(
         publisher_avatar: Some(config.github_avatar_url(feed.owner.github_user_id.get())),
         publisher_verified: true,
         last_seen_at: feed.last_seen_at,
+    }
+}
+
+fn feed_views_from_headlines(headlines: Vec<RemoteHeadlineView>) -> Vec<ResolveFeedView> {
+    let mut feeds = Vec::new();
+    for headline in headlines {
+        if feeds
+            .iter()
+            .any(|feed: &ResolveFeedView| feed.feed_id == headline.feed_id)
+        {
+            continue;
+        }
+        feeds.push(ResolveFeedView {
+            feed_id: headline.feed_id,
+            label: headline.feed_label,
+            compatibility: headline.compatibility,
+            visibility: "public".to_string(),
+            publisher_login: headline.publisher_login,
+            publisher_display_name: headline.publisher_display_name,
+            publisher_avatar: headline.publisher_avatar,
+            publisher_verified: headline.verified,
+            last_seen_at: OffsetDateTime::now_utc(),
+        });
+    }
+    feeds
+}
+
+fn merge_resolve_feed_views(feeds: &mut Vec<ResolveFeedView>, extra: Vec<ResolveFeedView>) {
+    for feed in extra {
+        if feeds
+            .iter()
+            .any(|existing| existing.feed_id == feed.feed_id)
+        {
+            continue;
+        }
+        feeds.push(feed);
     }
 }
 
@@ -556,9 +600,31 @@ struct HttpState {
 #[derive(Clone, Default)]
 struct SnapshotStore {
     headlines: Arc<Mutex<VecDeque<RemoteHeadlineView>>>,
+    path: Option<PathBuf>,
 }
 
 impl SnapshotStore {
+    fn from_env() -> Self {
+        env::var("AGENT_FEED_EDGE_SNAPSHOT_PATH")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .map(Self::from_path)
+            .unwrap_or_default()
+    }
+
+    fn from_path(path: PathBuf) -> Self {
+        let headlines = fs::read_to_string(&path)
+            .ok()
+            .and_then(|input| serde_json::from_str::<Vec<RemoteHeadlineView>>(&input).ok())
+            .map(VecDeque::from)
+            .unwrap_or_default();
+        Self {
+            headlines: Arc::new(Mutex::new(headlines)),
+            path: Some(path),
+        }
+    }
+
     fn push(&self, headline: RemoteHeadlineView) {
         let Ok(mut headlines) = self.headlines.lock() else {
             tracing::warn!("network snapshot headline store lock poisoned");
@@ -575,6 +641,7 @@ impl SnapshotStore {
         while headlines.len() > SNAPSHOT_HEADLINE_LIMIT {
             headlines.pop_front();
         }
+        self.persist_locked(&headlines);
     }
 
     fn headlines(&self) -> Vec<RemoteHeadlineView> {
@@ -582,6 +649,35 @@ impl SnapshotStore {
             .lock()
             .map(|headlines| headlines.iter().cloned().collect())
             .unwrap_or_default()
+    }
+
+    fn feeds(&self) -> Vec<ResolveFeedView> {
+        feed_views_from_headlines(self.headlines())
+    }
+
+    fn persist_locked(&self, headlines: &VecDeque<RemoteHeadlineView>) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            tracing::warn!(path = %parent.display(), error = %err, "failed to create edge snapshot dir");
+            return;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let payload: Vec<_> = headlines.iter().cloned().collect();
+        match serde_json::to_vec_pretty(&payload)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| fs::write(&tmp, bytes))
+            .and_then(|()| fs::rename(&tmp, path))
+        {
+            Ok(()) => {}
+            Err(err) => {
+                let _ = fs::remove_file(&tmp);
+                tracing::warn!(path = %path.display(), error = %err, "failed to persist edge snapshot");
+            }
+        }
     }
 }
 
@@ -591,7 +687,7 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
     }
     let state = Arc::new(HttpState {
         config: config.edge,
-        snapshot: SnapshotStore::default(),
+        snapshot: SnapshotStore::from_env(),
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -694,8 +790,8 @@ async fn spawn_udp_probe_listener(
 
 fn fabric_probe_payload(edge: &EdgeConfig, transport: &str) -> String {
     serde_json::json!({
-        "product": "feed",
-        "protocol": "agent-feed.edge/1",
+        "product": agent_feed_p2p_proto::AGENT_FEED_PRODUCT,
+        "protocol": agent_feed_p2p_proto::AGENT_FEED_EDGE_PROTOCOL,
         "protocol_version": agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
         "model_version": agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
         "min_model_version": agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION,
@@ -876,20 +972,22 @@ async fn callback_github(
     let expires_at = expires_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    let redirect_url = format!(
-        "{}?{}",
-        final_url,
-        encode_query(&[
-            ("state", payload.state.as_str()),
-            ("github_user_id", github_user_id.as_str()),
-            ("login", profile.login.as_str()),
-            ("name", profile.name.as_deref().unwrap_or("")),
-            ("avatar_url", avatar_url.as_str()),
-            ("session", session.as_str()),
-            ("expires_at", expires_at.as_str()),
-            ("return_to", payload.return_to.as_str()),
-        ])
-    );
+    let callback_query = encode_query(&[
+        ("state", payload.state.as_str()),
+        ("github_user_id", github_user_id.as_str()),
+        ("login", profile.login.as_str()),
+        ("name", profile.name.as_deref().unwrap_or("")),
+        ("avatar_url", avatar_url.as_str()),
+        ("session", session.as_str()),
+        ("expires_at", expires_at.as_str()),
+        ("return_to", payload.return_to.as_str()),
+    ]);
+    let separator = if payload.client.ends_with("-cli") {
+        "?"
+    } else {
+        "#"
+    };
+    let redirect_url = format!("{final_url}{separator}{callback_query}");
     Redirect::temporary(&redirect_url).into_response()
 }
 
@@ -942,6 +1040,11 @@ async fn resolve_github(
             StatusCode::TOO_MANY_REQUESTS,
             "github resolver rate limited",
         ),
+        Err(
+            err @ EdgeError::Directory(
+                DirectoryError::NetworkMismatch { .. } | DirectoryError::IncompatibleProtocol(_),
+            ),
+        ) => edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string()),
         Err(err) => edge_error(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -1025,15 +1128,23 @@ async fn browser_seed(State(state): State<Arc<HttpState>>) -> impl IntoResponse 
     }
 }
 
-async fn network_snapshot(State(state): State<Arc<HttpState>>) -> Json<serde_json::Value> {
-    Json(network_snapshot_value(
-        &state.config,
-        state.snapshot.headlines(),
-    ))
+async fn network_snapshot(
+    State(state): State<Arc<HttpState>>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> impl IntoResponse {
+    let requested = requested_network_id(query.get("network").map(String::as_str), &state.config);
+    if let Err(err) = ensure_network_id(&state.config.network_id, &requested) {
+        return edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string());
+    }
+    Json(network_snapshot_value(&state.config, &state.snapshot)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
 struct NetworkPublishRequest {
+    #[serde(default)]
+    network_id: Option<String>,
+    #[serde(default)]
+    compatibility: Option<ProtocolCompatibility>,
     #[serde(default)]
     feed_name: Option<String>,
     #[serde(default)]
@@ -1043,6 +1154,7 @@ struct NetworkPublishRequest {
 #[derive(Debug, Serialize)]
 struct NetworkPublishResponse {
     state: &'static str,
+    compatibility: ProtocolCompatibility,
     accepted: usize,
     headlines: usize,
 }
@@ -1052,16 +1164,42 @@ async fn network_publish(
     headers: HeaderMap,
     Json(request): Json<NetworkPublishRequest>,
 ) -> impl IntoResponse {
-    let Some(session) = verify_bearer_session(&headers) else {
+    let Some(bearer) = verify_bearer_session(&headers) else {
         return edge_error(StatusCode::UNAUTHORIZED, "github session required");
     };
+    let session = bearer.session;
+    let Some(network_id) = request.network_id.as_deref() else {
+        return edge_error(
+            StatusCode::BAD_REQUEST,
+            "network_id is required; update your peer to the latest version",
+        );
+    };
+    if let Err(err) = ensure_network_id(&state.config.network_id, network_id) {
+        return edge_error(StatusCode::BAD_REQUEST, err.to_string());
+    }
+    let Some(compatibility) = request.compatibility.as_ref() else {
+        return edge_error(
+            StatusCode::UPGRADE_REQUIRED,
+            "compatibility metadata is required; update your peer to the latest version",
+        );
+    };
+    if let Err(err) = ensure_current_compatibility(compatibility) {
+        return edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string());
+    }
     if request.capsules.is_empty() {
         return Json(NetworkPublishResponse {
             state: "accepted",
+            compatibility: ProtocolCompatibility::current(),
             accepted: 0,
             headlines: state.snapshot.headlines().len(),
         })
         .into_response();
+    }
+    if request.capsules.len() > MAX_PUBLISH_CAPSULES {
+        return edge_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("publish batch exceeds {MAX_PUBLISH_CAPSULES} capsules"),
+        );
     }
 
     let feed_name = request
@@ -1072,7 +1210,13 @@ async fn network_publish(
         .unwrap_or("workstation");
     let mut accepted = 0usize;
     for capsule in request.capsules {
-        if !capsule.verify_capsule().unwrap_or(false) {
+        if let Err(err) = ensure_current_compatibility(&capsule.value.compatibility) {
+            return edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string());
+        }
+        if !capsule
+            .verify_capsule_with_secret(&bearer.token)
+            .unwrap_or(false)
+        {
             return edge_error(StatusCode::BAD_REQUEST, "invalid capsule signature");
         }
         if capsule.value.privacy_class != agent_feed_core::PrivacyClass::Redacted {
@@ -1091,6 +1235,7 @@ async fn network_publish(
         let view = RemoteHeadlineView {
             feed_id: capsule.value.feed_id.clone(),
             feed_label: feed_name.to_string(),
+            compatibility: capsule.value.compatibility.clone(),
             publisher_github_user_id: publisher.github_user_id,
             publisher_login,
             publisher_display_name: publisher.display_name.clone(),
@@ -1113,6 +1258,7 @@ async fn network_publish(
     );
     Json(NetworkPublishResponse {
         state: "accepted",
+        compatibility: ProtocolCompatibility::current(),
         accepted,
         headlines: state.snapshot.headlines().len(),
     })
@@ -1131,10 +1277,7 @@ fn headline_matches_github_route(
     identity_matches && route.stream_filter.permits_label(&headline.feed_label)
 }
 
-fn network_snapshot_value(
-    config: &EdgeConfig,
-    headlines: Vec<RemoteHeadlineView>,
-) -> serde_json::Value {
+fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serde_json::Value {
     serde_json::json!({
         "state": "ready",
         "product": "feed",
@@ -1146,9 +1289,16 @@ fn network_snapshot_value(
         "feed_mode": "discovery",
         "story_only": true,
         "raw_events": false,
-        "feeds": [],
-        "headlines": headlines,
+        "feeds": snapshot.feeds(),
+        "headlines": snapshot.headlines(),
     })
+}
+
+fn requested_network_id(value: Option<&str>, config: &EdgeConfig) -> String {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("mainnet") => config.network_id.clone(),
+        Some(value) => value.to_string(),
+    }
 }
 
 fn edge_error(status: StatusCode, message: impl Into<String>) -> axum::response::Response {
@@ -1167,6 +1317,12 @@ struct VerifiedSession {
     github_user_id: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedBearer {
+    session: VerifiedSession,
+    token: String,
+}
+
 fn issue_session_token(github_user_id: u64, expires_at: OffsetDateTime) -> Option<String> {
     let expires = expires_at.unix_timestamp();
     let secret = session_secret()?;
@@ -1177,10 +1333,14 @@ fn issue_session_token(github_user_id: u64, expires_at: OffsetDateTime) -> Optio
     ))
 }
 
-fn verify_bearer_session(headers: &HeaderMap) -> Option<VerifiedSession> {
+fn verify_bearer_session(headers: &HeaderMap) -> Option<VerifiedBearer> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
     let token = value.strip_prefix("Bearer ")?.trim();
-    verify_session_token(token)
+    let session = verify_session_token(token)?;
+    Some(VerifiedBearer {
+        session,
+        token: token.to_string(),
+    })
 }
 
 fn verify_session_token(token: &str) -> Option<VerifiedSession> {
@@ -1686,20 +1846,42 @@ mod tests {
         assert_eq!(response.state, "resolved");
         assert_eq!(response.requested_login, "mosure");
         assert_eq!(response.github_user_id, 123);
-        assert_eq!(response.compatibility.protocol_version, 1);
-        assert_eq!(response.compatibility.model_version, 1);
+        assert_eq!(
+            response.compatibility.protocol_version,
+            agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            response.compatibility.model_version,
+            agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION
+        );
         assert_eq!(response.browser_seed_url, "/browser-seed");
         assert_eq!(
             response.profile.avatar.as_deref(),
             Some("https://api.feed.aberration.technology/avatar/github/123")
         );
         assert_eq!(response.feeds[0].publisher_login, "mosure");
-        assert_eq!(response.feeds[0].compatibility.protocol_version, 1);
+        assert_eq!(
+            response.feeds[0].compatibility.protocol_version,
+            agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION
+        );
         assert_eq!(
             response.feeds[0].publisher_avatar.as_deref(),
             Some("https://api.feed.aberration.technology/avatar/github/123")
         );
         assert!(response.feeds[0].publisher_verified);
+    }
+
+    #[test]
+    fn edge_rejects_wrong_requested_network() {
+        let edge = resolver_with_directory();
+        let err = edge
+            .resolve_github_route("/mosure", Some("network=agent-feed-lab"))
+            .expect_err("wrong network is rejected");
+
+        assert!(matches!(
+            err,
+            EdgeError::Directory(DirectoryError::NetworkMismatch { .. })
+        ));
     }
 
     #[test]
@@ -1717,17 +1899,14 @@ mod tests {
     }
 
     #[test]
-    fn github_oauth_callback_uses_feed_host() {
+    fn github_oauth_callback_uses_edge_host() {
         let config = config();
 
         assert_eq!(
             config.github_callback_url(),
-            "https://feed.aberration.technology/callback/github"
-        );
-        assert_ne!(
-            config.github_callback_url(),
             "https://api.feed.aberration.technology/callback/github"
         );
+        assert_ne!(config.github_callback_url(), config.browser_app_base_url);
     }
 
     #[test]
@@ -1737,7 +1916,7 @@ mod tests {
         assert!(payload.contains("\"product\":\"feed\""));
         assert!(payload.contains("\"protocol\":\"agent-feed.edge/1\""));
         assert!(payload.contains("\"protocol_version\":1"));
-        assert!(payload.contains("\"model_version\":1"));
+        assert!(payload.contains("\"model_version\":3"));
         assert!(payload.contains("\"transport\":\"tcp\""));
         assert!(payload.contains("\"state\":\"ready\""));
         assert!(!payload.contains("secret"));
@@ -1746,7 +1925,8 @@ mod tests {
 
     #[test]
     fn network_snapshot_supports_global_discovery_shape() {
-        let snapshot = network_snapshot_value(&config(), Vec::new());
+        let store = SnapshotStore::default();
+        let snapshot = network_snapshot_value(&config(), &store);
 
         assert_eq!(snapshot["state"], "ready");
         assert_eq!(snapshot["feed_mode"], "discovery");
@@ -1755,6 +1935,55 @@ mod tests {
         assert!(snapshot["feeds"].as_array().is_some());
         assert!(snapshot["headlines"].as_array().is_some());
         assert_eq!(snapshot["compatibility"]["protocol_version"], 1);
+    }
+
+    #[test]
+    fn network_snapshot_query_resolves_mainnet_alias_only() {
+        let config = config();
+
+        assert_eq!(
+            requested_network_id(Some("mainnet"), &config),
+            "agent-feed-mainnet"
+        );
+        assert!(
+            ensure_network_id(
+                &config.network_id,
+                &requested_network_id(Some("agent-feed-mainnet"), &config)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            ensure_network_id(
+                &config.network_id,
+                &requested_network_id(Some("agent-feed-lab"), &config)
+            ),
+            Err(DirectoryError::NetworkMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn network_publish_request_requires_compatibility_metadata() {
+        let old_request: NetworkPublishRequest =
+            serde_json::from_value(serde_json::json!({"feed_name":"workstation","capsules":[]}))
+                .expect("old shape parses");
+        assert!(old_request.network_id.is_none());
+        assert!(old_request.compatibility.is_none());
+
+        let current_request: NetworkPublishRequest = serde_json::from_value(serde_json::json!({
+            "network_id": "agent-feed-mainnet",
+            "compatibility": ProtocolCompatibility::current(),
+            "feed_name":"workstation",
+            "capsules":[],
+        }))
+        .expect("current shape parses");
+        assert_eq!(
+            current_request.network_id.as_deref(),
+            Some("agent-feed-mainnet")
+        );
+        assert_eq!(
+            current_request.compatibility,
+            Some(ProtocolCompatibility::current())
+        );
     }
 
     #[test]
@@ -1783,6 +2012,7 @@ mod tests {
         let headline = RemoteHeadlineView {
             feed_id: "local:workstation".to_string(),
             feed_label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
             publisher_display_name: Some("mosure".to_string()),
@@ -1797,7 +2027,7 @@ mod tests {
 
         store.push(headline.clone());
         store.push(headline);
-        let snapshot = network_snapshot_value(&config(), store.headlines());
+        let snapshot = network_snapshot_value(&config(), &store);
 
         assert_eq!(
             snapshot["headlines"].as_array().expect("headlines").len(),
@@ -1815,6 +2045,10 @@ mod tests {
             snapshot["headlines"][0]["headline"],
             serde_json::json!("codex finished release pass")
         );
+        assert_eq!(
+            snapshot["feeds"][0]["publisher_login"],
+            serde_json::json!("mosure")
+        );
     }
 
     #[test]
@@ -1823,6 +2057,7 @@ mod tests {
         let matching = RemoteHeadlineView {
             feed_id: "local:workstation".to_string(),
             feed_label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
             publisher_github_user_id: Some(123),
             publisher_login: "old-login".to_string(),
             publisher_display_name: None,

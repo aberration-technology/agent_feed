@@ -1,9 +1,8 @@
 use agent_feed_core::{AgentEvent, PrivacyClass};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use sha2::{Digest, Sha256};
 use std::env;
-use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrivacyConfig {
@@ -29,7 +28,14 @@ impl Default for PrivacyConfig {
             redact_patterns: vec![
                 "sk-[A-Za-z0-9_-]+".to_string(),
                 "ghp_[A-Za-z0-9_]+".to_string(),
+                "github_pat_[A-Za-z0-9_]+".to_string(),
                 "AKIA[0-9A-Z]{16}".to_string(),
+                "ASIA[0-9A-Z]{16}".to_string(),
+                "(?i)bearer\\s+[A-Za-z0-9._~+/=-]{20,}".to_string(),
+                "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+".to_string(),
+                "(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"
+                    .to_string(),
+                "(?i)(password|passwd|secret|token|api[_-]?key)\\s*=\\s*[^\\s]+".to_string(),
             ],
             redact_paths: vec![
                 ".env".to_string(),
@@ -84,6 +90,11 @@ impl Redactor {
     pub fn redact_event(&self, mut event: AgentEvent) -> AgentEvent {
         event.title = self.redact_text(&event.title);
         event.summary = event.summary.map(|value| self.redact_text(&value));
+        event.project = event.project.map(|value| self.redact_text(&value));
+        event.session_id = event.session_id.map(|value| self.redact_text(&value));
+        event.turn_id = event.turn_id.map(|value| self.redact_text(&value));
+        event.item_id = event.item_id.map(|value| self.redact_text(&value));
+        event.tool = event.tool.map(|value| self.redact_text(&value));
         event.command = event.command.map(|value| self.redact_text(&value));
         event.uri = event.uri.map(|value| self.redact_uri(&value));
         event.cwd = event.cwd.map(|value| self.redact_path(&value));
@@ -91,6 +102,11 @@ impl Redactor {
             .files
             .into_iter()
             .map(|value| self.redact_path(&value))
+            .collect();
+        event.tags = event
+            .tags
+            .into_iter()
+            .map(|value| self.redact_text(&value))
             .collect();
         event.privacy = PrivacyClass::Redacted;
         event
@@ -157,9 +173,20 @@ impl Redactor {
 }
 
 fn short_hash(input: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:08x}", hasher.finish())
+    hex_lower(&Sha256::digest(input.as_bytes()))
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[cfg(test)]

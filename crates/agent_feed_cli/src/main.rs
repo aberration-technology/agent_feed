@@ -11,7 +11,9 @@ use agent_feed_edge::{
 };
 use agent_feed_ingest::source_from_str;
 use agent_feed_install::{doctor_report, init_plan};
-use agent_feed_p2p_proto::{FeedVisibility, PublisherIdentity, Signed, StoryCapsule};
+use agent_feed_p2p_proto::{
+    FeedVisibility, ProtocolCompatibility, PublisherIdentity, Signed, StoryCapsule,
+};
 use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve_with_ready};
 use agent_feed_story::{CompiledStory, compile_events};
@@ -331,6 +333,8 @@ enum P2pCommand {
         dry_run: bool,
         #[arg(long, default_value = "https://api.feed.aberration.technology")]
         edge: String,
+        #[arg(long, default_value = "agent-feed-mainnet")]
+        network_id: String,
         #[arg(long)]
         auth_store: Option<PathBuf>,
         #[arg(
@@ -554,7 +558,9 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 move |bind| {
                     println!("serving http://{bind}/reel");
                     if p2p_enabled {
-                        println!("p2p browser discovery ux enabled");
+                        println!(
+                            "p2p browser discovery ux enabled; publishing still requires `agent-feed auth github` and `agent-feed p2p publish --feed <name>`"
+                        );
                     }
                     if let Some(capture) = capture {
                         start_serve_agent_capture(bind, capture);
@@ -1062,6 +1068,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             P2pCommand::Publish {
                 dry_run,
                 edge,
+                network_id,
                 auth_store,
                 feed,
                 sessions,
@@ -1097,6 +1104,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 info!(
                     feed_name = %feed,
                     %edge,
+                    %network_id,
                     agents = %agents,
                     selected_agents = ?selected_agents,
                     sessions,
@@ -1182,8 +1190,15 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         session.avatar_url.clone(),
                     )
                 });
-                let capsules =
-                    signed_capsules(&feed, &stories, &summary_config, publisher.as_ref())?;
+                let capsules = signed_capsules(
+                    &feed,
+                    &stories,
+                    &summary_config,
+                    publisher.as_ref(),
+                    session
+                        .as_ref()
+                        .and_then(|session| session.session_token.as_deref()),
+                )?;
                 info!(
                     feed_name = %feed,
                     capsules = capsules.len(),
@@ -1218,6 +1233,8 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     }
                 } else if let Some(session) = session {
                     let body = serde_json::to_string(&json!({
+                        "network_id": network_id,
+                        "compatibility": ProtocolCompatibility::current(),
                         "feed_name": feed,
                         "capsules": capsules,
                     }))?;
@@ -1741,6 +1758,27 @@ mod tests {
             panic!("expected p2p publish command");
         };
         assert_eq!(workspace, Some(PathBuf::from("/tmp/agent-feed-workspace")));
+    }
+
+    #[test]
+    fn p2p_publish_carries_network_id() {
+        let cli = Cli::try_parse_from([
+            "agent-feed",
+            "p2p",
+            "publish",
+            "--dry-run",
+            "--network-id",
+            "agent-feed-lab",
+        ])
+        .expect("network id parses");
+
+        let Commands::P2p {
+            command: P2pCommand::Publish { network_id, .. },
+        } = cli.command
+        else {
+            panic!("expected p2p publish command");
+        };
+        assert_eq!(network_id, "agent-feed-lab");
     }
 
     #[test]
@@ -2674,6 +2712,7 @@ fn signed_capsules(
     stories: &[CompiledStory],
     summary_config: &SummaryConfig,
     publisher: Option<&PublisherIdentity>,
+    signing_secret: Option<&str>,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
     let feed_id = format!("local:{feed}");
     let summaries = summarize_feed(&feed_id, stories, summary_config)?;
@@ -2696,7 +2735,15 @@ fn signed_capsules(
             if let Some(publisher) = publisher {
                 capsule = capsule.with_publisher(publisher.clone())?;
             }
-            Signed::sign_capsule(capsule, "local-codex").map_err(CliError::from)
+            if let Some(secret) = signing_secret {
+                let key_id = publisher
+                    .and_then(|publisher| publisher.github_user_id)
+                    .map(|id| format!("github:{id}"))
+                    .unwrap_or_else(|| "local-codex".to_string());
+                Signed::sign_capsule_with_secret(capsule, &key_id, secret).map_err(CliError::from)
+            } else {
+                Signed::sign_capsule(capsule, "local-codex").map_err(CliError::from)
+            }
         })
         .collect()
 }
@@ -3474,7 +3521,12 @@ fn post_edge_json_with_bearer(
         .as_deref()
         .ok_or_else(|| CliError::Http("github session token missing".to_string()))?;
     let url = format!("{}{}", edge.trim_end_matches('/'), path);
-    let mut child = ProcessCommand::new("curl")
+    let header_file = write_private_temp(
+        "agent-feed-header",
+        format!("Authorization: Bearer {token}\n").as_bytes(),
+    )?;
+    let body_file = write_private_temp("agent-feed-body", body.as_bytes())?;
+    let child = ProcessCommand::new("curl")
         .args([
             "-fsS",
             "-X",
@@ -3482,22 +3534,20 @@ fn post_edge_json_with_bearer(
             "-H",
             "Content-Type: application/json",
             "-H",
-            &format!("Authorization: Bearer {token}"),
+            &format!("@{}", header_file.display()),
             "--data-binary",
-            "@-",
+            &format!("@{}", body_file.display()),
             &url,
         ])
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| CliError::Http(format!("failed to start curl: {err}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(body.as_bytes())?;
-    }
     let output = child
         .wait_with_output()
         .map_err(|err| CliError::Http(format!("curl failed: {err}")))?;
+    let _ = fs::remove_file(&header_file);
+    let _ = fs::remove_file(&body_file);
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
@@ -3507,6 +3557,28 @@ fn post_edge_json_with_bearer(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )))
+}
+
+fn write_private_temp(prefix: &str, bytes: &[u8]) -> Result<PathBuf, CliError> {
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}.tmp",
+        std::process::id(),
+        time::OffsetDateTime::now_utc()
+            .unix_timestamp_nanos()
+            .unsigned_abs()
+    ));
+    fs::write(&path, bytes)?;
+    set_owner_only_permissions(&path)?;
+    Ok(path)
+}
+
+fn set_owner_only_permissions(path: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn auth_store_path(path: Option<PathBuf>) -> PathBuf {

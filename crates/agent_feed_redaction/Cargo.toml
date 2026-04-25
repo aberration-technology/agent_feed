@@ -1,6 +1,6 @@
 [package]
 name = "agent_feed_redaction"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 license.workspace = true
 description.workspace = true
@@ -11,6 +11,7 @@ rust-version.workspace = true
 agent_feed_core = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true
