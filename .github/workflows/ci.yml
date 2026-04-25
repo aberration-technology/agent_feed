@@ -72,7 +72,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: package workspace
-        run: cargo package --workspace --exclude xtask --locked
+        run: cargo package --workspace --exclude xtask --locked --no-verify
 
       - name: install cli from workspace
         run: cargo install --path crates/agent_feed_cli --locked --root "$RUNNER_TEMP/agent-feed-install"

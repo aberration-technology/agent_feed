@@ -2,10 +2,12 @@ use agent_feed_core::{HeadlineImage, PrivacyClass, Severity};
 use agent_feed_story::{CompiledStory, StoryFamily};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -169,7 +171,6 @@ pub struct GuardrailViolation {
 }
 
 const PROMPT_LEAKAGE_VIOLATION: &str = "prompt-leakage";
-const SUMMARY_QUALITY_VIOLATION: &str = "summary-quality";
 
 const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
     r"(?i)\braw\s+prompts?,\s*command output,\s*diffs?,\s*paths?,\s*(?:and\s+)?repo names?\s+omitted\b[\s.,;:]*",
@@ -197,6 +198,11 @@ pub enum FeedSummaryMode {
 pub enum SummaryProcessorConfig {
     Deterministic,
     CodexExec,
+    CodexSessionMemory {
+        store_path: String,
+        key: String,
+        command: String,
+    },
     ClaudeCodeExec,
     Process {
         command: String,
@@ -293,6 +299,7 @@ impl SummaryProcessorConfig {
         match self {
             Self::Deterministic => "deterministic",
             Self::CodexExec => "codex-exec",
+            Self::CodexSessionMemory { .. } => "codex-memory",
             Self::ClaudeCodeExec => "claude-code",
             Self::Process { .. } => "process",
             Self::HttpEndpoint { .. } => "http-endpoint",
@@ -485,6 +492,10 @@ pub struct ProcessorSummary {
     pub publish: Option<bool>,
     #[serde(default)]
     pub publish_reason: Option<String>,
+    #[serde(default)]
+    pub memory_digest: Option<String>,
+    #[serde(default)]
+    pub semantic_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -555,6 +566,153 @@ impl SummaryProcessor for ExternalProcessProcessor {
         let prompt = processor_prompt(request);
         let stdout = run_process(&self.command, &self.args, &prompt)?;
         parse_processor_output(&stdout)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SummaryMemoryStore {
+    records: BTreeMap<String, SummaryMemoryRecord>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SummaryMemoryRecord {
+    codex_session_id: Option<String>,
+    memory_digest: Option<String>,
+    semantic_fingerprint: Option<String>,
+    uses: u64,
+}
+
+pub struct CodexSessionMemoryProcessor {
+    store_path: PathBuf,
+    key: String,
+    command: String,
+}
+
+impl CodexSessionMemoryProcessor {
+    #[must_use]
+    pub fn new(
+        store_path: impl Into<PathBuf>,
+        key: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
+        Self {
+            store_path: store_path.into(),
+            key: key.into(),
+            command: command.into(),
+        }
+    }
+
+    fn load_store(&self) -> Result<SummaryMemoryStore, SummaryError> {
+        if !self.store_path.exists() {
+            return Ok(SummaryMemoryStore::default());
+        }
+        let input = fs::read_to_string(&self.store_path).map_err(|err| {
+            SummaryError::Processor(format!(
+                "summary memory read failed for {}: {err}",
+                self.store_path.display()
+            ))
+        })?;
+        serde_json::from_str(&input).map_err(SummaryError::from)
+    }
+
+    fn save_store(&self, store: &SummaryMemoryStore) -> Result<(), SummaryError> {
+        if let Some(parent) = self.store_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                SummaryError::Processor(format!(
+                    "summary memory directory create failed for {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let body = serde_json::to_string_pretty(store)?;
+        fs::write(&self.store_path, body).map_err(|err| {
+            SummaryError::Processor(format!(
+                "summary memory write failed for {}: {err}",
+                self.store_path.display()
+            ))
+        })
+    }
+
+    fn prompt_with_memory(
+        &self,
+        request: &SummaryRequest,
+        record: Option<&SummaryMemoryRecord>,
+    ) -> String {
+        let digest = record
+            .and_then(|record| record.memory_digest.as_deref())
+            .filter(|digest| !digest.trim().is_empty())
+            .unwrap_or("none");
+        let fingerprint = record
+            .and_then(|record| record.semantic_fingerprint.as_deref())
+            .filter(|fingerprint| !fingerprint.trim().is_empty())
+            .unwrap_or("none");
+        format!(
+            "You are the private local headline memory for one agent feed. Maintain continuity across calls, but publish only when the new redacted delta changes the public story. Do not run tools. Return JSON only. Include memory_digest and semantic_fingerprint.\nsummary_memory_key={}\nprior_memory_digest={}\nprior_semantic_fingerprint={}\n\n{}",
+            self.key,
+            clamp_chars(digest, 900),
+            clamp_chars(fingerprint, 180),
+            processor_prompt(request)
+        )
+    }
+}
+
+impl SummaryProcessor for CodexSessionMemoryProcessor {
+    fn name(&self) -> &str {
+        "codex-memory"
+    }
+
+    fn summarize(&self, request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+        let mut store = self.load_store()?;
+        let existing = store.records.get(&self.key).cloned();
+        let prompt = self.prompt_with_memory(request, existing.as_ref());
+        let mut args = vec!["exec".to_string()];
+        if let Some(session_id) = existing
+            .as_ref()
+            .and_then(|record| record.codex_session_id.as_deref())
+            .filter(|session_id| !session_id.trim().is_empty())
+        {
+            args.push("resume".to_string());
+            args.push("--json".to_string());
+            args.push("--skip-git-repo-check".to_string());
+            args.push(session_id.to_string());
+            args.push("-".to_string());
+        } else {
+            args.push("--json".to_string());
+            args.push("--sandbox".to_string());
+            args.push("read-only".to_string());
+            args.push("--ask-for-approval".to_string());
+            args.push("never".to_string());
+            args.push("--skip-git-repo-check".to_string());
+            args.push("-".to_string());
+        }
+        let stdout = run_process(&self.command, &args, &prompt)?;
+        let ParsedProcessorOutput {
+            summary,
+            codex_session_id,
+        } = parse_processor_output_with_meta(&stdout)?;
+        let mut record = existing.unwrap_or_default();
+        if codex_session_id.is_some() {
+            record.codex_session_id = codex_session_id;
+        }
+        if let Some(digest) = summary.memory_digest.as_ref() {
+            record.memory_digest = Some(clamp_chars(digest, 1400));
+        } else if record.memory_digest.is_none() {
+            record.memory_digest = Some(clamp_chars(
+                &format!("{} {}", summary.headline, summary.deck),
+                1400,
+            ));
+        }
+        if let Some(fingerprint) = summary.semantic_fingerprint.as_ref() {
+            record.semantic_fingerprint = Some(clamp_chars(fingerprint, 180));
+        } else {
+            record.semantic_fingerprint = Some(headline_fingerprint(&summary.headline));
+        }
+        record.uses = record.uses.saturating_add(1);
+        store.records.insert(self.key.clone(), record);
+        self.save_store(&store)?;
+        Ok(summary)
     }
 }
 
@@ -916,6 +1074,25 @@ fn summarize_request_inner(
                 )
                 .summarize(&processor_request)?
             }
+            SummaryProcessorConfig::CodexSessionMemory {
+                store_path,
+                key,
+                command,
+            } => {
+                let processor_request = request_for_external_processor(request, config)?;
+                match CodexSessionMemoryProcessor::new(store_path, key, command)
+                    .summarize(&processor_request)
+                {
+                    Ok(summary) => summary,
+                    Err(err) => {
+                        let mut summary = deterministic_output(request);
+                        summary.publish_reason = Some(format!(
+                            "codex-memory unavailable; deterministic fallback used: {err}"
+                        ));
+                        summary
+                    }
+                }
+            }
             SummaryProcessorConfig::ClaudeCodeExec => ExternalProcessProcessor::new(
                 "claude",
                 vec![
@@ -1120,6 +1297,8 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
                 .collect(),
             publish: None,
             publish_reason: None,
+            memory_digest: None,
+            semantic_fingerprint: None,
         };
     }
 
@@ -1178,6 +1357,8 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
         ],
         publish: None,
         publish_reason: None,
+        memory_digest: None,
+        semantic_fingerprint: None,
     }
 }
 
@@ -1278,6 +1459,7 @@ fn build_summary(
         "feed-rollup".to_string()
     };
 
+    let headline_fingerprint = headline_fingerprint(&headline);
     let mut summary = FeedSummary {
         story_window,
         source_agent_kinds,
@@ -1298,7 +1480,7 @@ fn build_summary(
             publish_action: PublishAction::Publish,
             publish_reason: processor_publish_reason
                 .unwrap_or_else(|| "local publish policy accepted the summary".to_string()),
-            headline_fingerprint: String::new(),
+            headline_fingerprint,
             max_headline_similarity: 0,
             max_deck_similarity: 0,
             guardrail_version: guardrails.version,
@@ -1312,7 +1494,6 @@ fn build_summary(
             violations,
         },
     };
-    repair_low_quality_summary(&mut summary, request, config)?;
     fit_capsule_budget(&mut summary, budget, guardrails)?;
     if processor_publish == Some(false)
         && config.publish.allow_processor_skip
@@ -1326,206 +1507,9 @@ fn build_summary(
                 "processor reported no meaningful feed change".to_string();
         }
     }
-    summary.metadata.headline_fingerprint = headline_fingerprint(&summary.headline);
     summary.metadata.output_chars =
         summary.headline.len() + summary.deck.len() + summary.lower_third.len();
     Ok(summary)
-}
-
-fn repair_low_quality_summary(
-    summary: &mut FeedSummary,
-    request: &SummaryRequest,
-    config: &SummaryConfig,
-) -> Result<(), SummaryError> {
-    let mut repaired = false;
-
-    if weak_headline(&summary.headline, request) {
-        let (fallback, violations) = clean_and_clamp(
-            &quality_fallback_headline(request),
-            config.budget.max_headline_chars,
-            &config.guardrails,
-        )?;
-        summary.metadata.violations.extend(violations);
-        if !fallback.is_empty() {
-            summary.headline = fallback;
-        }
-        repaired = true;
-    }
-
-    if weak_deck(&summary.deck) {
-        let (fallback, violations) = clean_and_clamp(
-            &quality_fallback_deck(request),
-            config.budget.max_deck_chars,
-            &config.guardrails,
-        )?;
-        summary.metadata.violations.extend(violations);
-        if !fallback.is_empty() {
-            summary.deck = fallback;
-        }
-        repaired = true;
-    }
-
-    if contains_placeholder_or_policy_copy(&summary.lower_third) {
-        summary.lower_third = "feed · redacted".to_string();
-        repaired = true;
-    }
-
-    let before_chips = summary.chips.len();
-    summary
-        .chips
-        .retain(|chip| !contains_placeholder_or_policy_copy(chip));
-    if summary.chips.len() != before_chips {
-        repaired = true;
-    }
-    if summary.chips.is_empty() {
-        summary.chips.push("redacted".to_string());
-        repaired = true;
-    }
-
-    if repaired {
-        push_summary_quality_violation(&mut summary.metadata.violations);
-    }
-    Ok(())
-}
-
-fn push_summary_quality_violation(violations: &mut Vec<GuardrailViolation>) {
-    if violations
-        .iter()
-        .any(|violation| violation.name == SUMMARY_QUALITY_VIOLATION)
-    {
-        return;
-    }
-    violations.push(GuardrailViolation {
-        name: SUMMARY_QUALITY_VIOLATION.to_string(),
-        action: GuardrailAction::Mask,
-    });
-}
-
-fn weak_headline(headline: &str, request: &SummaryRequest) -> bool {
-    if contains_placeholder_or_policy_copy(headline) {
-        return true;
-    }
-    let normalized = normalize_text(headline);
-    if normalized.is_empty() {
-        return true;
-    }
-    if normalized.contains("shell command failed") {
-        return true;
-    }
-    if request.stories.len() == 1 {
-        let story = &request.stories[0];
-        return normalized == "feed activity settled"
-            || normalized == format!("{} activity settled", normalize_text(&story.agent))
-            || (story.family == StoryFamily::Incident
-                && (normalized.contains("hit project command")
-                    || normalized.ends_with("hit command")
-                    || normalized.ends_with("incident settled")));
-    }
-    false
-}
-
-fn weak_deck(deck: &str) -> bool {
-    if contains_placeholder_or_policy_copy(deck) {
-        return true;
-    }
-    matches!(
-        normalize_text(deck).as_str(),
-        "" | "1 tool failures" | "one tool failures" | "shell command failed"
-    )
-}
-
-fn contains_placeholder_or_policy_copy(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("[project]")
-        || lower.contains("raw detail omitted")
-        || lower.contains("raw details omitted")
-        || lower.contains("raw output omitted")
-        || lower.contains("raw prompt")
-        || lower.contains("command output")
-        || lower.contains("repo names omitted")
-        || lower.contains("policy/omission")
-        || lower.contains("do not include")
-        || lower.contains("redacted story facts")
-        || lower.contains("use only the redacted")
-}
-
-fn quality_fallback_headline(request: &SummaryRequest) -> String {
-    if request.stories.len() != 1 {
-        return fallback_headline(request);
-    }
-    let story = &request.stories[0];
-    let agent = story.agent.as_str();
-    let display = format!("{} {}", story.headline, story.deck).to_ascii_lowercase();
-    match story.family {
-        StoryFamily::Incident => {
-            if display.contains("test command failed") {
-                format!("{agent} test command failed")
-            } else if display.contains("build command failed") {
-                format!("{agent} build command failed")
-            } else if display.contains("vcs command failed") {
-                format!("{agent} vcs command failed")
-            } else if display.contains("task command failed") {
-                format!("{agent} task command failed")
-            } else {
-                format!("{agent} hit a tool failure")
-            }
-        }
-        StoryFamily::Test => {
-            if display.contains("fail")
-                || matches!(story.severity, Severity::Warning | Severity::Critical)
-            {
-                format!("{agent} found failing tests")
-            } else {
-                format!("{agent} verified tests")
-            }
-        }
-        StoryFamily::Permission => format!("{agent} hit a permission boundary"),
-        StoryFamily::Command => format!("{agent} completed command work"),
-        StoryFamily::FileChange => format!("{agent} changed files"),
-        StoryFamily::Mcp => format!("{agent} saw mcp degradation"),
-        StoryFamily::Plan => format!("{agent} updated the plan"),
-        StoryFamily::Turn => format!("{agent} completed a turn"),
-        StoryFamily::IdleRecap => format!("{agent} activity settled"),
-    }
-}
-
-fn quality_fallback_deck(request: &SummaryRequest) -> String {
-    if request.stories.len() != 1 {
-        return fallback_deck(request);
-    }
-    let story = &request.stories[0];
-    let display = format!("{} {}", story.headline, story.deck).to_ascii_lowercase();
-    match story.family {
-        StoryFamily::Incident => {
-            if display.contains("test command failed") {
-                "test command failed.".to_string()
-            } else if display.contains("build command failed") {
-                "build command failed.".to_string()
-            } else if display.contains("vcs command failed") {
-                "vcs command failed.".to_string()
-            } else if display.contains("task command failed") {
-                "task command failed.".to_string()
-            } else {
-                "tool failed during the turn.".to_string()
-            }
-        }
-        StoryFamily::Test => {
-            if display.contains("fail")
-                || matches!(story.severity, Severity::Warning | Severity::Critical)
-            {
-                "tests need attention.".to_string()
-            } else {
-                "tests passed.".to_string()
-            }
-        }
-        StoryFamily::Permission => "permission boundary reached.".to_string(),
-        StoryFamily::Command => "command activity settled.".to_string(),
-        StoryFamily::FileChange => "file changes settled.".to_string(),
-        StoryFamily::Mcp => "mcp degraded during the turn.".to_string(),
-        StoryFamily::Plan => "plan changed.".to_string(),
-        StoryFamily::Turn => "turn completed.".to_string(),
-        StoryFamily::IdleRecap => "feed activity settled.".to_string(),
-    }
 }
 
 fn clean_and_clamp(
@@ -1711,25 +1695,24 @@ fn apply_publish_decision(
     summary.metadata.max_deck_similarity = nearest_deck;
     summary.metadata.headline_fingerprint = headline_fingerprint(&summary.headline);
 
+    if summary.score >= policy.severe_score_bypass {
+        summary.metadata.publish_action = PublishAction::Publish;
+        summary.metadata.publish_reason =
+            "high-severity summary bypassed duplicate suppression".to_string();
+        return true;
+    }
+
+    if is_generic_or_low_signal_summary(summary) {
+        summary.metadata.publish_action = PublishAction::SkipProcessor;
+        summary.metadata.publish_reason =
+            "summary quality gate rejected a generic low-context headline".to_string();
+        return false;
+    }
+
     let duplicate = nearest.is_some()
         && nearest_headline >= policy.max_headline_similarity
         && (nearest_headline == 100
             || nearest_deck >= policy.max_deck_similarity_when_headline_matches);
-    let exact_duplicate = duplicate && nearest_headline == 100 && nearest_deck == 100;
-    if exact_duplicate {
-        summary.metadata.publish_action = PublishAction::SkipDuplicate;
-        summary.metadata.publish_reason =
-            "headline exactly matched a recent published summary".to_string();
-        return false;
-    }
-
-    if summary.score >= policy.severe_score_bypass {
-        summary.metadata.publish_action = PublishAction::Publish;
-        summary.metadata.publish_reason =
-            "high-severity summary bypassed fuzzy duplicate suppression".to_string();
-        return true;
-    }
-
     if duplicate {
         summary.metadata.publish_action = PublishAction::SkipDuplicate;
         summary.metadata.publish_reason = format!(
@@ -1747,6 +1730,31 @@ fn apply_publish_decision(
         "no recent matching feed summary".to_string()
     };
     true
+}
+
+fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
+    let headline = normalize_text(&summary.headline);
+    let deck = normalize_text(&summary.deck);
+    let combined = format!("{headline} {deck}");
+    [
+        "feed activity settled",
+        "activity settled",
+        "shell command failed",
+        "hit project command",
+        "hit command",
+        "tool failures",
+        "settled stories",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
+        || (summary.story_family == StoryFamily::FileChange
+            && headline.contains("changed")
+            && headline.contains("file")
+            && deck.contains("changed")
+            && deck.contains("file")
+            && !combined.contains("test")
+            && !combined.contains("verified")
+            && !combined.contains("complete"))
 }
 
 #[must_use]
@@ -1899,18 +1907,117 @@ fn image_processor_prompt(request: &ImageRequest) -> String {
     clamp_chars(&base, request.policy.max_prompt_chars)
 }
 
+struct ParsedProcessorOutput {
+    summary: ProcessorSummary,
+    codex_session_id: Option<String>,
+}
+
 fn parse_processor_output(output: &str) -> Result<ProcessorSummary, SummaryError> {
+    parse_processor_output_with_meta(output).map(|parsed| parsed.summary)
+}
+
+fn parse_processor_output_with_meta(output: &str) -> Result<ParsedProcessorOutput, SummaryError> {
     if let Ok(summary) = serde_json::from_str::<ProcessorSummary>(output) {
-        return Ok(summary);
+        return Ok(ParsedProcessorOutput {
+            summary,
+            codex_session_id: None,
+        });
     }
-    Ok(ProcessorSummary {
-        headline: "feed activity settled".to_string(),
-        deck: clamp_chars(output.trim(), 220),
-        lower_third: Some("external processor · redacted".to_string()),
-        chips: vec!["external".to_string(), "redacted".to_string()],
-        publish: None,
-        publish_reason: None,
+
+    let mut codex_session_id = None;
+    let mut last_message = None::<String>;
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("session_meta") {
+            codex_session_id = value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .or(codex_session_id);
+        }
+        if let Some(message) = codex_message_text(&value) {
+            last_message = Some(message);
+        }
+    }
+    if let Some(message) = last_message {
+        if let Some(json) = extract_json_object(&message)
+            && let Ok(summary) = serde_json::from_str::<ProcessorSummary>(json)
+        {
+            return Ok(ParsedProcessorOutput {
+                summary,
+                codex_session_id,
+            });
+        }
+        return Ok(ParsedProcessorOutput {
+            summary: ProcessorSummary {
+                headline: "feed activity settled".to_string(),
+                deck: clamp_chars(message.trim(), 220),
+                lower_third: Some("external processor · redacted".to_string()),
+                chips: vec!["external".to_string(), "redacted".to_string()],
+                publish: None,
+                publish_reason: Some("processor returned prose instead of json".to_string()),
+                memory_digest: None,
+                semantic_fingerprint: None,
+            },
+            codex_session_id,
+        });
+    }
+
+    Ok(ParsedProcessorOutput {
+        summary: ProcessorSummary {
+            headline: "feed activity settled".to_string(),
+            deck: clamp_chars(output.trim(), 220),
+            lower_third: Some("external processor · redacted".to_string()),
+            chips: vec!["external".to_string(), "redacted".to_string()],
+            publish: None,
+            publish_reason: Some("processor output did not include a final message".to_string()),
+            memory_digest: None,
+            semantic_fingerprint: None,
+        },
+        codex_session_id,
     })
+}
+
+fn codex_message_text(value: &serde_json::Value) -> Option<String> {
+    let payload = value.get("payload")?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("event_msg")
+        && payload.get("type").and_then(serde_json::Value::as_str) == Some("task_complete")
+    {
+        return payload
+            .get("last_agent_message")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("response_item")
+        || payload.get("type").and_then(serde_json::Value::as_str) != Some("message")
+        || payload.get("role").and_then(serde_json::Value::as_str) != Some("assistant")
+    {
+        return None;
+    }
+    let content = payload.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|item| {
+            item.get("text")
+                .or_else(|| item.get("content"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn extract_json_object(input: &str) -> Option<&str> {
+    let start = input.find('{')?;
+    let end = input.rfind('}')?;
+    (end > start).then_some(&input[start..=end])
 }
 
 fn parse_image_processor_output(
@@ -2074,7 +2181,7 @@ fn clamp_chars(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_feed_core::{EventKind, SourceKind};
+    use agent_feed_core::{EventKind, Severity, SourceKind};
     use agent_feed_story::compile_events;
 
     fn story(title: &str, score: u8) -> CompiledStory {
@@ -2090,8 +2197,16 @@ mod tests {
         compile_events([event]).remove(0)
     }
 
+    fn verified_story(score: u8) -> CompiledStory {
+        let mut story = story("codex verified tests", score);
+        story.family = StoryFamily::Test;
+        story.headline = "codex verified tests".to_string();
+        story.deck = "tests passed after the update.".to_string();
+        story
+    }
+
     #[test]
-    fn p2p_rollup_reduces_many_stories_to_one_bounded_summary() {
+    fn deterministic_rollup_skips_count_only_summary() {
         let stories = (0..12)
             .map(|index| story(&format!("codex changed secret_repo {index}"), 78))
             .collect::<Vec<_>>();
@@ -2099,10 +2214,24 @@ mod tests {
             summarize_feed("local:workstation", &stories, &SummaryConfig::p2p_default())
                 .expect("summary compiles");
 
-        assert_eq!(summaries.len(), 1);
-        assert!(summaries[0].metadata.output_chars <= SummaryBudget::default().max_capsule_chars);
-        assert!(!summaries[0].headline.contains("secret_repo"));
-        assert!(!summaries[0].deck.contains("secret_repo"));
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn generic_low_context_summaries_do_not_publish() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut incident = story("codex command failed", 84);
+        incident.family = StoryFamily::Incident;
+        incident.headline = "codex shell command failed".to_string();
+        incident.deck = "shell command failed.".to_string();
+        incident.score = 84;
+        incident.severity = Severity::Warning;
+
+        let summaries =
+            summarize_feed("local:workstation", &[incident], &config).expect("summary compiles");
+
+        assert!(summaries.is_empty());
     }
 
     #[test]
@@ -2114,14 +2243,9 @@ mod tests {
             summarize_feed("local:workstation", &stories, &SummaryConfig::p2p_default())
                 .expect("summary compiles");
 
-        let display = format!(
-            "{} {} {} {}",
-            summaries[0].headline,
-            summaries[0].deck,
-            summaries[0].lower_third,
-            summaries[0].chips.join(" ")
-        )
-        .to_ascii_lowercase();
+        let display = serde_json::to_string(&summaries)
+            .expect("summaries serialize")
+            .to_ascii_lowercase();
         assert!(!display.contains("raw detail omitted"));
         assert!(!display.contains("raw prompts"));
         assert!(!display.contains("command output"));
@@ -2140,8 +2264,7 @@ mod tests {
         let summaries =
             summarize_feed("local:workstation", &stories, &config).expect("summary compiles");
 
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].metadata.publish_action, PublishAction::Publish);
+        assert!(summaries.is_empty());
     }
 
     #[test]
@@ -2157,9 +2280,9 @@ mod tests {
         let summaries = summarize_feed("local:workstation", &[first, second], &config)
             .expect("summary compiles");
 
-        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries.len(), 1);
         assert!(
-            summaries[1].metadata.max_headline_similarity < config.publish.max_headline_similarity
+            summaries[0].metadata.max_headline_similarity < config.publish.max_headline_similarity
         );
     }
 
@@ -2206,11 +2329,108 @@ mod tests {
     #[test]
     fn codex_and_claude_processor_configs_are_available() {
         assert_eq!(SummaryProcessorConfig::CodexExec.name(), "codex-exec");
+        assert_eq!(
+            SummaryProcessorConfig::CodexSessionMemory {
+                store_path: "/tmp/agent-feed-memory.json".to_string(),
+                key: "feed:test".to_string(),
+                command: "codex".to_string(),
+            }
+            .name(),
+            "codex-memory"
+        );
         assert_eq!(SummaryProcessorConfig::ClaudeCodeExec.name(), "claude-code");
         let codex = SummaryProcessorConfig::codex_command();
         let claude = SummaryProcessorConfig::claude_command();
         assert!(matches!(codex, SummaryProcessorConfig::Process { .. }));
         assert!(matches!(claude, SummaryProcessorConfig::Process { .. }));
+    }
+
+    #[test]
+    fn codex_jsonl_processor_output_extracts_session_and_summary() {
+        let output = r#"{"type":"session_meta","payload":{"id":"019dbd66-7008-7122-8858-a94e3a7ad2f6"}}
+{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"{\"headline\":\"codex resolved publish gating\",\"deck\":\"new events publish after the memory gate accepts them.\",\"chips\":[\"codex\",\"memory\"],\"memory_digest\":\"the feed now tracks post-start publish gating\",\"semantic_fingerprint\":\"publish:gating\"}"}}"#;
+
+        let parsed = parse_processor_output_with_meta(output).expect("codex jsonl parses");
+
+        assert_eq!(
+            parsed.codex_session_id.as_deref(),
+            Some("019dbd66-7008-7122-8858-a94e3a7ad2f6")
+        );
+        assert_eq!(parsed.summary.headline, "codex resolved publish gating");
+        assert_eq!(
+            parsed.summary.semantic_fingerprint.as_deref(),
+            Some("publish:gating")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn codex_memory_processor_resumes_stored_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = env::temp_dir().join(format!(
+            "agent-feed-codex-memory-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp dir creates");
+        let script = root.join("fake-codex");
+        let args_log = root.join("args.log");
+        let store = root.join("memory.json");
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+cat >/dev/null
+printf '%s\n' '{{"type":"session_meta","payload":{{"id":"summary-session-1"}}}}'
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_agent_message":"{{\"headline\":\"codex remembered feed context\",\"deck\":\"new publish only happens after meaning changes.\",\"chips\":[\"codex\",\"memory\"],\"memory_digest\":\"context retained\",\"semantic_fingerprint\":\"memory:retained\"}}"}}}}'
+"#,
+                args_log.display()
+            ),
+        )
+        .expect("script writes");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("script executable");
+
+        let processor =
+            CodexSessionMemoryProcessor::new(&store, "feed:test", script.display().to_string());
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let request = SummaryRequest::new(
+            "local:workstation",
+            FeedSummaryMode::PerStory,
+            vec![verified_story(88)],
+        );
+
+        let first = summarize_request_with_processor(&request, &config, &processor)
+            .expect("first summary compiles");
+        let second = summarize_request_with_processor(&request, &config, &processor)
+            .expect("second summary compiles");
+
+        let args = fs::read_to_string(&args_log).expect("args log reads");
+        assert!(
+            args.lines()
+                .next()
+                .is_some_and(|line| line.contains("exec --json"))
+        );
+        assert!(
+            args.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("exec resume --json"))
+        );
+        assert!(args.contains("summary-session-1"));
+        assert_eq!(first.headline, "codex remembered feed context");
+        assert_eq!(second.headline, "codex remembered feed context");
+        assert!(
+            fs::read_to_string(&store)
+                .expect("store reads")
+                .contains("summary-session-1")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2301,6 +2521,8 @@ mod tests {
                 chips: vec!["endpoint".to_string(), "alice@example.com".to_string()],
                 publish: None,
                 publish_reason: None,
+                memory_digest: None,
+                semantic_fingerprint: None,
             })
         }
     }
@@ -2339,6 +2561,8 @@ mod tests {
                 chips: vec!["raw detail omitted".to_string(), "codex".to_string()],
                 publish: None,
                 publish_reason: None,
+                memory_digest: None,
+                semantic_fingerprint: None,
             })
         }
     }
@@ -2377,128 +2601,6 @@ mod tests {
         );
     }
 
-    fn weak_incident_story() -> CompiledStory {
-        let mut incident = story("codex hit secret_repo command", 92);
-        incident.family = StoryFamily::Incident;
-        incident.headline = "codex hit [project] command".to_string();
-        incident.deck = "1 tool failures.".to_string();
-        incident.score = 92;
-        incident.severity = Severity::Warning;
-        incident
-    }
-
-    #[test]
-    fn deterministic_summary_repairs_project_command_incident() {
-        let mut config = SummaryConfig::p2p_default();
-        config.mode = FeedSummaryMode::PerStory;
-        let stories = vec![weak_incident_story()];
-
-        let summaries =
-            summarize_feed("local:workstation", &stories, &config).expect("summary compiles");
-
-        assert_eq!(summaries.len(), 1);
-        let summary = &summaries[0];
-        let display = format!("{} {}", summary.headline, summary.deck);
-        assert_eq!(summary.headline, "codex hit a tool failure");
-        assert_eq!(summary.deck, "tool failed during the turn.");
-        assert!(!display.contains("[project]"));
-        assert!(!display.contains("1 tool failures"));
-        assert!(
-            summary
-                .metadata
-                .violations
-                .iter()
-                .any(|violation| violation.name == SUMMARY_QUALITY_VIOLATION)
-        );
-    }
-
-    struct PlaceholderIncidentProcessor;
-
-    impl SummaryProcessor for PlaceholderIncidentProcessor {
-        fn name(&self) -> &str {
-            "placeholder-incident"
-        }
-
-        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
-            Ok(ProcessorSummary {
-                headline: "codex hit [project] command".to_string(),
-                deck: "1 tool failures.".to_string(),
-                lower_third: Some("codex · [project] · incident".to_string()),
-                chips: vec!["[project]".to_string(), "redacted".to_string()],
-                publish: None,
-                publish_reason: None,
-            })
-        }
-    }
-
-    #[test]
-    fn external_processor_placeholder_output_is_repaired() {
-        let mut config = SummaryConfig::p2p_default();
-        config.mode = FeedSummaryMode::PerStory;
-        let stories = vec![weak_incident_story()];
-
-        let summaries = summarize_feed_with_processor(
-            "local:workstation",
-            &stories,
-            &config,
-            &PlaceholderIncidentProcessor,
-        )
-        .expect("processor output is repaired");
-
-        assert_eq!(summaries.len(), 1);
-        let summary = &summaries[0];
-        let display = format!(
-            "{} {} {} {}",
-            summary.headline,
-            summary.deck,
-            summary.lower_third,
-            summary.chips.join(" ")
-        );
-        assert!(!display.contains("[project]"));
-        assert!(!display.contains("1 tool failures"));
-        assert_eq!(summary.lower_third, "feed · redacted");
-        assert_eq!(summary.chips, vec!["redacted"]);
-    }
-
-    #[test]
-    fn shell_command_failed_summary_is_repaired() {
-        let mut config = SummaryConfig::p2p_default();
-        config.mode = FeedSummaryMode::PerStory;
-        let mut incident = weak_incident_story();
-        incident.headline = "codex shell command failed".to_string();
-        incident.deck = "shell command failed.".to_string();
-
-        let summaries =
-            summarize_feed("local:workstation", &[incident], &config).expect("summary compiles");
-
-        assert_eq!(summaries.len(), 1);
-        let summary = &summaries[0];
-        let display = format!("{} {}", summary.headline, summary.deck);
-        assert!(!display.contains("shell command failed"));
-        assert_eq!(summary.headline, "codex hit a tool failure");
-        assert_eq!(summary.deck, "tool failed during the turn.");
-    }
-
-    #[test]
-    fn severe_exact_duplicate_summary_is_still_skipped() {
-        let mut config = SummaryConfig::p2p_default();
-        config.mode = FeedSummaryMode::PerStory;
-        let first_story = weak_incident_story();
-        let first = summarize_feed(
-            "local:workstation",
-            std::slice::from_ref(&first_story),
-            &config,
-        )
-        .expect("first summary compiles");
-
-        let recent = vec![RecentSummary::from(&first[0])];
-        let second =
-            summarize_feed_with_recent("local:workstation", &[first_story], &config, &recent)
-                .expect("second summary compiles");
-
-        assert!(second.is_empty());
-    }
-
     struct DecliningProcessor;
 
     impl SummaryProcessor for DecliningProcessor {
@@ -2515,6 +2617,10 @@ mod tests {
                 chips: vec!["processor".to_string(), "redacted".to_string()],
                 publish: Some(false),
                 publish_reason: Some("headline did not meaningfully change".to_string()),
+                memory_digest: Some(
+                    "codex changed one file earlier; no new public signal".to_string(),
+                ),
+                semantic_fingerprint: Some("changed:file".to_string()),
             })
         }
     }
@@ -2573,7 +2679,7 @@ mod tests {
 
     #[test]
     fn headline_images_are_disabled_by_default() {
-        let stories = vec![story("codex changed secret_repo", 82)];
+        let stories = vec![verified_story(82)];
         let summaries =
             summarize_feed("local:workstation", &stories, &SummaryConfig::p2p_default())
                 .expect("summary compiles");
@@ -2588,7 +2694,7 @@ mod tests {
         let mut config = SummaryConfig::p2p_default();
         config.image.enabled = true;
         config.image.decision = ImageDecisionMode::AlwaysAsk;
-        let stories = vec![story("codex changed secret_repo", 82)];
+        let stories = vec![verified_story(82)];
         let processor = StaticImageProcessor { image: None };
 
         let summaries = summarize_feed_with_processors(
@@ -2609,7 +2715,7 @@ mod tests {
         let mut config = SummaryConfig::p2p_default();
         config.image.enabled = true;
         config.image.decision = ImageDecisionMode::AlwaysAsk;
-        let stories = vec![story("codex changed secret_repo", 82)];
+        let stories = vec![verified_story(82)];
         let processor = StaticImageProcessor {
             image: Some(HeadlineImage::new(
                 "/assets/headlines/settled-story.webp",
@@ -2637,7 +2743,7 @@ mod tests {
         let mut config = SummaryConfig::p2p_default();
         config.image.enabled = true;
         config.image.decision = ImageDecisionMode::AlwaysAsk;
-        let stories = vec![story("codex changed secret_repo", 82)];
+        let stories = vec![verified_story(82)];
         let processor = StaticImageProcessor {
             image: Some(HeadlineImage::new(
                 "https://example.com/secret.png",

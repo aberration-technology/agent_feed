@@ -13,7 +13,7 @@ use time::OffsetDateTime;
 pub enum RemoteFeedMode {
     #[default]
     Discovery,
-    Subscribed,
+    Following,
     Local,
 }
 
@@ -35,7 +35,7 @@ impl RemoteFeedMode {
                 .first("following")
                 .is_some_and(|value| matches!(value, "1" | "true" | "on"))
         {
-            Self::Subscribed
+            Self::Following
         } else {
             Self::Discovery
         }
@@ -45,7 +45,8 @@ impl RemoteFeedMode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteOperatingMode {
     pub mode: RemoteFeedMode,
-    pub subscription_targets: Vec<String>,
+    #[serde(alias = "subscription_targets")]
+    pub following_targets: Vec<String>,
 }
 
 impl RemoteOperatingMode {
@@ -61,7 +62,7 @@ impl RemoteOperatingMode {
             .unwrap_or_else(|| vec![selection_syntax]);
         Self {
             mode: RemoteFeedMode::from_query(query),
-            subscription_targets: targets,
+            following_targets: targets,
         }
     }
 }
@@ -455,14 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn feed_mode_query_separates_discovery_from_subscribed() {
+    fn feed_mode_query_separates_discovery_from_following() {
         assert_eq!(
             RemoteFeedMode::from_query("feed_mode=discovery"),
             RemoteFeedMode::Discovery
         );
         assert_eq!(
             RemoteFeedMode::from_query("feed_mode=subscribed"),
-            RemoteFeedMode::Subscribed
+            RemoteFeedMode::Following
         );
         assert_eq!(
             RemoteFeedMode::from_query("feed_mode=local"),
@@ -470,20 +471,20 @@ mod tests {
         );
         assert_eq!(
             RemoteFeedMode::from_query("subscriptions=mosure/workstation"),
-            RemoteFeedMode::Subscribed
+            RemoteFeedMode::Following
         );
     }
 
     #[test]
-    fn subscribed_operating_mode_keeps_explicit_targets() {
+    fn following_operating_mode_keeps_explicit_targets() {
         let mode = RemoteOperatingMode::from_query(
             "mosure/*",
-            "feed_mode=subscribed&subscriptions=mosure/workstation,alice/release",
+            "feed_mode=following&following=mosure/workstation,alice/release",
         );
 
-        assert_eq!(mode.mode, RemoteFeedMode::Subscribed);
+        assert_eq!(mode.mode, RemoteFeedMode::Following);
         assert_eq!(
-            mode.subscription_targets,
+            mode.following_targets,
             vec!["mosure/workstation", "alice/release"]
         );
     }

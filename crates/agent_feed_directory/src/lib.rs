@@ -671,7 +671,7 @@ impl FeedDirectoryEntry {
 pub struct RemoteHeadlineView {
     pub feed_id: FeedId,
     pub feed_label: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_github_user_id: Option<u64>,
     pub publisher_login: String,
     pub publisher_display_name: Option<String>,
@@ -708,7 +708,9 @@ impl RemoteHeadlineView {
         Ok(Self {
             feed_id: entry.feed_id.clone(),
             feed_label: entry.feed_label.clone(),
-            publisher_github_user_id: Some(entry.owner.github_user_id.get()),
+            publisher_github_user_id: publisher
+                .github_user_id
+                .or(Some(entry.owner.github_user_id.get())),
             publisher_login: publisher
                 .github_login
                 .clone()
@@ -959,15 +961,6 @@ impl DirectoryStore {
             visible.push(filter_entry_streams_for_org(entry, filter));
         }
         Ok(visible)
-    }
-
-    #[must_use]
-    pub fn visible_public_entries(&self) -> Vec<FeedDirectoryEntry> {
-        self.entries
-            .values()
-            .filter(|entry| entry.is_publicly_visible())
-            .cloned()
-            .collect()
     }
 
     #[must_use]

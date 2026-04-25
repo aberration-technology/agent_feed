@@ -143,7 +143,7 @@ variable "agent_feed_git_ref" {
 variable "agent_feed_crate_version" {
   description = "Crate version used when agent_feed_install_source = crate."
   type        = string
-  default     = "0.1.0"
+  default     = "0.1.13"
 }
 
 variable "github_required_org" {

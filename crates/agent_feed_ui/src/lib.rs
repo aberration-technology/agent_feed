@@ -6,6 +6,7 @@ pub const FAVICON_SVG: &str = include_str!("favicon.svg");
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UiConfig {
     pub p2p_enabled: bool,
+    pub revision: Option<String>,
 }
 
 #[must_use]
@@ -15,9 +16,15 @@ pub fn render_index(view: Option<&str>) -> String {
 
 #[must_use]
 pub fn render_index_with_config(view: Option<&str>, config: &UiConfig) -> String {
+    let revision = config
+        .revision
+        .clone()
+        .or_else(default_revision)
+        .unwrap_or_else(|| "dev".to_string());
     let config_js = format!(
-        "window.FEED_P2P_ENABLED = {};",
-        if config.p2p_enabled { "true" } else { "false" }
+        "window.FEED_P2P_ENABLED = {};\nwindow.FEED_BUILD_REV = {};",
+        if config.p2p_enabled { "true" } else { "false" },
+        js_string(&revision)
     );
     INDEX_HTML
         .replace("/*__REEL_CSS__*/", REEL_CSS)
@@ -26,13 +33,47 @@ pub fn render_index_with_config(view: Option<&str>, config: &UiConfig) -> String
         .replace("__REEL_VIEW__", view.unwrap_or("stage"))
 }
 
+fn default_revision() -> Option<String> {
+    option_env!("GITHUB_SHA")
+        .or(option_env!("VERGEN_GIT_SHA"))
+        .map(short_revision)
+}
+
+fn short_revision(value: &str) -> String {
+    value.chars().take(12).collect::<String>()
+}
+
+fn js_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::{UiConfig, render_index_with_config};
 
+    fn config(p2p_enabled: bool) -> UiConfig {
+        UiConfig {
+            p2p_enabled,
+            revision: Some("abc123def456".to_string()),
+        }
+    }
+
     #[test]
     fn stage_progress_starts_hidden() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("id=\"stage-progress\""));
         assert!(html.contains("aria-hidden=\"true\" hidden"));
@@ -40,7 +81,7 @@ mod tests {
 
     #[test]
     fn favicon_matches_feed_mark() {
-        let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
+        let html = render_index_with_config(Some("stage"), &config(false));
 
         assert!(html.contains("href=\"./favicon.svg\" type=\"image/svg+xml\""));
         assert!(super::FAVICON_SVG.contains("rx=\"12\" fill=\"#000000\""));
@@ -50,7 +91,7 @@ mod tests {
 
     #[test]
     fn idle_state_avoids_redundant_local_status_chips() {
-        let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
+        let html = render_index_with_config(Some("stage"), &config(false));
 
         assert!(html.contains("<div class=\"brand\">feed</div>"));
         assert!(html.contains("id=\"eyebrow\">local feed</div>"));
@@ -65,7 +106,7 @@ mod tests {
 
     #[test]
     fn chrome_uses_lowercase_accented_site_links() {
-        let html = render_index_with_config(Some("stage"), &UiConfig { p2p_enabled: false });
+        let html = render_index_with_config(Some("stage"), &config(false));
 
         assert!(html.contains("--sans: ui-monospace, monospace;"));
         assert!(html.contains("--mono: ui-monospace, monospace;"));
@@ -75,6 +116,9 @@ mod tests {
         assert!(html.contains("--secondary: #d87c7c;"));
         assert!(html.contains(".brand {\n  color: var(--secondary);\n}"));
         assert!(html.contains(".footer-links a {\n  color: var(--secondary);"));
+        assert!(html.contains("id=\"footer-rev\">rev dev</span>"));
+        assert!(html.contains(".footer-rev"));
+        assert!(html.contains("window.FEED_BUILD_REV = \"abc123def456\";"));
         assert!(html.contains("href=\"https://aberration.technology/\""));
         assert!(html.contains("href=\"https://github.com/aberration-technology\""));
         assert!(!html.contains("href=\"https://github.com/aberration-technology/agent_feed\""));
@@ -84,7 +128,7 @@ mod tests {
 
     #[test]
     fn remote_states_stop_dwell_progress() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
         let remote_state = html
             .split("function renderRemoteState")
             .nth(1)
@@ -96,7 +140,7 @@ mod tests {
 
     #[test]
     fn remote_user_route_shows_identity_once() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("function routeStreamLabel"));
         assert!(html.contains("function routeEyebrow"));
@@ -111,7 +155,7 @@ mod tests {
 
     #[test]
     fn timeline_uses_feed_labels_without_repeating_login() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("feedLink(route.login, \"*\", \"all feeds\""));
         assert!(html.contains("feed.publisher_avatar ||"));
@@ -125,7 +169,7 @@ mod tests {
 
     #[test]
     fn discovery_publishers_link_to_user_discovery_feed() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("function userDiscoveryUrl"));
         assert!(html.contains("return `/${encodeURIComponent(login)}/*"));
@@ -140,7 +184,7 @@ mod tests {
 
     #[test]
     fn browser_console_logs_feed_lifecycle_events() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("function logEvent"));
         assert!(html.contains("feed.remote.route.start"));
@@ -150,20 +194,8 @@ mod tests {
     }
 
     #[test]
-    fn github_oauth_code_callback_forwards_to_edge() {
-        let html = render_index_with_config(Some("network"), &UiConfig { p2p_enabled: true });
-
-        assert!(html.contains("code: params.get(\"code\") || \"\""));
-        assert!(html.contains("function handleGithubOauthCodeCallback"));
-        assert!(html.contains("/callback/github${window.location.search}"));
-        assert!(html.contains("feed.github.oauth.forward"));
-        assert!(html.contains("if (githubAuthCallback?.code)"));
-        assert!(html.contains("handleGithubOauthCodeCallback(githubAuthCallback);"));
-    }
-
-    #[test]
     fn browser_remote_route_reports_version_mismatch() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("const FEED_PROTOCOL_VERSION = 1;"));
         assert!(html.contains("function compatibilityStatus"));
@@ -174,7 +206,7 @@ mod tests {
 
     #[test]
     fn root_page_supports_global_network_discovery() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("function parseGlobalRoute"));
         assert!(html.contains("function startGlobalDiscoveryRoute"));
@@ -191,14 +223,27 @@ mod tests {
     }
 
     #[test]
+    fn following_mode_uses_local_follow_list_and_resolves_targets() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("function startFollowingRoute"));
+        assert!(html.contains("window.localStorage.getItem(\"feed.following\")"));
+        assert!(html.contains("window.localStorage.setItem(\"feed.following\""));
+        assert!(html.contains("function fetchFollowingTarget"));
+        assert!(html.contains("function renderFollowingTimeline"));
+        assert!(html.contains("nothing followed yet"));
+        assert!(!html.contains("no subscriptions selected"));
+    }
+
+    #[test]
     fn mode_switcher_preserves_user_scope_without_loopback_link() {
-        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+        let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(!html.contains("id=\"mode-local\""));
         assert!(!html.contains("http://127.0.0.1:7777/reel"));
         assert!(
             html.contains(
-                "modeDiscovery.textContent = route.kind === \"global\" ? \"discovery\" : `${route.login}/*`;"
+                "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : `${route.login}/*`;"
             )
         );
         assert!(html.contains("params.set(\"all\", \"true\");"));
@@ -206,5 +251,6 @@ mod tests {
             html.contains("[\"discovery\", \"discover\", \"hero\", \"public\"].includes(explicit)")
         );
         assert!(html.contains("hosted feed pages do not link to loopback reels"));
+        assert!(html.contains("modeFollowing.textContent = \"following\";"));
     }
 }

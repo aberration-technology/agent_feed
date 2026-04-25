@@ -29,6 +29,8 @@ pub enum ProtoError {
     Serialize(#[from] serde_json::Error),
     #[error(transparent)]
     Summary(#[from] SummaryError),
+    #[error("story rejected by p2p summary policy")]
+    StoryRejected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,12 +380,15 @@ impl StoryCapsule {
         story: &CompiledStory,
     ) -> Result<Self, ProtoError> {
         let feed_id = feed_id.into();
-        let mut summaries = summarize_feed(
+        let summaries = summarize_feed(
             &feed_id,
             std::slice::from_ref(story),
             &SummaryConfig::p2p_default(),
         )?;
-        let summary = summaries.remove(0);
+        let summary = summaries
+            .into_iter()
+            .next()
+            .ok_or(ProtoError::StoryRejected)?;
         Self::from_summary(feed_id, seq, author, &summary)
     }
 
@@ -602,13 +607,34 @@ mod tests {
     use agent_feed_story::compile_events;
 
     fn story() -> CompiledStory {
+        let mut event = AgentEvent::new(
+            SourceKind::Codex,
+            EventKind::TestPass,
+            "codex verified release tests",
+        );
+        event.agent = "codex".to_string();
+        event.project = Some("agent_feed".to_string());
+        event.files = vec!["src/lib.rs".to_string()];
+        event.summary = Some("tests passed after the feed publisher update.".to_string());
+        event.score_hint = Some(82);
+        let mut stories = compile_events([event]);
+        stories.remove(0)
+    }
+
+    #[test]
+    fn low_context_story_is_rejected_without_panicking() {
         let mut event = AgentEvent::new(SourceKind::Codex, EventKind::FileChanged, "patch applied");
         event.agent = "codex".to_string();
         event.project = Some("agent_feed".to_string());
         event.files = vec!["src/lib.rs".to_string()];
+        event.summary = Some("1 changed files. raw diff omitted.".to_string());
         event.score_hint = Some(82);
-        let mut stories = compile_events([event]);
-        stories.remove(0)
+        let story = compile_events([event]).remove(0);
+
+        assert!(matches!(
+            StoryCapsule::from_story("feed-workstation", 1, "github:1", &story),
+            Err(ProtoError::StoryRejected)
+        ));
     }
 
     #[test]

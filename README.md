@@ -69,25 +69,6 @@ agent-feed claude import path/to/claude-stream.jsonl
 the normal local loop is: start the daemon, attach agent activity when you want
 capture, and leave the browser feed open.
 
-## p2p publishing
-
-p2p is opt-in. `serve --p2p` publishes settled, redacted story capsules to your
-github-backed feed, so it requires an edge-issued github session:
-
-```sh
-agent-feed serve --p2p --feed workstation
-```
-
-if you are not signed in, the CLI opens the github sign-in flow and waits for
-the loopback callback before publishing. if you are already signed in, it reuses
-the stored session.
-
-to join the p2p UX without publishing local stories:
-
-```sh
-agent-feed serve --p2p --no-publish
-```
-
 ## safety boundary
 
 raw prompts, secrets, absolute home paths, command output, and file diffs are
@@ -136,7 +117,7 @@ headlines. it never requests raw events.
 
 ```text
 https://feed.aberration.technology/?feed_mode=discovery
-https://feed.aberration.technology/?feed_mode=subscribed&subscriptions=mosure/*
+https://feed.aberration.technology/?feed_mode=following
 ```
 
 user paths resolve github usernames through the edge. `user/*` is the wildcard
@@ -147,6 +128,9 @@ https://feed.aberration.technology/mosure
 https://feed.aberration.technology/mosure/*
 https://feed.aberration.technology/mosure/workstation
 ```
+
+interactive timeline views can follow feeds in the browser. following is a
+local viewer selection; private feed access remains a signed protocol grant.
 
 ## repo shape
 

@@ -145,11 +145,13 @@ fn render_browser_shell(
     let css = fs::read_to_string(ui_dir.join("reel.css")).map_err(XtaskError::Io)?;
     let js = fs::read_to_string(ui_dir.join("reel.ts")).map_err(XtaskError::Io)?;
     let favicon = fs::read_to_string(ui_dir.join("favicon.svg")).map_err(XtaskError::Io)?;
+    let revision = current_git_commit(root);
     let config = format!(
-        "window.FEED_P2P_ENABLED = true;\nwindow.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.AGENT_FEED_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
+        "window.FEED_P2P_ENABLED = true;\nwindow.FEED_EDGE_BASE_URL = {};\nwindow.FEED_SITE_BASE_URL = {};\nwindow.FEED_NETWORK_ID = {};\nwindow.FEED_BUILD_REV = {};\nwindow.AGENT_FEED_EDGE_BASE_URL = window.FEED_EDGE_BASE_URL;",
         js_string(edge_url),
         js_string(site_base_url),
         js_string(network_id),
+        js_string(&revision),
     );
     let rendered = index
         .replace("/*__REEL_CSS__*/", &css)
@@ -161,6 +163,30 @@ fn render_browser_shell(
             &format!("<script>\n{config}\n    </script>\n    <script type=\"module\">"),
         );
     Ok((rendered, favicon))
+}
+
+fn current_git_commit(root: &Path) -> String {
+    if let Ok(value) = env::var("GITHUB_SHA") {
+        let short = value.chars().take(12).collect::<String>();
+        if !short.is_empty() {
+            return short;
+        }
+    }
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if commit.is_empty() {
+                "dev".to_string()
+            } else {
+                commit
+            }
+        }
+        _ => "dev".to_string(),
+    }
 }
 
 fn js_string(value: &str) -> String {

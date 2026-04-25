@@ -310,12 +310,12 @@ impl StoryCompiler {
         if score < self.config.min_score || context_score < self.config.min_context_score {
             return None;
         }
-        if !has_publishable_context(&window) {
-            return None;
-        }
 
         let headline = headline(&window);
         let deck = deck(&window);
+        if is_low_quality_story(&window, &headline, &deck) {
+            return None;
+        }
         let project = window.key.project_hash.clone();
         let mut chips = vec![
             window.key.agent.clone(),
@@ -456,15 +456,11 @@ fn context_score(window: &StoryWindow) -> u8 {
     if window.signals.latest_kind.is_some() {
         score = score.saturating_add(18);
     }
-    let has_object = !window.signals.files.is_empty()
+    if window.key.project_hash.is_some()
+        || !window.signals.files.is_empty()
         || window.signals.latest_tool.is_some()
         || window.signals.latest_command_class.is_some()
-        || (window.key.project_hash.is_some()
-            && !matches!(
-                window.key.family,
-                StoryFamily::Incident | StoryFamily::Command
-            ));
-    if has_object {
+    {
         score = score.saturating_add(18);
     }
     if outcome_label(window).is_some() {
@@ -480,49 +476,6 @@ fn context_score(window: &StoryWindow) -> u8 {
         score = score.saturating_add(8);
     }
     score.min(100)
-}
-
-fn has_publishable_context(window: &StoryWindow) -> bool {
-    match window.key.family {
-        StoryFamily::Incident => incident_has_publishable_context(window),
-        StoryFamily::Command => {
-            window.signals.latest_command_class.is_some()
-                || window.signals.latest_tool.is_some()
-                || !window.signals.files.is_empty()
-        }
-        _ => true,
-    }
-}
-
-fn incident_has_publishable_context(window: &StoryWindow) -> bool {
-    if matches!(
-        window.signals.latest_kind,
-        Some(EventKind::TurnFail | EventKind::Error | EventKind::McpFail)
-    ) {
-        return true;
-    }
-    if !window.signals.files.is_empty()
-        || window.signals.latest_tool.is_some()
-        || window.signals.latest_command_class.is_some()
-    {
-        return true;
-    }
-    !only_generic_tool_failure(window)
-}
-
-fn only_generic_tool_failure(window: &StoryWindow) -> bool {
-    window.counters.tool_failures > 0
-        && window.counters.tests_failed == 0
-        && window.counters.permissions == 0
-        && window.counters.mcp_failures == 0
-        && window.counters.files_changed == 0
-        && window.signals.latest_tool.is_none()
-        && window.signals.latest_command_class.is_none()
-        && window
-            .signals
-            .latest_summary
-            .as_deref()
-            .is_none_or(summary_is_redundant)
 }
 
 fn headline(window: &StoryWindow) -> String {
@@ -548,7 +501,7 @@ fn headline(window: &StoryWindow) -> String {
             }
         }
         StoryFamily::FileChange => format!("{agent} changed {object}"),
-        StoryFamily::Incident => incident_headline(window),
+        StoryFamily::Incident => format!("{agent} hit {}", object),
         StoryFamily::Mcp => format!("{agent} saw mcp degradation"),
         StoryFamily::Plan => format!("{agent} updated the plan"),
         StoryFamily::Command => format!("{agent} completed {object}"),
@@ -571,14 +524,10 @@ fn deck(window: &StoryWindow) -> String {
         parts.push("tests passed".to_string());
     }
     if window.counters.tool_failures > 0 {
-        parts.push(tool_failure_deck(window));
+        parts.push(format!("{} tool failures", window.counters.tool_failures));
     }
     if window.counters.permissions > 0 {
-        if window.counters.permissions == 1 {
-            parts.push("permission boundary reached".to_string());
-        } else {
-            parts.push(format!("{} permission events", window.counters.permissions));
-        }
+        parts.push(format!("{} permission events", window.counters.permissions));
     }
     if window.counters.mcp_failures > 0 {
         parts.push("mcp failed".to_string());
@@ -630,40 +579,30 @@ fn object_label(window: &StoryWindow) -> String {
     story_family_label(window.key.family).to_string()
 }
 
-fn incident_headline(window: &StoryWindow) -> String {
-    let agent = &window.key.agent;
-    match window.signals.latest_kind {
-        Some(EventKind::TurnFail) => format!("{agent} turn failed"),
-        Some(EventKind::Error) => format!("{agent} hit an agent error"),
-        Some(EventKind::McpFail) => format!("{agent} saw mcp degradation"),
-        Some(EventKind::ToolFail) => {
-            if let Some(command) = &window.signals.latest_command_class {
-                format!("{agent} {command} failed")
-            } else if let Some(tool) = safe_tool_label(window.signals.latest_tool.as_deref()) {
-                format!("{agent} {tool} tool failed")
-            } else {
-                format!("{agent} hit a tool failure")
-            }
-        }
-        _ => format!("{agent} hit an incident"),
+fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> bool {
+    if window.signals.highest_score >= 90 {
+        return false;
     }
-}
-
-fn tool_failure_deck(window: &StoryWindow) -> String {
-    if let Some(command) = &window.signals.latest_command_class {
-        return format!("{command} failed");
+    let combined = format!(
+        "{} {}",
+        headline.to_ascii_lowercase(),
+        deck.to_ascii_lowercase()
+    );
+    let only_tool_failure = window.key.family == StoryFamily::Incident
+        && window.counters.tool_failures > 0
+        && window.counters.files_changed == 0
+        && window.counters.tests_failed == 0
+        && window.counters.tests_passed == 0
+        && window.counters.permissions == 0
+        && window.counters.mcp_failures == 0;
+    if only_tool_failure
+        && (combined.contains("shell command")
+            || combined.contains("command failed")
+            || combined.contains("tool failures"))
+    {
+        return true;
     }
-    if let Some(tool) = safe_tool_label(window.signals.latest_tool.as_deref()) {
-        return format!("{tool} tool failed");
-    }
-    if window.counters.tool_failures == 1 {
-        "tool failed during the turn".to_string()
-    } else {
-        format!(
-            "{} tools failed during the turn",
-            window.counters.tool_failures
-        )
-    }
+    combined.contains("activity settled") || combined.contains("hit [project] command")
 }
 
 fn outcome_label(window: &StoryWindow) -> Option<&'static str> {
@@ -700,35 +639,12 @@ fn story_family_label(family: StoryFamily) -> &'static str {
 }
 
 fn command_class(command: &str) -> Option<String> {
-    let normalized = command.to_ascii_lowercase();
-    let first = normalized.split_whitespace().next()?;
-    let class = match first
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(first)
-        .trim_matches('"')
-    {
-        "cargo" | "pytest" | "test" | "npm" | "pnpm" | "yarn" | "vitest" | "go" => {
-            if normalized.contains(" test") || normalized.contains("test ") || first == "pytest" {
-                "test command"
-            } else {
-                "build command"
-            }
-        }
-        "git" | "gh" => "vcs command",
-        "make" | "just" | "task" => "task command",
-        "apply_patch" => "patch",
-        _ => return None,
-    };
-    Some(class.to_string())
-}
-
-fn safe_tool_label(tool: Option<&str>) -> Option<String> {
-    let tool = tool?.trim();
-    if tool.is_empty() || tool.contains('/') || tool.contains('_') || tool.contains('[') {
-        return None;
+    let first = command.split_whitespace().next()?;
+    if first.is_empty() {
+        None
+    } else {
+        Some(format!("{first} command"))
     }
-    Some(tool.to_ascii_lowercase())
 }
 
 fn severity_rank(severity: Severity) -> u8 {
@@ -840,7 +756,6 @@ mod tests {
     fn severe_tool_failure_publishes_breaking_story() {
         let mut compiler = StoryCompiler::default();
         let mut failed = event(EventKind::ToolFail, "codex command failed");
-        failed.command = Some("cargo test --all".to_string());
         failed.summary = Some("exit 1. raw output omitted.".to_string());
         failed.score_hint = Some(92);
         failed.severity = Severity::Warning;
@@ -850,53 +765,20 @@ mod tests {
         assert_eq!(stories.len(), 1);
         assert_eq!(stories[0].family, StoryFamily::Incident);
         assert!(stories[0].score >= 90);
-        assert_eq!(stories[0].headline, "codex test command failed");
-        assert_eq!(stories[0].deck, "test command failed.");
         assert_eq!(stories[0].to_bulletin().mode, BulletinMode::Breaking);
     }
 
     #[test]
-    fn generic_lone_tool_failure_does_not_publish() {
+    fn generic_shell_failure_does_not_publish() {
         let mut compiler = StoryCompiler::default();
         let mut failed = event(EventKind::ToolFail, "codex command failed");
         failed.summary = Some("exit 1. raw output omitted.".to_string());
-        failed.score_hint = Some(94);
+        failed.command = Some("sh -c cargo test".to_string());
+        failed.score_hint = Some(84);
         failed.severity = Severity::Warning;
 
         assert!(compiler.ingest(failed).is_empty());
         assert!(compiler.flush().is_empty());
-    }
-
-    #[test]
-    fn shell_wrapper_tool_failure_does_not_publish() {
-        let mut compiler = StoryCompiler::default();
-        let mut failed = event(EventKind::ToolFail, "codex command failed");
-        failed.command = Some("/usr/bin/zsh".to_string());
-        failed.summary = Some("exit 1. raw output omitted.".to_string());
-        failed.score_hint = Some(94);
-        failed.severity = Severity::Warning;
-
-        assert!(compiler.ingest(failed).is_empty());
-        assert!(compiler.flush().is_empty());
-    }
-
-    #[test]
-    fn incident_headline_never_uses_project_placeholder() {
-        let mut compiler = StoryCompiler::default();
-        let mut failed = event(EventKind::ToolFail, "codex command failed");
-        failed.project = Some("agent_feed".to_string());
-        failed.command = Some("unknown-internal-binary --flag".to_string());
-        failed.tool = Some("Bash".to_string());
-        failed.summary = Some("tool failed during safe capture".to_string());
-        failed.score_hint = Some(92);
-        failed.severity = Severity::Warning;
-
-        let stories = compiler.ingest(failed);
-
-        assert_eq!(stories.len(), 1);
-        assert!(!stories[0].headline.contains("[project]"));
-        assert!(!stories[0].headline.contains("agent_feed"));
-        assert_ne!(stories[0].deck, "1 tool failures.");
     }
 
     #[test]

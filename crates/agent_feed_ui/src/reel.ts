@@ -17,7 +17,8 @@ const stageProgress = document.querySelector("#stage-progress");
 const timeline = document.querySelector("#timeline");
 const modeSwitcher = document.querySelector("#mode-switcher");
 const modeDiscovery = document.querySelector("#mode-discovery");
-const modeSubscribed = document.querySelector("#mode-subscribed");
+const modeFollowing = document.querySelector("#mode-following");
+const footerRev = document.querySelector("#footer-rev");
 
 let bulletins = [];
 let activeIndex = 0;
@@ -30,6 +31,11 @@ const FEED_MIN_MODEL_VERSION = 1;
 
 const githubAuthCallback = parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
+
+if (footerRev) {
+  const rev = String(window.FEED_BUILD_REV || "dev").slice(0, 12) || "dev";
+  footerRev.textContent = `rev ${rev}`;
+}
 
 if (publisher) {
   publisher.addEventListener("click", (event) => {
@@ -328,10 +334,10 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   renderHeadlineImage(undefined);
   clearAuthAction();
   renderChips([
-    route.feedMode === "subscribed"
-      ? "subscribed"
+    route.feedMode === "following"
+      ? "following"
       : route.kind === "global"
-        ? "discovery"
+        ? "discover"
         : "selected",
     route.network,
     state === "version-mismatch" ? "version" : "redacted",
@@ -342,14 +348,18 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
 
 function routeEyebrow(route) {
   if (route.kind === "global") {
-    return `feed / ${route.network} / ${route.feedMode}`;
+    return `feed / ${route.network} / ${routeDisplayMode(route)}`;
   }
-  return `${route.network} / ${route.feedMode} / ${routeStreamLabel(route)}`;
+  return `${route.network} / ${routeDisplayMode(route)} / ${routeStreamLabel(route)}`;
+}
+
+function routeDisplayMode(route) {
+  return route.feedMode === "discovery" ? "discover" : route.feedMode;
 }
 
 function routeStreamLabel(route) {
   if (route.kind === "global") {
-    return route.feedMode === "subscribed" ? "explicit subscriptions" : "all public feeds";
+    return route.feedMode === "following" ? "followed feeds" : "all public feeds";
   }
   if (route.feed === "*") {
     return "all feeds";
@@ -410,7 +420,7 @@ function renderP2pDisabled(route) {
   setText(headline, "local feed only");
   setText(
     deck,
-    "network discovery and subscribed remote feeds are unavailable because p2p is disabled.",
+    "network discovery and following are unavailable because p2p is disabled.",
   );
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
@@ -560,7 +570,7 @@ function parseRemoteRoute(location) {
     feed: feedSegment,
     selection: feedSegment ? `${login}/${feedSegment}` : routeSelection(login, params),
     feedMode: routeFeedMode(params, "user"),
-    subscriptionTargets: routeSubscriptionTargets(login, feedSegment, params),
+    followingTargets: routeFollowingTargets(login, params),
     interactive:
       params.get("view") === "timeline" ||
       params.get("mode") === "timeline" ||
@@ -583,7 +593,7 @@ function parseGlobalRoute(location) {
     feed: "*",
     selection: "network/*",
     feedMode: routeFeedMode(params, "global"),
-    subscriptionTargets: routeSubscriptionTargets("", "*", params),
+    followingTargets: routeFollowingTargets("", params),
     interactive:
       params.get("view") === "timeline" ||
       params.get("mode") === "timeline" ||
@@ -620,7 +630,7 @@ function routeFeedMode(params, scope = "user") {
     });
   }
   if (["subscribed", "subscriptions", "following"].includes(explicit)) {
-    return "subscribed";
+    return "following";
   }
   if (scope === "global" && ["discovery", "discover", "hero", "public", ""].includes(explicit)) {
     return "discovery";
@@ -630,7 +640,7 @@ function routeFeedMode(params, scope = "user") {
     params.has("subscribed") ||
     ["1", "true", "on"].includes(params.get("following") || "")
   ) {
-    return "subscribed";
+    return "following";
   }
   if (scope === "global") {
     return "discovery";
@@ -643,7 +653,7 @@ function routeFeedMode(params, scope = "user") {
   return "selected";
 }
 
-function routeSubscriptionTargets(login, feedSegment, params) {
+function routeFollowingTargets(login, params) {
   const raw =
     params.get("subscriptions") ||
     params.get("subscribed") ||
@@ -655,24 +665,19 @@ function routeSubscriptionTargets(login, feedSegment, params) {
     .filter(Boolean)
     .filter(isSafeSubscriptionTarget);
   if (explicit.length) {
-    return explicit;
+    return dedupeTargets(explicit.map(normalizeFollowTarget).filter(Boolean));
   }
-  const stored = storedSubscriptions().filter(isSafeSubscriptionTarget);
-  if (stored.length) {
+  const stored = storedFollowingTargets().filter(isSafeSubscriptionTarget);
+  if (!login) {
     return stored;
   }
-  if (!login) {
-    return [];
-  }
-  if (feedSegment) {
-    return [`${login}/${feedSegment}`];
-  }
-  return [`${login}/*`];
+  return stored.filter((target) => target.replace(/^@/, "").split("/")[0] === login);
 }
 
-function storedSubscriptions() {
+function storedFollowingTargets() {
   try {
     const raw =
+      window.localStorage.getItem("feed.following") ||
       window.localStorage.getItem("feed.subscriptions") ||
       window.localStorage.getItem("agent_feed.subscriptions") ||
       "";
@@ -681,15 +686,55 @@ function storedSubscriptions() {
     }
     const value = JSON.parse(raw);
     if (Array.isArray(value)) {
-      return value.map(String);
+      return dedupeTargets(value.map(String).map(normalizeFollowTarget).filter(Boolean));
     }
     if (typeof value === "string") {
-      return value.split(",");
+      return dedupeTargets(value.split(",").map(normalizeFollowTarget).filter(Boolean));
     }
   } catch (error) {
-    logError("subscription list read failed", error);
+    logError("following list read failed", error);
   }
   return [];
+}
+
+function saveFollowingTargets(targets) {
+  const clean = dedupeTargets(targets.map(normalizeFollowTarget).filter(Boolean));
+  window.localStorage.setItem("feed.following", JSON.stringify(clean));
+  logInfo("feed.following.saved", { targets: clean });
+  return clean;
+}
+
+function dedupeTargets(targets) {
+  return [...new Set(targets)];
+}
+
+function normalizeFollowTarget(value) {
+  const clean = String(value || "").trim().replace(/^@/, "");
+  if (!isSafeSubscriptionTarget(clean)) {
+    return "";
+  }
+  const [login, feed = "*"] = clean.split("/");
+  return `${login}/${feed || "*"}`;
+}
+
+function isFollowingTarget(target) {
+  const clean = normalizeFollowTarget(target);
+  if (!clean) {
+    return false;
+  }
+  return storedFollowingTargets().includes(clean);
+}
+
+function toggleFollowTarget(target) {
+  const clean = normalizeFollowTarget(target);
+  if (!clean) {
+    return [];
+  }
+  const current = storedFollowingTargets();
+  const next = current.includes(clean)
+    ? current.filter((value) => value !== clean)
+    : [...current, clean];
+  return saveFollowingTargets(next);
 }
 
 function isSafeSubscriptionTarget(value) {
@@ -743,20 +788,20 @@ function p2pEnabled() {
 }
 
 function setupModeSwitcher(route) {
-  if (!modeSwitcher || !modeDiscovery || !modeSubscribed || !p2pEnabled()) {
+  if (!modeSwitcher || !modeDiscovery || !modeFollowing || !p2pEnabled()) {
     hideModeSwitcher();
     return;
   }
-  modeDiscovery.textContent = route.kind === "global" ? "discovery" : `${route.login}/*`;
-  modeSubscribed.textContent = route.kind === "global" ? "subscribed" : "subscribed";
+  modeDiscovery.textContent = route.kind === "global" ? "discover" : `${route.login}/*`;
+  modeFollowing.textContent = "following";
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
-  modeSubscribed.setAttribute("href", modeUrl(route, "subscribed"));
+  modeFollowing.setAttribute("href", modeUrl(route, "following"));
   modeDiscovery.toggleAttribute(
     "aria-current",
     (route.kind === "global" && route.feedMode === "discovery") ||
-      (route.kind === "user" && route.feedMode !== "subscribed"),
+      (route.kind === "user" && route.feedMode !== "following"),
   );
-  modeSubscribed.toggleAttribute("aria-current", route.feedMode === "subscribed");
+  modeFollowing.toggleAttribute("aria-current", route.feedMode === "following");
   modeSwitcher.hidden = false;
   const reveal = () => revealControls();
   window.addEventListener("pointermove", reveal, { passive: true });
@@ -790,8 +835,8 @@ function modeUrl(route, mode) {
   if (route.network && route.network !== "mainnet") {
     params.set("network", route.network);
   }
-  if (mode === "subscribed" && !params.has("subscriptions") && route.subscriptionTargets.length) {
-    params.set("subscriptions", route.subscriptionTargets.join(","));
+  if (mode === "following" && !params.has("following") && route.followingTargets.length) {
+    params.set("following", route.followingTargets.join(","));
   }
   if (mode === "discovery") {
     params.delete("subscriptions");
@@ -799,7 +844,7 @@ function modeUrl(route, mode) {
     params.delete("following");
     params.delete("streams");
   }
-  if (mode === "subscribed") {
+  if (mode === "following") {
     params.delete("all");
     params.delete("streams");
   }
@@ -816,9 +861,9 @@ function modeUrl(route, mode) {
       ? "*"
       : route.feed && route.feed !== "*"
         ? route.feed
-        : route.subscriptionTargets.length === 1 &&
-            route.subscriptionTargets[0].replace(/^@/, "").startsWith(`${route.login}/`)
-          ? route.subscriptionTargets[0].replace(/^@/, "").split("/")[1] || "*"
+        : route.followingTargets.length === 1 &&
+            route.followingTargets[0].replace(/^@/, "").startsWith(`${route.login}/`)
+          ? route.followingTargets[0].replace(/^@/, "").split("/")[1] || "*"
           : route.feed === "*"
             ? "*"
             : "";
@@ -837,7 +882,6 @@ function parseGithubAuthCallback(location) {
   }
   const params = new URLSearchParams(location.search);
   return {
-    code: params.get("code") || "",
     state: params.get("state") || "",
     login: params.get("login") || "",
     github_user_id: params.get("github_user_id") || params.get("id") || "",
@@ -908,35 +952,6 @@ function randomState() {
     logWarn("browser crypto unavailable; github auth state used weak fallback");
   }
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function handleGithubOauthCodeCallback(callback) {
-  setText(liveState, "auth");
-  setText(eyebrow, "github / sign-in / edge");
-  setText(headline, "github sign-in");
-  renderPublisher(undefined);
-  renderHeadlineImage(undefined);
-  renderChips(["github", "edge", "oauth", "session"]);
-  stopStageProgress();
-
-  const edge = edgeBaseUrl();
-  if (!edge) {
-    setText(deck, "edge callback is not configured. start again from /network.");
-    logError("github oauth callback could not find edge", {
-      has_code: Boolean(callback.code),
-      has_state: Boolean(callback.state),
-    });
-    return;
-  }
-
-  setText(deck, "finishing github sign-in with the edge.");
-  const edgeCallback = `${edge.replace(/\/$/, "")}/callback/github${window.location.search}`;
-  logInfo("feed.github.oauth.forward", {
-    edge,
-    has_code: Boolean(callback.code),
-    has_state: Boolean(callback.state),
-  });
-  window.location.replace(edgeCallback);
 }
 
 function handleGithubAuthCallback(callback) {
@@ -1039,8 +1054,8 @@ async function startRemoteRoute(route) {
     return;
   }
   setupModeSwitcher(route);
-  if (route.feedMode === "subscribed" && route.kind === "global") {
-    startSubscribedRoute(route);
+  if (route.feedMode === "following") {
+    await startFollowingRoute(route);
     return;
   }
   if (route.kind === "global") {
@@ -1200,9 +1215,9 @@ async function startUserRoute(route) {
       ticket.candidate_feeds = compatibleFeeds;
     }
     const feedCount = compatibleFeeds.length;
-    const headlines = snapshotHeadlines(ticket).filter((item) =>
-      headlineMatchesRoute(item, route),
-    );
+    const headlines = snapshotHeadlines(ticket)
+      .filter((item) => headlineMatchesRoute(item, route))
+      .map((item) => enrichHeadlineFromTicket(item, ticket));
     logInfo("feed.user.ticket", {
       login: ticket.profile?.login || route.login,
       github_user_id: ticket.github_user_id || ticket.resolved_github_id,
@@ -1227,9 +1242,7 @@ async function startUserRoute(route) {
     if (feedCount === 0 && headlines.length === 0) {
       renderRemoteState(route, "no-feeds", [
         "github identity found",
-        route.feedMode === "subscribed"
-          ? "no selected feed is currently publishing"
-          : "no visible settled story streams",
+        "no visible settled story streams",
       ], ticket.profile);
       logInfo("feed.user.no_visible_streams", {
         login: ticket.profile?.login || route.login,
@@ -1271,12 +1284,15 @@ function snapshotHeadlines(snapshot) {
   return snapshot.headlines || snapshot.stories || snapshot.capsules || [];
 }
 
-function headlineMatchesRoute(item, route) {
-  const label = item.feed_label || item.feedLabel || item.label || "";
-  if (route.feed && route.feed !== "*") {
-    return label === route.feed;
+function enrichHeadlineFromTicket(item, ticket) {
+  if (!ticket?.profile) {
+    return item;
   }
-  return true;
+  return {
+    ...item,
+    publisher_login: item.publisher_login || item.github_login || ticket.profile.login,
+    publisher_avatar: item.publisher_avatar || item.avatar || ticket.profile.avatar,
+  };
 }
 
 function compatibilityStatus(remote) {
@@ -1310,39 +1326,109 @@ function compatibilityStatus(remote) {
   };
 }
 
-function startSubscribedRoute(route) {
-  const targets = route.subscriptionTargets.length
-    ? route.subscriptionTargets
-    : route.kind === "global"
-      ? []
-      : [route.selection];
-  showStage();
-  document.body.dataset.mode = "dispatch";
-  setText(liveState, "wait");
-  setText(eyebrow, `feed / ${route.network} / subscribed`);
-  setText(headline, "subscribed feed");
-  setText(
-    deck,
-    [
-      "showing explicit feed subscriptions",
-      "waiting for signed story capsules",
-      "network discovery feed is not mixed in",
-    ].join(" · "),
-  );
-  renderPublisher(undefined);
-  renderHeadlineImage(undefined);
-  clearAuthAction();
-  renderChips(["subscribed", "explicit", route.network, "redacted"]);
-  renderTicker(targets.length ? targets.map((target) => `follow ${target}`) : ["no subscriptions selected"]);
-  if (route.interactive) {
-    renderSubscribedTimeline(route, targets);
-  } else {
-    stopStageProgress();
-  }
-  logInfo("feed.subscribed.selected", {
+async function startFollowingRoute(route) {
+  const targets = route.followingTargets.map(normalizeFollowTarget).filter(Boolean);
+  logInfo("feed.following.selected", {
     network: route.network,
-    subscriptions: targets,
+    targets,
+    interactive: route.interactive,
   });
+  if (!targets.length) {
+    renderFollowingEmpty(route);
+    return;
+  }
+
+  renderRemoteState(route, "resolving", [
+    `checking ${targets.length} followed ${targets.length === 1 ? "feed" : "feeds"}`,
+    "requesting accessible story snapshots",
+    "raw events unavailable",
+  ]);
+  const results = await Promise.all(targets.map((target) => fetchFollowingTarget(route, target)));
+  const tickets = results.filter((result) => result.ticket).map((result) => result.ticket);
+  const headlines = results
+    .flatMap((result) => result.headlines)
+    .sort((a, b) => Date.parse(a.created_at || a.createdAt || 0) - Date.parse(b.created_at || b.createdAt || 0));
+  const feeds = tickets.flatMap(ticketFeeds);
+  logInfo("feed.following.snapshot", {
+    targets: targets.length,
+    tickets: tickets.length,
+    feeds: feeds.length,
+    headlines: headlines.length,
+    failures: results.filter((result) => result.error).length,
+  });
+
+  if (route.interactive) {
+    renderFollowingTimeline(route, targets, results);
+    return;
+  }
+  if (headlines.length) {
+    applyRemoteHeadlines(route, headlines);
+    return;
+  }
+  renderRemoteState(route, "waiting", [
+    `following ${targets.length} ${targets.length === 1 ? "feed" : "feeds"}`,
+    "connected · waiting for first story",
+    "move mouse for controls",
+  ]);
+  setText(sourceCount, `${targets.length} src`);
+}
+
+async function fetchFollowingTarget(route, target) {
+  const clean = normalizeFollowTarget(target);
+  const [login, feed = "*"] = clean.split("/");
+  const endpoint = `${edgeBaseUrl()}/resolve/github/${encodeURIComponent(login)}${followingResolverQuery(route, feed)}`;
+  try {
+    logInfo("feed.following.target.request", { target: clean, endpoint });
+    const response = await fetch(endpoint, {
+      cache: "no-store",
+      headers: githubAuthHeaders(),
+    });
+    logInfo("feed.following.target.response", {
+      target: clean,
+      status: response.status,
+      ok: response.ok,
+    });
+    if (!response.ok) {
+      throw new Error(`following target failed: ${response.status}`);
+    }
+    const ticket = await response.json();
+    const status = compatibilityStatus(ticket.compatibility || ticket.browser_seed?.compatibility);
+    if (!status.compatible) {
+      logWarn("feed.following.target.version_mismatch", { target: clean, message: status.message });
+      return { target: clean, ticket, headlines: [], error: status.message };
+    }
+    const targetRoute = {
+      ...route,
+      kind: "user",
+      login,
+      feed,
+      selection: feed === "*" ? `${login}/*` : `${login}/${feed}`,
+    };
+    return {
+      target: clean,
+      ticket,
+      headlines: snapshotHeadlines(ticket)
+        .filter((item) => headlineMatchesRoute(item, targetRoute))
+        .map((item) => enrichHeadlineFromTicket(item, ticket)),
+      error: undefined,
+    };
+  } catch (error) {
+    logError("following target resolution failed", error);
+    return { target: clean, ticket: undefined, headlines: [], error: String(error) };
+  }
+}
+
+function followingResolverQuery(route, feed) {
+  const params = new URLSearchParams();
+  params.set("network", route.network || "mainnet");
+  params.set("story_only", "true");
+  params.set("settled_only", "true");
+  if (feed === "*") {
+    params.set("streams", "all");
+  } else if (feed) {
+    params.set("streams", feed);
+  }
+  return `?${params.toString()}`;
 }
 
 function networkDiscoveryQuery(route) {
@@ -1404,7 +1490,7 @@ function remoteHeadlineToBulletin(route, item, index) {
     mode: item.mode || "dispatch",
     priority: item.priority || item.score || 75,
     dwell_ms: item.dwell_ms || item.dwellMs || 14000,
-    eyebrow: routeEyebrow(route),
+    eyebrow: `feed / ${route.network} / ${route.feedMode === "following" ? "following" : "discover"}`,
     headline: headlineText,
     deck: item.deck || item.summary || "settled story capsule published to the network.",
     lower_third: item.lower_third || item.lowerThird || item.publisher_label || "verified peer",
@@ -1461,7 +1547,7 @@ function renderGlobalTimeline(route, snapshot) {
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
   nav.appendChild(rootModeLink(route, "discovery", "all public feeds", true));
-  nav.appendChild(rootModeLink(route, "subscribed", "subscribed", false));
+  nav.appendChild(rootModeLink(route, "following", "following", false));
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
 
@@ -1478,7 +1564,7 @@ function renderGlobalTimeline(route, snapshot) {
       title.textContent = item.headline || item.title || "settled story";
       const copy = document.createElement("p");
       copy.textContent = item.deck || item.summary || "story-only capsule";
-      card.append(meta, title, copy);
+      card.append(meta, title, copy, timelineActions(item, route));
       timeline.appendChild(card);
     }
   } else {
@@ -1495,7 +1581,7 @@ function renderGlobalTimeline(route, snapshot) {
       const copy = document.createElement("p");
       copy.textContent =
         "this feed is visible on the network. settled story capsules will appear without raw events.";
-      card.append(meta, title, copy, timelineStatus(feed, route));
+      card.append(meta, title, copy, timelineStatus(feed, route), timelineActions(feed, route));
       timeline.appendChild(card);
     }
   }
@@ -1513,7 +1599,7 @@ function renderGlobalTimeline(route, snapshot) {
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
-  renderTicker(["interactive network discovery", "subscribed feeds stay explicit"]);
+  renderTicker(["interactive network discovery", "followed feeds stay explicit"]);
 }
 
 function rootModeLink(route, mode, label, current = false) {
@@ -1556,9 +1642,9 @@ function renderTimeline(route, ticket) {
     return;
   }
   const feeds = ticket.feeds || ticket.candidate_feeds || [];
-  const headlines = snapshotHeadlines(ticket).filter((item) =>
-    headlineMatchesRoute(item, route),
-  );
+  const headlines = snapshotHeadlines(ticket)
+    .filter((item) => headlineMatchesRoute(item, route))
+    .map((item) => enrichHeadlineFromTicket(item, ticket));
   logInfo("feed.timeline.render", {
     login: ticket.profile?.login || route.login,
     selection: route.selection,
@@ -1602,12 +1688,12 @@ function renderTimeline(route, ticket) {
     meta.className = "timeline-meta";
     meta.textContent =
       item.lower_third ||
-      `${item.publisher_login || route.login} / ${item.feed_label || "feed"}`;
+      `${item.feed_label || "feed"} · ${relativeTime(item.created_at || item.createdAt || Date.now())}`;
     const title = document.createElement("h2");
     title.textContent = item.headline || item.title || "settled story";
     const copy = document.createElement("p");
     copy.textContent = item.deck || item.summary || "story-only capsule";
-    card.append(meta, title, copy);
+    card.append(timelinePublisher(item, ticket, route), meta, title, copy, timelineActions(item, route));
     timeline.appendChild(card);
   }
 
@@ -1628,7 +1714,7 @@ function renderTimeline(route, ticket) {
     const copy = document.createElement("p");
     copy.textContent =
       "settled story capsules will appear here as a vertical feed. raw events remain unavailable.";
-    card.append(meta, title, copy, timelineStatus(feed, route));
+    card.append(meta, title, copy, timelineStatus(feed, route), timelineActions(feed, route));
     timeline.appendChild(card);
   }
   if (timeline.children.length === 1) {
@@ -1648,14 +1734,35 @@ function renderTimeline(route, ticket) {
   renderTicker([`interactive timeline · ${routeStreamLabel(route)}`, "projection mode remains automatic"]);
 }
 
-function renderSubscribedTimeline(route, targets) {
+function renderFollowingEmpty(route) {
+  showStage();
+  document.body.dataset.mode = "dispatch";
+  setText(liveState, "browse");
+  setText(eyebrow, `feed / ${route.network} / following`);
+  setText(headline, "nothing followed yet");
+  setText(
+    deck,
+    "open discovery, choose a feed, and follow it here. private access still requires a signed grant.",
+  );
+  renderPublisher(undefined);
+  renderHeadlineImage(undefined);
+  clearAuthAction();
+  renderChips(["following", "local selection", route.network, "redacted"]);
+  renderTicker(["discovery finds feeds", "following is your explicit list"]);
+  stopStageProgress();
+  if (route.interactive) {
+    renderFollowingTimeline(route, [], []);
+  }
+}
+
+function renderFollowingTimeline(route, targets, results) {
   if (!timeline) {
     renderRemoteState(route, "failed", ["timeline surface unavailable"]);
     return;
   }
-  logInfo("feed.subscribed.timeline.render", {
+  logInfo("feed.following.timeline.render", {
     network: route.network,
-    subscriptions: targets,
+    targets,
   });
   if (stage) {
     stage.hidden = true;
@@ -1665,41 +1772,63 @@ function renderSubscribedTimeline(route, targets) {
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "follow");
-  setText(sourceCount, `${targets.length} sub`);
+  setText(sourceCount, `${targets.length} src`);
   timeline.replaceChildren();
 
   const toolbar = document.createElement("div");
   toolbar.className = "timeline-toolbar";
   const label = document.createElement("span");
-  label.textContent = `subscribed / ${route.network}`;
+  label.textContent = `following / ${route.network}`;
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
+  nav.appendChild(rootModeLink(route, "discovery", "discover", false));
   for (const target of targets) {
     const link = document.createElement("a");
-    link.href = subscribedTargetUrl(target);
+    link.href = followingTargetUrl(target);
     link.textContent = target;
     nav.appendChild(link);
   }
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
 
+  for (const result of results) {
+    for (const item of result.headlines || []) {
+      const card = document.createElement("article");
+      card.className = "timeline-card";
+      card.tabIndex = 0;
+      const meta = document.createElement("div");
+      meta.className = "timeline-meta";
+      meta.textContent = item.lower_third || `${result.target} / following`;
+      const title = document.createElement("h2");
+      title.textContent = item.headline || item.title || "settled story";
+      const copy = document.createElement("p");
+      copy.textContent = item.deck || item.summary || "story-only capsule";
+      card.append(timelinePublisher(item, { profile: {} }, route), meta, title, copy, timelineActions(item, route));
+      timeline.appendChild(card);
+    }
+  }
+
   for (const target of targets) {
+    const hasHeadline = results.some((result) => result.target === target && result.headlines?.length);
+    if (hasHeadline) {
+      continue;
+    }
     const card = document.createElement("article");
     card.className = "timeline-card";
     card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
-    meta.textContent = `${target} / subscribed`;
+    meta.textContent = `${target} / following`;
     const title = document.createElement("h2");
     title.textContent = "waiting for story";
     const copy = document.createElement("p");
     copy.textContent =
-      "only explicitly subscribed settled story capsules appear here. discovery results are not mixed in.";
+      "only followed settled story capsules appear here. discovery results are not mixed in.";
     const status = document.createElement("div");
     status.className = "timeline-status";
-    status.append(statusItem("target", target), statusItem("mode", "subscribed only"));
-    card.append(meta, title, copy, status);
+    status.append(statusItem("target", target), statusItem("mode", "following only"));
+    card.append(meta, title, copy, status, timelineActions({ feed_label: target.split("/")[1] || "*", publisher_login: target.split("/")[0] }, route));
     timeline.appendChild(card);
   }
   if (!targets.length) {
@@ -1708,22 +1837,81 @@ function renderSubscribedTimeline(route, targets) {
     card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
-    meta.textContent = "subscribed";
+    meta.textContent = "following";
     const title = document.createElement("h2");
-    title.textContent = "no subscriptions selected";
+    title.textContent = "nothing followed yet";
     const copy = document.createElement("p");
     copy.textContent =
-      "choose explicit feeds to follow. network discovery remains separate from subscriptions.";
+      "use discovery to follow visible feeds. private feeds can request access after sign-in.";
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
-  renderTicker(["interactive subscribed timeline", "move mouse for mode switcher"]);
+  renderTicker(["interactive following timeline", "move mouse for mode switcher"]);
 }
 
-function subscribedTargetUrl(target) {
+function followingTargetUrl(target) {
   const clean = target.replace(/^@/, "");
   const [login, feed = "*"] = clean.split("/");
-  return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=subscribed&view=timeline&subscriptions=${encodeURIComponent(target)}`;
+  return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=following&view=timeline&following=${encodeURIComponent(target)}`;
+}
+
+function timelineActions(feed, route) {
+  const actions = document.createElement("div");
+  actions.className = "timeline-actions";
+  const target = followTargetFor(feed, route);
+  if (target) {
+    actions.appendChild(followButton(target));
+  }
+  const visibility = String(feed.visibility || "").toLowerCase();
+  if (visibility && visibility !== "public") {
+    actions.appendChild(requestAccessButton(target || route.selection));
+  }
+  return actions;
+}
+
+function followTargetFor(feed, route) {
+  const login =
+    publisherLoginForProfile(feed, { profile: { login: route.login } }) ||
+    route.login ||
+    "";
+  if (!login) {
+    return "";
+  }
+  const label = feed.feed_label || feed.label || route.feed || "*";
+  return normalizeFollowTarget(`${login}/${label || "*"}`);
+}
+
+function followButton(target) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "feed-action";
+  const applyState = () => {
+    const active = isFollowingTarget(target);
+    button.textContent = active ? "following" : "follow";
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  };
+  applyState();
+  button.addEventListener("click", () => {
+    const next = toggleFollowTarget(target);
+    applyState();
+    logInfo("feed.following.toggle", { target, following: next });
+  });
+  return button;
+}
+
+function requestAccessButton(target) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "feed-action";
+  button.textContent = "request access";
+  button.addEventListener("click", () => {
+    logInfo("feed.access.request.pending", {
+      target,
+      message: "private subscription grants are protocol-level and require edge support",
+    });
+    button.textContent = "access pending";
+  });
+  return button;
 }
 
 function feedLink(login, label, text, current = false) {
@@ -1881,9 +2069,7 @@ function updateSourceCount() {
 
 updateClock();
 window.setInterval(updateClock, 1000);
-if (githubAuthCallback?.code) {
-  handleGithubOauthCodeCallback(githubAuthCallback);
-} else if (githubAuthCallback) {
+if (githubAuthCallback) {
   handleGithubAuthCallback(githubAuthCallback);
 } else if (isNetworkView()) {
   startNetworkView();

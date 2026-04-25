@@ -343,6 +343,15 @@ h1 {
   gap: clamp(12px, 1.8vw, 24px);
 }
 
+.footer-rev {
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, 0.16);
+  font-family: ui-monospace, monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0;
+  user-select: text;
+}
+
 .footer-links a {
   color: var(--secondary);
   text-decoration: none;
@@ -491,6 +500,37 @@ h1 {
   overflow-wrap: anywhere;
 }
 
+.timeline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.feed-action {
+  appearance: none;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: var(--label);
+  padding: 8px 10px;
+}
+
+.feed-action:hover,
+.feed-action:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+
+.feed-action[aria-pressed="true"] {
+  border-color: rgba(216, 124, 124, 0.45);
+  color: var(--secondary);
+}
+
 .timeline-empty h2 {
   color: var(--muted);
 }
@@ -535,6 +575,10 @@ body[data-mode="breaking"] .chips span {
 
   .footer-links {
     gap: 12px;
+  }
+
+  .footer-rev {
+    display: none;
   }
 
   .status {

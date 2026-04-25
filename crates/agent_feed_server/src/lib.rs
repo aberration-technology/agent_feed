@@ -163,7 +163,19 @@ async fn remote_user_shell(
 }
 
 fn render_ui(view: Option<&str>, p2p_enabled: bool) -> String {
-    agent_feed_ui::render_index_with_config(view, &UiConfig { p2p_enabled })
+    agent_feed_ui::render_index_with_config(
+        view,
+        &UiConfig {
+            p2p_enabled,
+            revision: option_env!("GITHUB_SHA")
+                .map(short_revision)
+                .or_else(|| option_env!("VERGEN_GIT_SHA").map(short_revision)),
+        },
+    )
+}
+
+fn short_revision(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 async fn events_sse(

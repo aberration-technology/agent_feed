@@ -1,18 +1,16 @@
 use agent_feed_directory::{
-    DirectoryError, DirectoryStore, FeedDirectoryEntry, GithubDiscoveryTicket, GithubPrincipal,
-    GithubProfileView, OrgDiscoveryTicket, OrgRouteFilter, RemoteHeadlineView, RemoteUserRoute,
-    SignedBrowserSeed,
+    DirectoryError, DirectoryStore, GithubDiscoveryTicket, GithubProfileView, OrgDiscoveryTicket,
+    OrgRouteFilter, RemoteHeadlineView, RemoteUserRoute, SignedBrowserSeed,
 };
-use agent_feed_identity::GithubUserId;
 use agent_feed_identity::{GithubLogin, GithubOrgName, GithubTeamSlug};
 use agent_feed_identity_github::{
     AllowAllGithubAccess, GithubAccessResolver, GithubResolveError, GithubResolver,
     GithubUserResponse, StaticGithubResolver,
 };
 use agent_feed_p2p_proto::{
-    FeedVisibility, ProtocolCompatibility, Signature, Signed, StoryCapsule,
-    github_org_provider_key, github_org_topic, github_provider_key, github_team_provider_key,
-    github_team_topic, github_user_topic,
+    ProtocolCompatibility, Signature, Signed, StoryCapsule, github_org_provider_key,
+    github_org_topic, github_provider_key, github_team_provider_key, github_team_topic,
+    github_user_topic,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -552,7 +550,6 @@ impl EdgeFabricConfig {
 #[derive(Clone)]
 struct HttpState {
     config: EdgeConfig,
-    directory: Arc<Mutex<DirectoryStore>>,
     snapshot: SnapshotStore,
 }
 
@@ -586,26 +583,6 @@ impl SnapshotStore {
             .map(|headlines| headlines.iter().cloned().collect())
             .unwrap_or_default()
     }
-
-    fn headlines_for_route(
-        &self,
-        github_user_id: u64,
-        route: &RemoteUserRoute,
-    ) -> Vec<RemoteHeadlineView> {
-        self.headlines
-            .lock()
-            .map(|headlines| {
-                headlines
-                    .iter()
-                    .filter(|headline| {
-                        headline.publisher_github_user_id == Some(github_user_id)
-                            && route.stream_filter.permits_label(&headline.feed_label)
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
 }
 
 pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> {
@@ -614,7 +591,6 @@ pub async fn serve_http(config: EdgeServerConfig) -> Result<(), EdgeServeError> 
     }
     let state = Arc::new(HttpState {
         config: config.edge,
-        directory: Arc::new(Mutex::new(DirectoryStore::new())),
         snapshot: SnapshotStore::default(),
     });
     let app = Router::new()
@@ -932,21 +908,26 @@ async fn resolve_github(
         Ok(route) => route,
         Err(err) => return edge_error(StatusCode::BAD_REQUEST, err.to_string()),
     };
-    let directory = match state.directory.lock() {
-        Ok(directory) => directory.clone(),
-        Err(_) => {
-            return edge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "feed directory unavailable",
-            );
-        }
-    };
-    let resolver = EdgeResolver::new(state.config.clone(), CurlGithubResolver, directory);
+    let resolver = EdgeResolver::new(
+        state.config.clone(),
+        CurlGithubResolver,
+        DirectoryStore::new(),
+    );
     match resolver.resolve_github_user(&route) {
         Ok(ticket) => {
             let headlines = state
                 .snapshot
-                .headlines_for_route(ticket.resolved_github_id.get(), &route);
+                .headlines()
+                .into_iter()
+                .filter(|headline| {
+                    headline_matches_github_route(
+                        headline,
+                        ticket.resolved_github_id.get(),
+                        ticket.profile.login.as_str(),
+                        &route,
+                    )
+                })
+                .collect();
             Json(ResolveGithubResponse::from_ticket_and_headlines(
                 &ticket,
                 &state.config,
@@ -1007,16 +988,11 @@ fn resolve_org_like(
         Ok(filter) => filter,
         Err(err) => return edge_error(StatusCode::BAD_REQUEST, err.to_string()),
     };
-    let directory = match state.directory.lock() {
-        Ok(directory) => directory.clone(),
-        Err(_) => {
-            return edge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "feed directory unavailable",
-            );
-        }
-    };
-    let resolver = EdgeResolver::new(state.config.clone(), CurlGithubResolver, directory);
+    let resolver = EdgeResolver::new(
+        state.config.clone(),
+        CurlGithubResolver,
+        DirectoryStore::new(),
+    );
     match resolver.resolve_github_org(&org, team.as_ref(), &filter) {
         Ok(ticket) => Json(ResolveOrgResponse::from_ticket(&ticket, &state.config)).into_response(),
         Err(err) => edge_error(StatusCode::BAD_GATEWAY, err.to_string()),
@@ -1050,20 +1026,8 @@ async fn browser_seed(State(state): State<Arc<HttpState>>) -> impl IntoResponse 
 }
 
 async fn network_snapshot(State(state): State<Arc<HttpState>>) -> Json<serde_json::Value> {
-    let feeds = match state.directory.lock() {
-        Ok(directory) => directory
-            .visible_public_entries()
-            .iter()
-            .map(|feed| resolve_feed_view(feed, &state.config))
-            .collect(),
-        Err(_) => {
-            tracing::warn!("network snapshot directory lock poisoned");
-            Vec::new()
-        }
-    };
     Json(network_snapshot_value(
         &state.config,
-        feeds,
         state.snapshot.headlines(),
     ))
 }
@@ -1107,8 +1071,6 @@ async fn network_publish(
         .filter(|value| !value.is_empty())
         .unwrap_or("workstation");
     let mut accepted = 0usize;
-    let sequence_base = u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
-        .unwrap_or(u64::MAX.saturating_sub(1024));
     for capsule in request.capsules {
         if !capsule.verify_capsule().unwrap_or(false) {
             return edge_error(StatusCode::BAD_REQUEST, "invalid capsule signature");
@@ -1126,53 +1088,10 @@ async fn network_publish(
             .github_login
             .clone()
             .unwrap_or_else(|| format!("github:{}", session.github_user_id));
-        let owner = GithubPrincipal {
-            github_user_id: GithubUserId::new(session.github_user_id),
-            current_login: publisher_login.clone(),
-            display_name: publisher.display_name.clone(),
-            avatar: publisher.avatar.clone(),
-            verified_by: state.config.authority_id.clone(),
-            verified_at: OffsetDateTime::now_utc(),
-        };
-        let entry = match FeedDirectoryEntry::new(
-            &state.config.network_id,
-            capsule.value.feed_id.clone(),
-            owner,
-            format!("edge:github:{}", session.github_user_id),
-            feed_name,
-            FeedVisibility::Public,
-            sequence_base.saturating_add(accepted as u64),
-        )
-        .sign(&state.config.authority_id)
-        {
-            Ok(entry) => entry,
-            Err(error) => {
-                return edge_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("feed directory record failed: {error}"),
-                );
-            }
-        };
-        match state.directory.lock() {
-            Ok(mut directory) => {
-                if let Err(error) = directory.publish(entry) {
-                    return edge_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("feed directory publish failed: {error}"),
-                    );
-                }
-            }
-            Err(_) => {
-                return edge_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "feed directory unavailable",
-                );
-            }
-        }
         let view = RemoteHeadlineView {
             feed_id: capsule.value.feed_id.clone(),
             feed_label: feed_name.to_string(),
-            publisher_github_user_id: Some(session.github_user_id),
+            publisher_github_user_id: publisher.github_user_id,
             publisher_login,
             publisher_display_name: publisher.display_name.clone(),
             publisher_avatar: publisher.avatar.clone(),
@@ -1200,9 +1119,20 @@ async fn network_publish(
     .into_response()
 }
 
+fn headline_matches_github_route(
+    headline: &RemoteHeadlineView,
+    github_user_id: u64,
+    github_login: &str,
+    route: &RemoteUserRoute,
+) -> bool {
+    let identity_matches = headline.publisher_github_user_id == Some(github_user_id)
+        || (headline.publisher_github_user_id.is_none()
+            && headline.publisher_login.eq_ignore_ascii_case(github_login));
+    identity_matches && route.stream_filter.permits_label(&headline.feed_label)
+}
+
 fn network_snapshot_value(
     config: &EdgeConfig,
-    feeds: Vec<ResolveFeedView>,
     headlines: Vec<RemoteHeadlineView>,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -1216,7 +1146,7 @@ fn network_snapshot_value(
         "feed_mode": "discovery",
         "story_only": true,
         "raw_events": false,
-        "feeds": feeds,
+        "feeds": [],
         "headlines": headlines,
     })
 }
@@ -1659,7 +1589,7 @@ impl GithubResolver for CurlGithubResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_feed_directory::{FeedDirectoryEntry, GithubPrincipal};
+    use agent_feed_directory::{FeedDirectoryEntry, GithubPrincipal, RemoteUserRoute};
     use agent_feed_identity::{GithubOrgName, GithubTeamSlug, GithubUserId};
     use agent_feed_identity_github::{GithubProfile, StaticGithubAccessResolver};
     use agent_feed_p2p_proto::FeedVisibility;
@@ -1770,7 +1700,6 @@ mod tests {
             Some("https://api.feed.aberration.technology/avatar/github/123")
         );
         assert!(response.feeds[0].publisher_verified);
-        assert!(response.headlines.is_empty());
     }
 
     #[test]
@@ -1817,29 +1746,13 @@ mod tests {
 
     #[test]
     fn network_snapshot_supports_global_discovery_shape() {
-        let snapshot = network_snapshot_value(
-            &config(),
-            vec![ResolveFeedView {
-                feed_id: "github:123:workstation".to_string(),
-                label: "workstation".to_string(),
-                compatibility: ProtocolCompatibility::current(),
-                visibility: "public".to_string(),
-                publisher_login: "mosure".to_string(),
-                publisher_display_name: Some("mosure".to_string()),
-                publisher_avatar: Some("/avatar/github/123".to_string()),
-                publisher_verified: true,
-                last_seen_at: OffsetDateTime::UNIX_EPOCH,
-            }],
-            Vec::new(),
-        );
+        let snapshot = network_snapshot_value(&config(), Vec::new());
 
         assert_eq!(snapshot["state"], "ready");
         assert_eq!(snapshot["feed_mode"], "discovery");
         assert_eq!(snapshot["story_only"], true);
         assert_eq!(snapshot["raw_events"], false);
         assert!(snapshot["feeds"].as_array().is_some());
-        assert_eq!(snapshot["feeds"][0]["label"], "workstation");
-        assert_eq!(snapshot["feeds"][0]["publisher_login"], "mosure");
         assert!(snapshot["headlines"].as_array().is_some());
         assert_eq!(snapshot["compatibility"]["protocol_version"], 1);
     }
@@ -1884,7 +1797,7 @@ mod tests {
 
         store.push(headline.clone());
         store.push(headline);
-        let snapshot = network_snapshot_value(&config(), Vec::new(), store.headlines());
+        let snapshot = network_snapshot_value(&config(), store.headlines());
 
         assert_eq!(
             snapshot["headlines"].as_array().expect("headlines").len(),
@@ -1902,13 +1815,42 @@ mod tests {
             snapshot["headlines"][0]["headline"],
             serde_json::json!("codex finished release pass")
         );
+    }
 
-        let workstation =
-            RemoteUserRoute::parse("/mosure", Some("streams=workstation")).expect("route parses");
-        let release =
-            RemoteUserRoute::parse("/mosure", Some("streams=release")).expect("route parses");
-        assert_eq!(store.headlines_for_route(123, &workstation).len(), 1);
-        assert!(store.headlines_for_route(123, &release).is_empty());
+    #[test]
+    fn github_route_headline_filter_uses_stable_id_and_stream_label() {
+        let route = RemoteUserRoute::parse("/mosure/workstation", None).expect("route parses");
+        let matching = RemoteHeadlineView {
+            feed_id: "local:workstation".to_string(),
+            feed_label: "workstation".to_string(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "old-login".to_string(),
+            publisher_display_name: None,
+            publisher_avatar: None,
+            verified: true,
+            headline: "codex finished release pass".to_string(),
+            deck: "settled story capsule reached the edge.".to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["verified".to_string()],
+            image: None,
+        };
+        let wrong_stream = RemoteHeadlineView {
+            feed_label: "release".to_string(),
+            ..matching.clone()
+        };
+
+        assert!(headline_matches_github_route(
+            &matching, 123, "mosure", &route
+        ));
+        assert!(!headline_matches_github_route(
+            &wrong_stream,
+            123,
+            "mosure",
+            &route
+        ));
+        assert!(!headline_matches_github_route(
+            &matching, 456, "mosure", &route
+        ));
     }
 
     #[test]

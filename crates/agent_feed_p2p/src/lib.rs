@@ -846,13 +846,13 @@ mod tests {
     use time::OffsetDateTime;
 
     fn story_event(kind: EventKind) -> AgentEvent {
-        let mut event = AgentEvent::new(SourceKind::Codex, kind, "codex patch applied");
+        let mut event = AgentEvent::new(SourceKind::Codex, kind, "codex verified release tests");
         event.agent = "codex".to_string();
         event.project = Some("agent_feed".to_string());
         event.session_id = Some("session".to_string());
         event.turn_id = Some("turn".to_string());
         event.files = vec!["src/lib.rs".to_string()];
-        event.summary = Some("1 changed files. raw diff omitted.".to_string());
+        event.summary = Some("tests passed after the feed publisher update.".to_string());
         event.score_hint = Some(82);
         event
     }
@@ -866,7 +866,7 @@ mod tests {
         seq: u64,
         score: u8,
     ) -> Result<Signed<StoryCapsule>, ProtoError> {
-        let mut event = story_event(EventKind::FileChanged);
+        let mut event = story_event(EventKind::TestPass);
         event.score_hint = Some(score);
         let mut stories = compile_events([event]);
         let story = stories.remove(0);
@@ -1022,8 +1022,10 @@ mod tests {
 
     #[test]
     fn capsules_do_not_carry_raw_agent_output() -> Result<(), Box<dyn std::error::Error>> {
-        let mut event = story_event(EventKind::FileChanged);
-        event.summary = Some("changed files. raw diff omitted. stdout secret omitted.".to_string());
+        let mut event = story_event(EventKind::TestPass);
+        event.summary = Some(
+            "tests passed after the feed publisher update. stdout secret omitted.".to_string(),
+        );
         let story = compile_events([event]).remove(0);
         let signed = Signed::sign_capsule(
             StoryCapsule::from_story("feed-public", 1, "github:1", &story)?,

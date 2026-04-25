@@ -33,12 +33,9 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
-const TAIL_PRIME_HEAD_BYTES: usize = 64 * 1024;
-const TAIL_PRIME_TAIL_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
-#[command(name = "agent-feed")]
-#[command(version)]
+#[command(name = "agent-feed", version)]
 #[command(about = "agent activity, reduced to signal")]
 struct Cli {
     #[arg(
@@ -62,24 +59,6 @@ enum LogFormat {
     Json,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-enum BackfillMode {
-    #[default]
-    None,
-    Recent,
-    All,
-}
-
-impl BackfillMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Recent => "recent",
-            Self::All => "all",
-        }
-    }
-}
-
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -101,24 +80,6 @@ enum Commands {
         p2p: bool,
         #[arg(long)]
         no_p2p: bool,
-        #[arg(long, default_value = "https://api.feed.aberration.technology")]
-        edge: String,
-        #[arg(long)]
-        auth_store: Option<PathBuf>,
-        #[arg(
-            long,
-            visible_aliases = ["feed-name", "feed-label"],
-            default_value = "workstation",
-            value_parser = parse_feed_arg,
-        )]
-        feed: String,
-        #[arg(
-            long,
-            help = "enable p2p discovery UI without publishing local stories"
-        )]
-        no_publish: bool,
-        #[arg(long, default_value_t = 30)]
-        publish_interval_secs: u64,
         #[arg(long, default_value = "codex,claude")]
         agents: String,
         #[arg(long, default_value_t = 4)]
@@ -134,8 +95,11 @@ enum Commands {
         all_workspaces: bool,
         #[arg(long, visible_aliases = ["no-agent-watch", "no-capture"])]
         no_agent_capture: bool,
-        #[arg(long, value_enum, default_value = "none")]
-        backfill: BackfillMode,
+        #[arg(
+            long,
+            help = "replay currently selected transcript history before tailing"
+        )]
+        include_history: bool,
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
         #[arg(long)]
@@ -392,7 +356,12 @@ enum P2pCommand {
             help = "only collect events whose cwd is this workspace or one of its children"
         )]
         workspace: Option<PathBuf>,
-        #[arg(long, default_value = "codex-exec")]
+        #[arg(
+            long,
+            help = "replay selected transcript history instead of only future deltas"
+        )]
+        include_history: bool,
+        #[arg(long, default_value = "codex-memory")]
         summarizer: String,
         #[arg(
             long,
@@ -406,6 +375,10 @@ enum P2pCommand {
         per_story: bool,
         #[arg(long)]
         allow_project_names: bool,
+        #[arg(long)]
+        summary_memory_store: Option<PathBuf>,
+        #[arg(long)]
+        summary_memory_reset: bool,
         #[arg(long)]
         guardrail_pattern: Vec<String>,
         #[arg(long)]
@@ -514,17 +487,12 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             display_token_file,
             p2p,
             no_p2p,
-            edge,
-            auth_store,
-            feed,
-            no_publish,
-            publish_interval_secs,
             agents,
             sessions,
             workspace,
             all_workspaces,
             no_agent_capture,
-            backfill,
+            include_history,
             poll_ms,
             codex_history,
             codex_sessions_dir,
@@ -549,45 +517,27 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 display_token_configured = security.display_token.is_some(),
                 "serving local feed"
             );
-            let p2p_session = if p2p_enabled && !no_publish {
-                Some(ensure_publish_session(auth_store, &edge)?)
-            } else {
-                None
-            };
-            let serve_agents = agents.clone();
-            let workspace_filter = if all_workspaces {
-                info!("serve agent capture scanning all workspaces");
-                None
-            } else {
-                WorkspaceFilter::from_cli(workspace)?
-            };
             let capture = if no_agent_capture {
                 info!("agent transcript capture disabled for serve");
                 None
             } else {
+                let workspace_filter = if all_workspaces {
+                    info!("serve agent capture scanning all workspaces");
+                    None
+                } else {
+                    WorkspaceFilter::from_cli(workspace)?
+                };
                 Some(ServeAgentCapture {
                     agents,
                     sessions,
-                    workspace: workspace_filter.clone(),
+                    workspace: workspace_filter,
+                    include_history,
                     poll_ms,
-                    backfill,
                     codex_history,
                     codex_sessions_dir,
                     claude_projects_dir,
                 })
             };
-            let publisher = p2p_session.map(|session| ServeP2pPublisher {
-                edge,
-                session,
-                feed,
-                server: bind.to_string(),
-                agents: capture
-                    .as_ref()
-                    .map(|capture| capture.agents.clone())
-                    .unwrap_or_else(|| serve_agents.clone()),
-                workspace: workspace_filter,
-                interval_secs: publish_interval_secs,
-            });
             serve_with_ready(
                 ServerConfig {
                     security,
@@ -596,20 +546,12 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 move |bind| {
                     println!("serving http://{bind}/reel");
                     if p2p_enabled {
-                        if no_publish {
-                            println!("p2p browser discovery ux enabled; local feed publishing disabled");
-                        } else {
-                            println!("p2p publishing enabled; authenticated github feed publisher active");
-                        }
+                        println!("p2p browser discovery ux enabled");
                     }
                     if let Some(capture) = capture {
                         start_serve_agent_capture(bind, capture);
                     } else {
                         println!("agent capture disabled; use `agent-feed codex active --watch` to attach manually");
-                    }
-                    if let Some(publisher) = publisher {
-                        println!("p2p publish: waiting for new settled stories");
-                        start_serve_p2p_publisher(publisher);
                     }
                 },
             )
@@ -668,15 +610,64 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 print_url,
                 store,
             } => {
-                let session = run_github_login(GithubLoginOptions {
-                    edge,
-                    callback_bind,
+                let listener = TcpListener::bind(callback_bind)?;
+                let bind = listener.local_addr()?;
+                if !bind.ip().is_loopback() {
+                    return Err(CliError::Http(
+                        "github auth callback must bind to loopback".to_string(),
+                    ));
+                }
+                info!(
+                    edge = %edge,
+                    callback_bind = %bind,
                     timeout_secs,
                     no_browser,
                     print_url,
-                    store,
-                    reason: "github cli auth",
-                })?;
+                    "github cli auth starting"
+                );
+                let config = GithubCliAuthConfig {
+                    edge_base_url: edge.clone(),
+                    callback_bind,
+                    ..GithubCliAuthConfig::default()
+                };
+                let start = begin_cli_login(&config, bind)?;
+                debug!(authorize_url = %start.authorize_url, callback_url = %start.callback_url, "github auth url prepared");
+                if print_url || no_browser {
+                    println!("{}", start.authorize_url);
+                }
+                if !no_browser && let Err(err) = open_url(&start.authorize_url) {
+                    warn!(error = %err, "failed to open browser for github auth");
+                    eprintln!("agent-feed: failed to open browser: {err}");
+                    eprintln!("agent-feed: open this URL manually:");
+                    eprintln!("{}", start.authorize_url);
+                }
+                println!("waiting for github callback on {}", start.callback_url);
+                let (target, mut stream) =
+                    wait_for_github_callback(&listener, Duration::from_secs(timeout_secs))?;
+                let session = match parse_cli_callback_request(&target)
+                    .and_then(|callback| complete_cli_login(&start, callback, edge.clone()))
+                {
+                    Ok(session) => {
+                        write_auth_callback_response(&mut stream, true, "github sign-in complete")?;
+                        session
+                    }
+                    Err(err) => {
+                        let _ = write_auth_callback_response(
+                            &mut stream,
+                            false,
+                            "github sign-in failed",
+                        );
+                        return Err(CliError::Auth(err));
+                    }
+                };
+                let store = GithubSessionStore::new(auth_store_path(store));
+                store.save(&session)?;
+                info!(
+                    github_login = %session.login,
+                    github_user_id = session.github_user_id,
+                    expires_at = %session.expires_at,
+                    "github cli auth completed"
+                );
                 println!(
                     "github auth: @{} github:{} expires {}",
                     session.login, session.github_user_id, session.expires_at
@@ -759,7 +750,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         &paths,
                         poll_ms,
                         workspace_filter.as_ref(),
-                        BackfillMode::All,
+                        true,
                     )?;
                 } else {
                     import_codex_sessions(&server, &paths, workspace_filter.as_ref())?;
@@ -836,7 +827,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         &paths,
                         poll_ms,
                         workspace_filter.as_ref(),
-                        BackfillMode::All,
+                        true,
                     )?;
                 } else {
                     import_claude_sessions(&server, &paths, workspace_filter.as_ref())?;
@@ -1071,11 +1062,14 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 sessions_dir,
                 claude_projects_dir,
                 workspace,
+                include_history,
                 summarizer,
                 summary_style,
                 summary_prompt_max_chars,
                 per_story,
                 allow_project_names,
+                summary_memory_store,
+                summary_memory_reset,
                 guardrail_pattern,
                 images,
                 image_processor,
@@ -1095,6 +1089,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     selected_agents = ?selected_agents,
                     sessions,
                     workspace = workspace_filter.log_value(),
+                    include_history,
                     summarizer = %summarizer,
                     per_story,
                     images,
@@ -1112,7 +1107,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         sessions,
                         workspace_filter.as_ref(),
                     )?;
-                    stories.extend(compile_codex_stories(&paths, workspace_filter.as_ref())?);
+                    if include_history {
+                        stories.extend(compile_codex_stories(&paths, workspace_filter.as_ref())?);
+                    } else {
+                        warm_codex_paths(&paths);
+                    }
                     captured_paths.extend(paths);
                 }
                 if selected_agents.contains("claude") {
@@ -1123,15 +1122,20 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         sessions,
                         workspace_filter.as_ref(),
                     )?;
-                    stories.extend(compile_claude_stories(&paths, workspace_filter.as_ref())?);
+                    if include_history {
+                        stories.extend(compile_claude_stories(&paths, workspace_filter.as_ref())?);
+                    } else {
+                        warm_claude_paths(&paths);
+                    }
                     captured_paths.extend(paths);
                 }
-                let summary_config = summary_config(SummaryCliOptions {
+                let mut summary_config = summary_config(SummaryCliOptions {
                     summarizer: &summarizer,
                     summary_style: &summary_style,
                     summary_prompt_max_chars,
                     per_story,
                     allow_project_names,
+                    summary_memory_store: summary_memory_store.as_deref(),
                     guardrail_patterns: &guardrail_pattern,
                     images,
                     image_processor: &image_processor,
@@ -1142,6 +1146,13 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     image_prompt_max_chars,
                     allow_remote_image_urls,
                 })?;
+                scope_summary_memory(
+                    &mut summary_config,
+                    &feed,
+                    &selected_agents,
+                    workspace_filter.as_ref(),
+                    summary_memory_reset,
+                )?;
                 let session = if dry_run {
                     None
                 } else {
@@ -1413,29 +1424,11 @@ struct ServeAgentCapture {
     agents: String,
     sessions: usize,
     workspace: Option<WorkspaceFilter>,
+    include_history: bool,
     poll_ms: u64,
-    backfill: BackfillMode,
     codex_history: Option<PathBuf>,
     codex_sessions_dir: Option<PathBuf>,
     claude_projects_dir: Option<PathBuf>,
-}
-
-#[derive(Clone, Debug)]
-struct ServeP2pPublisher {
-    edge: String,
-    session: GithubAuthSession,
-    feed: String,
-    server: String,
-    agents: String,
-    workspace: Option<WorkspaceFilter>,
-    interval_secs: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ServePublishStats {
-    capsules: usize,
-    stories: usize,
-    events: usize,
 }
 
 fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
@@ -1452,7 +1445,7 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
     }
 
     let server = bind.to_string();
-    let backfill = capture.backfill;
+    let include_history = capture.include_history;
     if capture_codex {
         let server = server.clone();
         let history = capture.codex_history.unwrap_or_else(default_codex_history);
@@ -1471,9 +1464,9 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 history = %history.display(),
                 sessions_dir = %sessions_dir.display(),
                 workspace = workspace.log_value(),
+                include_history,
                 %server,
                 poll_ms,
-                backfill = backfill.as_str(),
                 "serve codex active capture starting"
             );
             if paths.is_empty() {
@@ -1483,12 +1476,14 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 );
                 return Ok(());
             }
-            println!(
-                "codex capture: tailing {} active sessions from now (backfill={})",
-                paths.len(),
-                backfill.as_str()
-            );
-            watch_codex_sessions(&server, &paths, poll_ms, workspace.as_ref(), backfill)
+            println!("codex capture: watching {} active sessions", paths.len());
+            watch_codex_sessions(
+                &server,
+                &paths,
+                poll_ms,
+                workspace.as_ref(),
+                include_history,
+            )
         });
     }
 
@@ -1507,9 +1502,9 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 sessions_found = paths.len(),
                 projects_dir = %projects_dir.display(),
                 workspace = workspace.log_value(),
+                include_history,
                 %server,
                 poll_ms,
-                backfill = backfill.as_str(),
                 "serve claude active capture starting"
             );
             if paths.is_empty() {
@@ -1519,12 +1514,14 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 );
                 return Ok(());
             }
-            println!(
-                "claude capture: tailing {} active sessions from now (backfill={})",
-                paths.len(),
-                backfill.as_str()
-            );
-            watch_claude_sessions(&server, &paths, poll_ms, workspace.as_ref(), backfill)
+            println!("claude capture: watching {} active sessions", paths.len());
+            watch_claude_sessions(
+                &server,
+                &paths,
+                poll_ms,
+                workspace.as_ref(),
+                include_history,
+            )
         });
     }
 }
@@ -1545,151 +1542,6 @@ where
         warn!(%agent, error = %err, "serve agent capture thread failed to start");
         eprintln!("agent-feed: failed to start {agent} capture: {err}");
     }
-}
-
-fn start_serve_p2p_publisher(publisher: ServeP2pPublisher) {
-    let result = std::thread::Builder::new()
-        .name("agent-feed-p2p-publish".to_string())
-        .spawn(move || {
-            let interval = Duration::from_secs(publisher.interval_secs.max(10));
-            let mut last_fingerprint = String::new();
-            let mut seen_event_ids = HashSet::new();
-            loop {
-                match collect_serve_publish_capsules(&publisher, &mut seen_event_ids) {
-                    Ok((capsules, stats)) if capsules.is_empty() => {
-                        debug!(
-                            feed_name = %publisher.feed,
-                            stories = stats.stories,
-                            events = stats.events,
-                            "serve p2p publish skipped empty story set"
-                        );
-                    }
-                    Ok((capsules, stats)) => {
-                        let fingerprint = capsule_fingerprint(&capsules);
-                        if fingerprint == last_fingerprint {
-                            debug!(
-                                feed_name = %publisher.feed,
-                                capsules = capsules.len(),
-                                "serve p2p publish skipped unchanged capsule set"
-                            );
-                        } else {
-                            match publish_capsules_to_edge(
-                                &publisher.edge,
-                                &publisher.feed,
-                                capsules,
-                                &publisher.session,
-                            ) {
-                                Ok(()) => {
-                                    last_fingerprint = fingerprint;
-                                    info!(
-                                        feed_name = %publisher.feed,
-                                        capsules = stats.capsules,
-                                        stories = stats.stories,
-                                        events = stats.events,
-                                        "serve p2p capsules published"
-                                    );
-                                    println!(
-                                        "p2p publish: feed_name={} capsules={} stories={} events={}",
-                                        publisher.feed, stats.capsules, stats.stories, stats.events
-                                    );
-                                }
-                                Err(err) => {
-                                    warn!(
-                                        feed_name = %publisher.feed,
-                                        error = %err,
-                                        "serve p2p publish failed"
-                                    );
-                                    eprintln!("agent-feed: p2p publish failed: {err}");
-                                }
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            feed_name = %publisher.feed,
-                            error = %err,
-                            "serve p2p publish collection failed"
-                        );
-                        eprintln!("agent-feed: p2p publish collection failed: {err}");
-                    }
-                }
-                std::thread::sleep(interval);
-            }
-        });
-    if let Err(err) = result {
-        warn!(error = %err, "serve p2p publish thread failed to start");
-        eprintln!("agent-feed: failed to start p2p publisher: {err}");
-    }
-}
-
-fn collect_serve_publish_capsules(
-    publisher: &ServeP2pPublisher,
-    seen_event_ids: &mut HashSet<String>,
-) -> Result<(Vec<Signed<StoryCapsule>>, ServePublishStats), CliError> {
-    let selected_agents = parse_agent_list(&publisher.agents);
-    let events = fetch_server_events(&publisher.server)?;
-    let mut new_events = Vec::new();
-    for event in events {
-        let event_id = event.id.to_string();
-        if !seen_event_ids.insert(event_id) {
-            continue;
-        }
-        if !selected_agents.contains(event.agent.as_str()) {
-            continue;
-        }
-        if !event_matches_workspace(
-            &event,
-            publisher.workspace.as_ref(),
-            Path::new("<server>"),
-            "p2p",
-        ) {
-            continue;
-        }
-        new_events.push(event);
-    }
-    let event_count = new_events.len();
-    let stories = compile_events(new_events);
-    let summary_config = SummaryConfig::p2p_default();
-    let publisher_identity = PublisherIdentity::github(
-        publisher.session.github_user_id,
-        publisher.session.login.clone(),
-        publisher.session.name.clone(),
-        publisher.session.avatar_url.clone(),
-    );
-    let capsules = signed_capsules(
-        &publisher.feed,
-        &stories,
-        &summary_config,
-        Some(&publisher_identity),
-    )?;
-    let stats = ServePublishStats {
-        capsules: capsules.len(),
-        stories: stories.len(),
-        events: event_count,
-    };
-    Ok((capsules, stats))
-}
-
-fn publish_capsules_to_edge(
-    edge: &str,
-    feed: &str,
-    capsules: Vec<Signed<StoryCapsule>>,
-    session: &GithubAuthSession,
-) -> Result<(), CliError> {
-    let body = serde_json::to_string(&json!({
-        "feed_name": feed,
-        "capsules": capsules,
-    }))?;
-    post_edge_json_with_bearer(edge, "/network/publish", &body, session)?;
-    Ok(())
-}
-
-fn capsule_fingerprint(capsules: &[Signed<StoryCapsule>]) -> String {
-    capsules
-        .iter()
-        .map(|capsule| capsule.value.content_hash.0.as_str())
-        .collect::<Vec<_>>()
-        .join(":")
 }
 
 fn capture_scope_message(workspace: Option<&WorkspaceFilter>) -> String {
@@ -1835,30 +1687,6 @@ mod tests {
     }
 
     #[test]
-    fn signed_feed_id_uses_durable_github_user_id_when_available() {
-        let publisher = PublisherIdentity::github(123, "mosure", None, None);
-
-        assert_eq!(
-            signed_feed_id("workstation", Some(&publisher)),
-            "github:123:workstation"
-        );
-        assert_eq!(signed_feed_id("workstation", None), "local:workstation");
-    }
-
-    #[test]
-    fn builtin_agent_summarizers_are_allowed_to_fallback() {
-        let mut config = SummaryConfig::p2p_default();
-        config.processor = SummaryProcessorConfig::CodexExec;
-        assert!(agent_processor_fallback_enabled(&config));
-
-        config.processor = SummaryProcessorConfig::ClaudeCodeExec;
-        assert!(agent_processor_fallback_enabled(&config));
-
-        config.processor = SummaryProcessorConfig::Deterministic;
-        assert!(!agent_processor_fallback_enabled(&config));
-    }
-
-    #[test]
     fn codex_active_accepts_workspace_scope() {
         let cli = Cli::try_parse_from([
             "agent-feed",
@@ -1910,15 +1738,56 @@ mod tests {
                     summarizer,
                     summary_style,
                     summary_prompt_max_chars,
+                    include_history,
                     ..
                 },
         } = cli.command
         else {
             panic!("expected p2p publish command");
         };
-        assert_eq!(summarizer, "codex-exec");
+        assert_eq!(summarizer, "codex-memory");
         assert_eq!(summary_style, DEFAULT_SUMMARY_PROMPT_STYLE);
         assert_eq!(summary_prompt_max_chars, DEFAULT_SUMMARY_PROMPT_MAX_CHARS);
+        assert!(!include_history);
+    }
+
+    #[test]
+    fn summary_config_routes_codex_memory_processor() {
+        let store = PathBuf::from("/tmp/agent-feed-summary-memory-test.json");
+        let mut config = summary_config(SummaryCliOptions {
+            summarizer: "codex-memory",
+            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
+            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
+            per_story: false,
+            allow_project_names: false,
+            summary_memory_store: Some(&store),
+            guardrail_patterns: &[],
+            images: false,
+            image_processor: "codex-exec",
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        })
+        .expect("summary config builds");
+        let selected = parse_agent_list("codex,claude");
+        scope_summary_memory(&mut config, "workstation", &selected, None, false)
+            .expect("memory scopes");
+
+        let SummaryProcessorConfig::CodexSessionMemory {
+            store_path,
+            key,
+            command,
+        } = config.processor
+        else {
+            panic!("expected codex memory processor");
+        };
+        assert_eq!(store_path, store.display().to_string());
+        assert!(key.contains("feed:workstation"));
+        assert!(key.contains("agents:claude+codex"));
+        assert_eq!(command, default_codex_command());
     }
 
     #[test]
@@ -1930,6 +1799,7 @@ mod tests {
             summary_prompt_max_chars: 128,
             per_story: true,
             allow_project_names: false,
+            summary_memory_store: None,
             guardrail_patterns: &guardrail_patterns,
             images: false,
             image_processor: "http-endpoint",
@@ -1963,6 +1833,7 @@ mod tests {
             summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
             per_story: false,
             allow_project_names: false,
+            summary_memory_store: None,
             guardrail_patterns: &[],
             images: false,
             image_processor: "codex-exec",
@@ -1982,6 +1853,7 @@ mod tests {
             summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
             per_story: false,
             allow_project_names: false,
+            summary_memory_store: None,
             guardrail_patterns: &[],
             images: true,
             image_processor: "http-endpoint",
@@ -2033,12 +1905,9 @@ mod tests {
             agents,
             sessions,
             no_agent_capture,
-            no_publish,
-            publish_interval_secs,
-            feed,
             workspace,
             all_workspaces,
-            backfill,
+            include_history,
             ..
         } = cli.command
         else {
@@ -2048,29 +1917,9 @@ mod tests {
         assert_eq!(agents, "codex,claude");
         assert_eq!(sessions, 4);
         assert!(!no_agent_capture);
-        assert!(!no_publish);
-        assert_eq!(publish_interval_secs, 30);
-        assert_eq!(feed, "workstation");
         assert_eq!(workspace, Some(PathBuf::from(".")));
         assert!(!all_workspaces);
-        assert_eq!(backfill, BackfillMode::None);
-    }
-
-    #[test]
-    fn serve_accepts_explicit_backfill_modes() {
-        let recent = Cli::try_parse_from(["agent-feed", "serve", "--backfill", "recent"])
-            .expect("recent backfill parses");
-        let Commands::Serve { backfill, .. } = recent.command else {
-            panic!("expected serve command");
-        };
-        assert_eq!(backfill, BackfillMode::Recent);
-
-        let all = Cli::try_parse_from(["agent-feed", "serve", "--backfill", "all"])
-            .expect("all backfill parses");
-        let Commands::Serve { backfill, .. } = all.command else {
-            panic!("expected serve command");
-        };
-        assert_eq!(backfill, BackfillMode::All);
+        assert!(!include_history);
     }
 
     #[test]
@@ -2095,6 +1944,7 @@ mod tests {
             no_agent_capture,
             workspace,
             all_workspaces,
+            include_history,
             ..
         } = cli.command
         else {
@@ -2106,62 +1956,7 @@ mod tests {
         assert!(no_agent_capture);
         assert_eq!(workspace, Some(PathBuf::from("/tmp/agent-feed-workspace")));
         assert!(all_workspaces);
-    }
-
-    #[test]
-    fn serve_p2p_defaults_to_authenticated_publish() {
-        let cli = Cli::try_parse_from(["agent-feed", "serve", "--p2p"]).expect("serve p2p parses");
-
-        let Commands::Serve {
-            p2p,
-            no_p2p,
-            no_publish,
-            edge,
-            auth_store,
-            feed,
-            ..
-        } = cli.command
-        else {
-            panic!("expected serve command");
-        };
-
-        assert!(p2p);
-        assert!(!no_p2p);
-        assert!(!no_publish);
-        assert_eq!(edge, "https://api.feed.aberration.technology");
-        assert_eq!(auth_store, None);
-        assert_eq!(feed, "workstation");
-    }
-
-    #[test]
-    fn serve_p2p_can_disable_publishing() {
-        let cli = Cli::try_parse_from([
-            "agent-feed",
-            "serve",
-            "--p2p",
-            "--no-publish",
-            "--feed-name",
-            "release",
-            "--edge",
-            "https://edge.example",
-        ])
-        .expect("serve p2p no-publish parses");
-
-        let Commands::Serve {
-            p2p,
-            no_publish,
-            edge,
-            feed,
-            ..
-        } = cli.command
-        else {
-            panic!("expected serve command");
-        };
-
-        assert!(p2p);
-        assert!(no_publish);
-        assert_eq!(edge, "https://edge.example");
-        assert_eq!(feed, "release");
+        assert!(!include_history);
     }
 
     #[test]
@@ -2419,196 +2214,6 @@ mod tests {
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
-
-    #[test]
-    fn codex_tail_only_startup_primes_state_without_importing_history() {
-        let root = temp_test_root("codex-tail-only-startup");
-        let workspace = root.join("repo");
-        fs::create_dir_all(&workspace).expect("workspace dir");
-        let transcript = root.join("codex.jsonl");
-        write_jsonl(
-            &transcript,
-            [
-                json!({
-                    "type": "session_meta",
-                    "timestamp": "2026-04-24T03:16:49.696Z",
-                    "payload": {"id": "tail-only-session", "cwd": workspace}
-                }),
-                json!({
-                    "type": "turn_context",
-                    "timestamp": "2026-04-24T03:16:49.697Z",
-                    "payload": {"cwd": workspace, "turn_id": "turn_1", "model": "gpt"}
-                }),
-                json!({
-                    "type": "event_msg",
-                    "timestamp": "2026-04-24T03:17:00.000Z",
-                    "payload": {
-                        "type": "exec_command_end",
-                        "status": "completed",
-                        "exit_code": 0,
-                        "duration": "120ms",
-                        "command": ["cargo", "test"]
-                    }
-                }),
-            ],
-        );
-
-        let (watcher, stats) =
-            initial_codex_watch_state("127.0.0.1:9", &transcript, None, BackfillMode::None)
-                .expect("watcher initializes");
-
-        assert_eq!(stats.imported, 0);
-        assert_eq!(stats.filtered, 0);
-        assert_eq!(
-            watcher.offset,
-            fs::metadata(&transcript).expect("metadata").len()
-        );
-        assert_eq!(
-            watcher.state.session_id.as_deref(),
-            Some("tail-only-session")
-        );
-        assert_eq!(watcher.state.turn_id.as_deref(), Some("turn_1"));
-
-        fs::remove_dir_all(root).expect("cleanup temp workspace");
-    }
-
-    #[test]
-    fn codex_tail_only_startup_uses_bounded_metadata_prime() {
-        let root = temp_test_root("codex-tail-only-bounded-prime");
-        let workspace = root.join("repo");
-        fs::create_dir_all(&workspace).expect("workspace dir");
-        let transcript = root.join("large-codex.jsonl");
-        let mut file = File::create(&transcript).expect("large transcript creates");
-        writeln!(
-            file,
-            "{}",
-            json!({
-                "type": "session_meta",
-                "timestamp": "2026-04-24T03:16:49.696Z",
-                "payload": {"id": "bounded-session", "cwd": workspace}
-            })
-        )
-        .expect("session metadata writes");
-        writeln!(
-            file,
-            "{}",
-            json!({
-                "type": "turn_context",
-                "timestamp": "2026-04-24T03:16:49.697Z",
-                "payload": {"cwd": workspace, "turn_id": "turn_head", "model": "gpt"}
-            })
-        )
-        .expect("head turn writes");
-        file.write_all(&vec![
-            b'x';
-            TAIL_PRIME_HEAD_BYTES + TAIL_PRIME_TAIL_BYTES + 4096
-        ])
-        .expect("large middle writes");
-        writeln!(file).expect("middle terminator writes");
-        writeln!(
-            file,
-            "{}",
-            json!({
-                "type": "turn_context",
-                "timestamp": "2026-04-24T03:17:49.697Z",
-                "payload": {"cwd": workspace, "turn_id": "turn_tail", "model": "gpt"}
-            })
-        )
-        .expect("tail turn writes");
-        drop(file);
-
-        let prime_input = bounded_tail_prime_input(&transcript).expect("bounded prime reads");
-        assert!(prime_input.len() < TAIL_PRIME_HEAD_BYTES + TAIL_PRIME_TAIL_BYTES + 4096);
-        assert!(!prime_input.contains(&"x".repeat(4096)));
-
-        let (watcher, stats) =
-            initial_codex_watch_state("127.0.0.1:9", &transcript, None, BackfillMode::None)
-                .expect("watcher initializes");
-
-        assert_eq!(stats.imported, 0);
-        assert_eq!(
-            watcher.offset,
-            fs::metadata(&transcript).expect("metadata").len()
-        );
-        assert_eq!(watcher.state.session_id.as_deref(), Some("bounded-session"));
-        assert_eq!(watcher.state.turn_id.as_deref(), Some("turn_tail"));
-
-        fs::remove_dir_all(root).expect("cleanup temp workspace");
-    }
-
-    #[test]
-    fn serve_p2p_publisher_reads_incremental_daemon_events_once() {
-        let mut event = AgentEvent::new(
-            agent_feed_core::SourceKind::Codex,
-            agent_feed_core::EventKind::FileChanged,
-            "codex changed files",
-        );
-        event.agent = "codex".to_string();
-        event.project = Some("agent_feed".to_string());
-        event.session_id = Some("session".to_string());
-        event.turn_id = Some("turn".to_string());
-        event.files = vec!["src/lib.rs".to_string()];
-        event.summary = Some("1 changed files. raw diff omitted.".to_string());
-        event.score_hint = Some(82);
-        let server = spawn_events_server(
-            serde_json::to_string(&json!({ "events": [event] })).expect("events serialize"),
-            2,
-        );
-        let now = time::OffsetDateTime::now_utc();
-        let publisher = ServeP2pPublisher {
-            edge: "https://edge.example".to_string(),
-            session: GithubAuthSession {
-                provider: "github".to_string(),
-                github_user_id: 123,
-                login: "mosure".to_string(),
-                name: Some("mosure".to_string()),
-                avatar_url: Some("/avatar/github/123".to_string()),
-                session_token: Some("token".to_string()),
-                issued_at: now,
-                expires_at: now + time::Duration::hours(1),
-                edge_base_url: "https://edge.example".to_string(),
-            },
-            feed: "workstation".to_string(),
-            server,
-            agents: "codex,claude".to_string(),
-            workspace: None,
-            interval_secs: 30,
-        };
-        let mut seen = HashSet::new();
-
-        let (capsules, stats) = collect_serve_publish_capsules(&publisher, &mut seen)
-            .expect("first incremental publish compiles");
-        let (again, again_stats) = collect_serve_publish_capsules(&publisher, &mut seen)
-            .expect("second incremental publish compiles");
-
-        assert_eq!(stats.events, 1);
-        assert_eq!(stats.stories, 1);
-        assert_eq!(capsules.len(), 1);
-        assert_eq!(again_stats.events, 0);
-        assert!(again.is_empty());
-    }
-
-    fn spawn_events_server(body: String, requests: usize) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("events server binds");
-        let addr = listener.local_addr().expect("events server addr");
-        std::thread::spawn(move || {
-            for _ in 0..requests {
-                let (mut stream, _) = listener.accept().expect("events request accepts");
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                let mut buffer = [0_u8; 2048];
-                let _ = stream.read(&mut buffer);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("events response writes");
-            }
-        });
-        addr.to_string()
-    }
 }
 
 fn endpoint_for_source(source: &str) -> &'static str {
@@ -2711,6 +2316,16 @@ fn compile_codex_stories(
     Ok(compile_events(events))
 }
 
+fn warm_codex_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let Ok(input) = fs::read_to_string(path) else {
+            continue;
+        };
+        let mut state = TranscriptState::default();
+        warm_codex_state(path, &input, &mut state);
+    }
+}
+
 fn import_claude_sessions(
     server: &str,
     paths: &[PathBuf],
@@ -2762,6 +2377,16 @@ fn compile_claude_stories(
         "claude events collected for story compilation"
     );
     Ok(compile_events(events))
+}
+
+fn warm_claude_paths(paths: &[PathBuf]) {
+    for path in paths {
+        let Ok(input) = fs::read_to_string(path) else {
+            continue;
+        };
+        let mut state = ClaudeState::default();
+        warm_claude_state(path, &input, &mut state);
+    }
 }
 
 fn collect_codex_events(
@@ -2846,224 +2471,6 @@ fn collect_claude_events(
     Ok(collected)
 }
 
-fn prime_codex_state(path: &Path, input: &str, state: &mut TranscriptState) {
-    for (index, line) in input
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        match serde_json::from_str::<Value>(line) {
-            Ok(value) => {
-                let _ = normalize_transcript_value(value, state, Some(path));
-            }
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    line = index + 1,
-                    error = %err,
-                    "codex transcript parse failed during tail-state priming"
-                );
-            }
-        }
-    }
-}
-
-fn prime_claude_state(path: &Path, input: &str, state: &mut ClaudeState) {
-    for (index, line) in input
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        match serde_json::from_str::<Value>(line) {
-            Ok(value) => {
-                let _ = normalize_stream_value(value, state, Some(path));
-            }
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    line = index + 1,
-                    error = %err,
-                    "claude stream parse failed during tail-state priming"
-                );
-            }
-        }
-    }
-}
-
-fn import_recent_codex_story(
-    server: &str,
-    path: &Path,
-    input: &str,
-    workspace: Option<&WorkspaceFilter>,
-) -> ImportStats {
-    let collected = collect_codex_events_from_input(path, input, workspace);
-    import_latest_story_events(server, "/ingest/codex/jsonl", path, "codex", collected)
-}
-
-fn import_recent_claude_story(
-    server: &str,
-    path: &Path,
-    input: &str,
-    workspace: Option<&WorkspaceFilter>,
-) -> ImportStats {
-    let collected = collect_claude_events_from_input(path, input, workspace);
-    import_latest_story_events(
-        server,
-        "/ingest/claude/stream-json",
-        path,
-        "claude",
-        collected,
-    )
-}
-
-fn collect_codex_events_from_input(
-    path: &Path,
-    input: &str,
-    workspace: Option<&WorkspaceFilter>,
-) -> CollectedEvents {
-    let mut state = TranscriptState::default();
-    let mut collected = CollectedEvents::default();
-    for (index, line) in input
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        let value = match serde_json::from_str::<Value>(line) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    line = index + 1,
-                    error = %err,
-                    "codex transcript parse failed during recent backfill"
-                );
-                continue;
-            }
-        };
-        if let Some(event) = normalize_transcript_value(value, &mut state, Some(path)) {
-            if event_matches_workspace(&event, workspace, path, "codex") {
-                collected.events.push(event);
-            } else {
-                collected.filtered += 1;
-            }
-        }
-    }
-    collected
-}
-
-fn collect_claude_events_from_input(
-    path: &Path,
-    input: &str,
-    workspace: Option<&WorkspaceFilter>,
-) -> CollectedEvents {
-    let mut state = ClaudeState::default();
-    let mut collected = CollectedEvents::default();
-    for (index, line) in input
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        let value = match serde_json::from_str::<Value>(line) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    path = %path.display(),
-                    line = index + 1,
-                    error = %err,
-                    "claude stream parse failed during recent backfill"
-                );
-                continue;
-            }
-        };
-        if let Some(event) = normalize_stream_value(value, &mut state, Some(path)) {
-            if event_matches_workspace(&event, workspace, path, "claude") {
-                collected.events.push(event);
-            } else {
-                collected.filtered += 1;
-            }
-        }
-    }
-    collected
-}
-
-fn import_latest_story_events(
-    server: &str,
-    endpoint: &str,
-    path: &Path,
-    source: &str,
-    collected: CollectedEvents,
-) -> ImportStats {
-    let mut stats = ImportStats {
-        imported: 0,
-        filtered: collected.filtered,
-    };
-    let stories = compile_events(collected.events.clone());
-    let Some(story) = stories.last() else {
-        return stats;
-    };
-    let evidence = story
-        .evidence_event_ids
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>();
-    for (index, event) in collected.events.iter().enumerate() {
-        if !evidence.contains(&event.id.to_string()) {
-            continue;
-        }
-        if post_agent_event(server, endpoint, path, source, index, event) {
-            stats.imported += 1;
-        }
-    }
-    stats
-}
-
-fn post_agent_event(
-    server: &str,
-    endpoint: &str,
-    path: &Path,
-    source: &str,
-    index: usize,
-    event: &AgentEvent,
-) -> bool {
-    let body = match serde_json::to_string(event) {
-        Ok(body) => body,
-        Err(err) => {
-            warn!(
-                path = %path.display(),
-                error = %err,
-                %source,
-                "agent event encode failed"
-            );
-            eprintln!(
-                "agent-feed: failed to encode {source} event from {}: {err}",
-                path.display()
-            );
-            return false;
-        }
-    };
-    if let Err(err) = post_json(server, endpoint, &body) {
-        warn!(
-            path = %path.display(),
-            %server,
-            endpoint,
-            index,
-            error = %err,
-            %source,
-            "agent event post failed"
-        );
-        eprintln!(
-            "agent-feed: failed to post {source} event from {}: {err}",
-            path.display()
-        );
-        return false;
-    }
-    true
-}
-
 fn print_import_file(label: &str, path: &Path, stats: ImportStats) {
     if stats.filtered == 0 {
         println!(
@@ -3081,28 +2488,20 @@ fn print_import_file(label: &str, path: &Path, stats: ImportStats) {
     }
 }
 
-fn print_watch_started(label: &str, path: &Path, stats: ImportStats, backfill: BackfillMode) {
-    match backfill {
-        BackfillMode::None => {
-            println!("{label} watching: {} (tailing from now)", path.display());
-        }
-        BackfillMode::Recent | BackfillMode::All if stats.filtered == 0 => {
-            println!(
-                "{label} watching: {} ({} initial events; backfill={})",
-                path.display(),
-                stats.imported,
-                backfill.as_str()
-            );
-        }
-        BackfillMode::Recent | BackfillMode::All => {
-            println!(
-                "{label} watching: {} ({} initial events; {} filtered outside workspace; backfill={})",
-                path.display(),
-                stats.imported,
-                stats.filtered,
-                backfill.as_str()
-            );
-        }
+fn print_watch_started(label: &str, path: &Path, stats: ImportStats) {
+    if stats.filtered == 0 {
+        println!(
+            "{label} watching: {} ({} initial events)",
+            path.display(),
+            stats.imported
+        );
+    } else {
+        println!(
+            "{label} watching: {} ({} initial events; {} filtered outside workspace)",
+            path.display(),
+            stats.imported,
+            stats.filtered
+        );
     }
 }
 
@@ -3151,12 +2550,8 @@ fn signed_capsules(
     summary_config: &SummaryConfig,
     publisher: Option<&PublisherIdentity>,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
-    let feed_id = signed_feed_id(feed, publisher);
-    let author = publisher
-        .and_then(|publisher| publisher.github_user_id)
-        .map(|github_user_id| format!("github:{github_user_id}"))
-        .unwrap_or_else(|| "local:codex".to_string());
-    let summaries = summarize_feed_with_cli_fallback(&feed_id, stories, summary_config)?;
+    let feed_id = format!("local:{feed}");
+    let summaries = summarize_feed(&feed_id, stories, summary_config)?;
     info!(
         %feed_id,
         stories = stories.len(),
@@ -3170,7 +2565,7 @@ fn signed_capsules(
             let mut capsule = StoryCapsule::from_summary(
                 feed_id.clone(),
                 (index + 1) as u64,
-                author.clone(),
+                "local:codex",
                 summary,
             )?;
             if let Some(publisher) = publisher {
@@ -3181,50 +2576,13 @@ fn signed_capsules(
         .collect()
 }
 
-fn summarize_feed_with_cli_fallback(
-    feed_id: &str,
-    stories: &[CompiledStory],
-    summary_config: &SummaryConfig,
-) -> Result<Vec<agent_feed_summarize::FeedSummary>, CliError> {
-    match summarize_feed(feed_id, stories, summary_config) {
-        Ok(summaries) => Ok(summaries),
-        Err(SummaryError::Processor(error)) if agent_processor_fallback_enabled(summary_config) => {
-            warn!(
-                processor = summary_config.processor.name(),
-                error = %error,
-                "agent summarizer failed; falling back to deterministic redacted summary"
-            );
-            let mut fallback = summary_config.clone();
-            fallback.processor = SummaryProcessorConfig::Deterministic;
-            fallback.image.processor = ImageProcessorConfig::Disabled;
-            fallback.image.enabled = false;
-            summarize_feed(feed_id, stories, &fallback).map_err(CliError::from)
-        }
-        Err(error) => Err(CliError::from(error)),
-    }
-}
-
-fn agent_processor_fallback_enabled(summary_config: &SummaryConfig) -> bool {
-    matches!(
-        summary_config.processor,
-        SummaryProcessorConfig::CodexExec | SummaryProcessorConfig::ClaudeCodeExec
-    )
-}
-
-fn signed_feed_id(feed: &str, publisher: Option<&PublisherIdentity>) -> String {
-    let feed = feed.trim();
-    match publisher.and_then(|publisher| publisher.github_user_id) {
-        Some(github_user_id) => format!("github:{github_user_id}:{feed}"),
-        None => format!("local:{feed}"),
-    }
-}
-
 struct SummaryCliOptions<'a> {
     summarizer: &'a str,
     summary_style: &'a str,
     summary_prompt_max_chars: usize,
     per_story: bool,
     allow_project_names: bool,
+    summary_memory_store: Option<&'a Path>,
     guardrail_patterns: &'a [String],
     images: bool,
     image_processor: &'a str,
@@ -3248,10 +2606,21 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
     config.processor = match options.summarizer {
         "deterministic" | "offline" => SummaryProcessorConfig::Deterministic,
         "aesthetic" | "codex" | "codex-exec" => SummaryProcessorConfig::CodexExec,
+        "codex-memory" | "codex-session" | "aesthetic-memory" => {
+            SummaryProcessorConfig::CodexSessionMemory {
+                store_path: options
+                    .summary_memory_store
+                    .map(Path::display)
+                    .map(|path| path.to_string())
+                    .unwrap_or_else(default_summary_memory_store_string),
+                key: "default".to_string(),
+                command: default_codex_command(),
+            }
+        }
         "claude" | "claude-code" | "claude-code-exec" => SummaryProcessorConfig::ClaudeCodeExec,
         other => {
             return Err(CliError::Http(format!(
-                "unknown summarizer {other}; use aesthetic, codex-exec, claude-code, or deterministic"
+                "unknown summarizer {other}; use codex-memory, aesthetic, codex-exec, claude-code, or deterministic"
             )));
         }
     };
@@ -3282,6 +2651,53 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
         ));
     }
     Ok(config)
+}
+
+fn scope_summary_memory(
+    config: &mut SummaryConfig,
+    feed: &str,
+    selected_agents: &HashSet<&str>,
+    workspace: Option<&WorkspaceFilter>,
+    reset: bool,
+) -> Result<(), CliError> {
+    let SummaryProcessorConfig::CodexSessionMemory {
+        store_path, key, ..
+    } = &mut config.processor
+    else {
+        return Ok(());
+    };
+    let agents = if selected_agents.is_empty() {
+        "agents".to_string()
+    } else {
+        let mut agents = selected_agents.iter().copied().collect::<Vec<_>>();
+        agents.sort();
+        agents.join("+")
+    };
+    let workspace_scope = workspace
+        .map(WorkspaceFilter::display)
+        .unwrap_or_else(|| "all-workspaces".to_string());
+    *key = format!("feed:{feed}:agents:{agents}:workspace:{workspace_scope}");
+    if reset {
+        let path = PathBuf::from(store_path.clone());
+        if path.exists() {
+            fs::remove_file(&path)?;
+            info!(path = %path.display(), "summary memory store reset");
+        }
+    }
+    Ok(())
+}
+
+fn default_summary_memory_store_string() -> String {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agent_feed")
+        .join("summary-memory.json")
+        .display()
+        .to_string()
+}
+
+fn default_codex_command() -> String {
+    std::env::var("AGENT_FEED_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
 }
 
 fn parse_image_processor(
@@ -3332,24 +2748,35 @@ fn watch_codex_sessions(
     paths: &[PathBuf],
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
-    backfill: BackfillMode,
+    include_history: bool,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let (watcher, stats) = initial_codex_watch_state(server, path, workspace, backfill)?;
-        let offset = watcher.offset;
+        let input = fs::read_to_string(path)?;
+        let mut state = TranscriptState::default();
+        let stats = if include_history {
+            import_codex_chunk(server, path, &input, &mut state, workspace)
+        } else {
+            warm_codex_state(path, &input, &mut state);
+            ImportStats::default()
+        };
+        let offset = fs::metadata(path)?.len();
         info!(
             path = %path.display(),
             initial_events = stats.imported,
             filtered_events = stats.filtered,
             offset,
             poll_ms,
-            backfill = backfill.as_str(),
             workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "codex transcript watcher started"
         );
-        print_watch_started("codex transcript", path, stats, backfill);
-        watchers.push(watcher);
+        print_watch_started("codex transcript", path, stats);
+        watchers.push(CodexWatcher {
+            path: path.clone(),
+            offset,
+            state,
+            pending: String::new(),
+        });
     }
 
     loop {
@@ -3426,7 +2853,32 @@ fn import_codex_chunk(
             stats.filtered += 1;
             continue;
         }
-        if !post_agent_event(server, "/ingest/codex/jsonl", path, "codex", index, &event) {
+        let body = match serde_json::to_string(&event) {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "codex event encode failed"
+                );
+                eprintln!(
+                    "agent-feed: failed to encode codex event from {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if let Err(err) = post_json(server, "/ingest/codex/jsonl", &body) {
+            warn!(
+                path = %path.display(),
+                %server,
+                error = %err,
+                "codex event post failed"
+            );
+            eprintln!(
+                "agent-feed: failed to post codex event from {}: {err}",
+                path.display()
+            );
             continue;
         }
         debug!(
@@ -3442,29 +2894,49 @@ fn import_codex_chunk(
     stats
 }
 
+fn warm_codex_state(path: &Path, input: &str, state: &mut TranscriptState) {
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let _ = normalize_transcript_value(value, state, Some(path));
+    }
+}
+
 fn watch_claude_sessions(
     server: &str,
     paths: &[PathBuf],
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
-    backfill: BackfillMode,
+    include_history: bool,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let (watcher, stats) = initial_claude_watch_state(server, path, workspace, backfill)?;
-        let offset = watcher.offset;
+        let input = fs::read_to_string(path)?;
+        let mut state = ClaudeState::default();
+        let stats = if include_history {
+            import_claude_chunk(server, path, &input, &mut state, workspace)
+        } else {
+            warm_claude_state(path, &input, &mut state);
+            ImportStats::default()
+        };
+        let offset = fs::metadata(path)?.len();
         info!(
             path = %path.display(),
             initial_events = stats.imported,
             filtered_events = stats.filtered,
             offset,
             poll_ms,
-            backfill = backfill.as_str(),
             workspace = workspace.map(WorkspaceFilter::display).unwrap_or_else(|| "all".to_string()),
             "claude stream watcher started"
         );
-        print_watch_started("claude stream", path, stats, backfill);
-        watchers.push(watcher);
+        print_watch_started("claude stream", path, stats);
+        watchers.push(ClaudeWatcher {
+            path: path.clone(),
+            offset,
+            state,
+            pending: String::new(),
+        });
     }
 
     loop {
@@ -3551,14 +3023,32 @@ fn import_claude_chunk(
             stats.filtered += 1;
             continue;
         }
-        if !post_agent_event(
-            server,
-            "/ingest/claude/stream-json",
-            path,
-            "claude",
-            index,
-            &event,
-        ) {
+        let body = match serde_json::to_string(&event) {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "claude event encode failed"
+                );
+                eprintln!(
+                    "agent-feed: failed to encode claude event from {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
+        };
+        if let Err(err) = post_json(server, "/ingest/claude/stream-json", &body) {
+            warn!(
+                path = %path.display(),
+                %server,
+                error = %err,
+                "claude event post failed"
+            );
+            eprintln!(
+                "agent-feed: failed to post claude event from {}: {err}",
+                path.display()
+            );
             continue;
         }
         debug!(
@@ -3572,6 +3062,15 @@ fn import_claude_chunk(
         stats.imported += 1;
     }
     stats
+}
+
+fn warm_claude_state(path: &Path, input: &str, state: &mut ClaudeState) {
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let _ = normalize_stream_value(value, state, Some(path));
+    }
 }
 
 fn split_complete_jsonl(buffer: &mut String) -> String {
@@ -3602,114 +3101,6 @@ struct ClaudeWatcher {
     offset: u64,
     state: ClaudeState,
     pending: String,
-}
-
-fn bounded_tail_prime_input(path: &Path) -> Result<String, CliError> {
-    let len = fs::metadata(path)?.len() as usize;
-    let max_bounded = TAIL_PRIME_HEAD_BYTES + TAIL_PRIME_TAIL_BYTES;
-    if len <= max_bounded {
-        return Ok(fs::read_to_string(path)?);
-    }
-
-    let mut file = File::open(path)?;
-    let mut head = vec![0_u8; TAIL_PRIME_HEAD_BYTES];
-    file.read_exact(&mut head)?;
-    trim_after_last_newline(&mut head);
-
-    let tail_start = len.saturating_sub(TAIL_PRIME_TAIL_BYTES);
-    file.seek(SeekFrom::Start(tail_start as u64))?;
-    let mut tail = Vec::with_capacity(TAIL_PRIME_TAIL_BYTES);
-    file.read_to_end(&mut tail)?;
-    trim_before_first_newline(&mut tail);
-
-    let mut bytes = head;
-    bytes.push(b'\n');
-    bytes.extend(tail);
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn trim_after_last_newline(bytes: &mut Vec<u8>) {
-    if let Some(index) = bytes.iter().rposition(|byte| *byte == b'\n') {
-        bytes.truncate(index + 1);
-    }
-}
-
-fn trim_before_first_newline(bytes: &mut Vec<u8>) {
-    if let Some(index) = bytes.iter().position(|byte| *byte == b'\n') {
-        bytes.drain(..=index);
-    }
-}
-
-fn initial_codex_watch_state(
-    server: &str,
-    path: &Path,
-    workspace: Option<&WorkspaceFilter>,
-    backfill: BackfillMode,
-) -> Result<(CodexWatcher, ImportStats), CliError> {
-    let mut state = TranscriptState::default();
-    let stats = match backfill {
-        BackfillMode::All => {
-            let input = fs::read_to_string(path)?;
-            import_codex_chunk(server, path, &input, &mut state, workspace)
-        }
-        BackfillMode::Recent => {
-            let input = fs::read_to_string(path)?;
-            let stats = import_recent_codex_story(server, path, &input, workspace);
-            prime_codex_state(path, &input, &mut state);
-            stats
-        }
-        BackfillMode::None => {
-            let prime_input = bounded_tail_prime_input(path)?;
-            prime_codex_state(path, &prime_input, &mut state);
-            ImportStats::default()
-        }
-    };
-    let offset = fs::metadata(path)?.len();
-    Ok((
-        CodexWatcher {
-            path: path.to_path_buf(),
-            offset,
-            state,
-            pending: String::new(),
-        },
-        stats,
-    ))
-}
-
-fn initial_claude_watch_state(
-    server: &str,
-    path: &Path,
-    workspace: Option<&WorkspaceFilter>,
-    backfill: BackfillMode,
-) -> Result<(ClaudeWatcher, ImportStats), CliError> {
-    let mut state = ClaudeState::default();
-    let stats = match backfill {
-        BackfillMode::All => {
-            let input = fs::read_to_string(path)?;
-            import_claude_chunk(server, path, &input, &mut state, workspace)
-        }
-        BackfillMode::Recent => {
-            let input = fs::read_to_string(path)?;
-            let stats = import_recent_claude_story(server, path, &input, workspace);
-            prime_claude_state(path, &input, &mut state);
-            stats
-        }
-        BackfillMode::None => {
-            let prime_input = bounded_tail_prime_input(path)?;
-            prime_claude_state(path, &prime_input, &mut state);
-            ImportStats::default()
-        }
-    };
-    let offset = fs::metadata(path)?.len();
-    Ok((
-        ClaudeWatcher {
-            path: path.to_path_buf(),
-            offset,
-            state,
-            pending: String::new(),
-        },
-        stats,
-    ))
 }
 
 fn active_codex_session_paths(
@@ -3889,155 +3280,6 @@ fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {
     }
 
     Err(CliError::Http(response))
-}
-
-fn fetch_server_events(server: &str) -> Result<Vec<AgentEvent>, CliError> {
-    let body = get_json_body(server, "/api/events")?;
-    let value = serde_json::from_str::<Value>(&body)?;
-    let Some(events) = value.get("events").and_then(Value::as_array) else {
-        return Err(CliError::Http(
-            "local server /api/events response did not contain events".to_string(),
-        ));
-    };
-    events
-        .iter()
-        .cloned()
-        .map(serde_json::from_value::<AgentEvent>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(CliError::from)
-}
-
-fn get_json_body(server: &str, path: &str) -> Result<String, CliError> {
-    let addr = server
-        .parse()
-        .map_err(|err| CliError::Http(format!("invalid server address: {err}")))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(700))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(
-        format!(
-            "GET {path} HTTP/1.1\r\nHost: {server}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
-        )
-        .as_bytes(),
-    )?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    if !(response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2")) {
-        return Err(CliError::Http(response));
-    }
-    response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .ok_or_else(|| CliError::Http("http response missing body separator".to_string()))
-}
-
-struct GithubLoginOptions<'a> {
-    edge: String,
-    callback_bind: SocketAddr,
-    timeout_secs: u64,
-    no_browser: bool,
-    print_url: bool,
-    store: Option<PathBuf>,
-    reason: &'a str,
-}
-
-fn ensure_publish_session(
-    auth_store: Option<PathBuf>,
-    edge: &str,
-) -> Result<GithubAuthSession, CliError> {
-    match load_publish_session(auth_store.clone(), edge) {
-        Ok(session) => {
-            info!(
-                github_login = %session.login,
-                github_user_id = session.github_user_id,
-                edge = %edge,
-                "github publish auth session loaded"
-            );
-            println!(
-                "github auth: signed in as @{} github:{}",
-                session.login, session.github_user_id
-            );
-            Ok(session)
-        }
-        Err(err) => {
-            warn!(
-                edge = %edge,
-                error = %err,
-                "github publish auth required for p2p serve"
-            );
-            println!("github sign-in required for p2p publishing");
-            run_github_login(GithubLoginOptions {
-                edge: edge.to_string(),
-                callback_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                timeout_secs: 120,
-                no_browser: false,
-                print_url: false,
-                store: auth_store,
-                reason: "github auth required for p2p publishing",
-            })
-        }
-    }
-}
-
-fn run_github_login(options: GithubLoginOptions<'_>) -> Result<GithubAuthSession, CliError> {
-    let listener = TcpListener::bind(options.callback_bind)?;
-    let bind = listener.local_addr()?;
-    if !bind.ip().is_loopback() {
-        return Err(CliError::Http(
-            "github auth callback must bind to loopback".to_string(),
-        ));
-    }
-    info!(
-        edge = %options.edge,
-        callback_bind = %bind,
-        timeout_secs = options.timeout_secs,
-        no_browser = options.no_browser,
-        print_url = options.print_url,
-        reason = options.reason,
-        "github cli auth starting"
-    );
-    let config = GithubCliAuthConfig {
-        edge_base_url: options.edge.clone(),
-        callback_bind: options.callback_bind,
-        ..GithubCliAuthConfig::default()
-    };
-    let start = begin_cli_login(&config, bind)?;
-    debug!(authorize_url = %start.authorize_url, callback_url = %start.callback_url, "github auth url prepared");
-    if options.print_url || options.no_browser {
-        println!("{}", start.authorize_url);
-    }
-    if !options.no_browser
-        && let Err(err) = open_url(&start.authorize_url)
-    {
-        warn!(error = %err, "failed to open browser for github auth");
-        eprintln!("agent-feed: failed to open browser: {err}");
-        eprintln!("agent-feed: open this URL manually:");
-        eprintln!("{}", start.authorize_url);
-    }
-    println!("waiting for github callback on {}", start.callback_url);
-    let (target, mut stream) =
-        wait_for_github_callback(&listener, Duration::from_secs(options.timeout_secs))?;
-    let session = match parse_cli_callback_request(&target)
-        .and_then(|callback| complete_cli_login(&start, callback, options.edge.clone()))
-    {
-        Ok(session) => {
-            write_auth_callback_response(&mut stream, true, "github sign-in complete")?;
-            session
-        }
-        Err(err) => {
-            let _ = write_auth_callback_response(&mut stream, false, "github sign-in failed");
-            return Err(CliError::Auth(err));
-        }
-    };
-    let store = GithubSessionStore::new(auth_store_path(options.store));
-    store.save(&session)?;
-    info!(
-        github_login = %session.login,
-        github_user_id = session.github_user_id,
-        expires_at = %session.expires_at,
-        "github cli auth completed"
-    );
-    Ok(session)
 }
 
 fn load_publish_session(
