@@ -1468,10 +1468,9 @@ fn remote_copy_has_public_quality_issue(copy: &str) -> bool {
         "test gate",
         "test line",
         "tests remain red",
-        "fixture",
+        "fixture feed",
         "m0 signal path",
-        "advances",
-        "advanced",
+        "p2p capsule coverage advanced",
         "verification s",
     ]
     .iter()
