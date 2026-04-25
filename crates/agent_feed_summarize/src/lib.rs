@@ -191,7 +191,7 @@ const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
     r"(?i)\bno policy or omission text\b[\s.,;:]*",
 ];
 
-pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; lowercase; terse contextual headline; strong verb/object/outcome; plain work language; no milestone labels; no production/scaffold/gate/test-line metaphors; no dashboard copy; no policy or omission text; no raw logs";
+pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; lowercase; terse contextual headline; strong verb/object/outcome; plain work language; no milestone labels; no production/scaffold/gate/test-line or red/green test metaphors; no dashboard copy; no policy or omission text; no raw logs";
 pub const DEFAULT_SUMMARY_PROMPT_MAX_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1698,7 +1698,11 @@ const PUBLIC_COPY_REPLACEMENTS: &[(&str, &str)] = &[
         "tests are still failing",
     ),
     (r"(?i)\btests?\s+red\b", "tests failing"),
+    (r"(?i)\blatest\s+red\s+runs?\b", "latest failing run"),
+    (r"(?i)\bred\s+runs?\b", "failing runs"),
+    (r"(?i)\bfailures\s+remain\b", "follow-up remains"),
     (r"(?i)\bcurrent public outcome remains\b", ""),
+    (r"(?i)\bchanged work\b", "changed"),
     (r"(?i)\bmoved forward\b", "changed"),
     (r"(?i)\badvanced across the feed\b", "changed"),
     (r"(?i)\bcoverage advanced\b", "coverage landed"),
