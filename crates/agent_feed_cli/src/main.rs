@@ -33,6 +33,8 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
+const TAIL_PRIME_HEAD_BYTES: usize = 64 * 1024;
+const TAIL_PRIME_TAIL_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-feed")]
@@ -2471,6 +2473,70 @@ mod tests {
     }
 
     #[test]
+    fn codex_tail_only_startup_uses_bounded_metadata_prime() {
+        let root = temp_test_root("codex-tail-only-bounded-prime");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let transcript = root.join("large-codex.jsonl");
+        let mut file = File::create(&transcript).expect("large transcript creates");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "bounded-session", "cwd": workspace}
+            })
+        )
+        .expect("session metadata writes");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "turn_context",
+                "timestamp": "2026-04-24T03:16:49.697Z",
+                "payload": {"cwd": workspace, "turn_id": "turn_head", "model": "gpt"}
+            })
+        )
+        .expect("head turn writes");
+        file.write_all(&vec![
+            b'x';
+            TAIL_PRIME_HEAD_BYTES + TAIL_PRIME_TAIL_BYTES + 4096
+        ])
+        .expect("large middle writes");
+        writeln!(file).expect("middle terminator writes");
+        writeln!(
+            file,
+            "{}",
+            json!({
+                "type": "turn_context",
+                "timestamp": "2026-04-24T03:17:49.697Z",
+                "payload": {"cwd": workspace, "turn_id": "turn_tail", "model": "gpt"}
+            })
+        )
+        .expect("tail turn writes");
+        drop(file);
+
+        let prime_input = bounded_tail_prime_input(&transcript).expect("bounded prime reads");
+        assert!(prime_input.len() < TAIL_PRIME_HEAD_BYTES + TAIL_PRIME_TAIL_BYTES + 4096);
+        assert!(!prime_input.contains(&"x".repeat(4096)));
+
+        let (watcher, stats) =
+            initial_codex_watch_state("127.0.0.1:9", &transcript, None, BackfillMode::None)
+                .expect("watcher initializes");
+
+        assert_eq!(stats.imported, 0);
+        assert_eq!(
+            watcher.offset,
+            fs::metadata(&transcript).expect("metadata").len()
+        );
+        assert_eq!(watcher.state.session_id.as_deref(), Some("bounded-session"));
+        assert_eq!(watcher.state.turn_id.as_deref(), Some("turn_tail"));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
     fn serve_p2p_publisher_reads_incremental_daemon_events_once() {
         let mut event = AgentEvent::new(
             agent_feed_core::SourceKind::Codex,
@@ -3538,23 +3604,63 @@ struct ClaudeWatcher {
     pending: String,
 }
 
+fn bounded_tail_prime_input(path: &Path) -> Result<String, CliError> {
+    let len = fs::metadata(path)?.len() as usize;
+    let max_bounded = TAIL_PRIME_HEAD_BYTES + TAIL_PRIME_TAIL_BYTES;
+    if len <= max_bounded {
+        return Ok(fs::read_to_string(path)?);
+    }
+
+    let mut file = File::open(path)?;
+    let mut head = vec![0_u8; TAIL_PRIME_HEAD_BYTES];
+    file.read_exact(&mut head)?;
+    trim_after_last_newline(&mut head);
+
+    let tail_start = len.saturating_sub(TAIL_PRIME_TAIL_BYTES);
+    file.seek(SeekFrom::Start(tail_start as u64))?;
+    let mut tail = Vec::with_capacity(TAIL_PRIME_TAIL_BYTES);
+    file.read_to_end(&mut tail)?;
+    trim_before_first_newline(&mut tail);
+
+    let mut bytes = head;
+    bytes.push(b'\n');
+    bytes.extend(tail);
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn trim_after_last_newline(bytes: &mut Vec<u8>) {
+    if let Some(index) = bytes.iter().rposition(|byte| *byte == b'\n') {
+        bytes.truncate(index + 1);
+    }
+}
+
+fn trim_before_first_newline(bytes: &mut Vec<u8>) {
+    if let Some(index) = bytes.iter().position(|byte| *byte == b'\n') {
+        bytes.drain(..=index);
+    }
+}
+
 fn initial_codex_watch_state(
     server: &str,
     path: &Path,
     workspace: Option<&WorkspaceFilter>,
     backfill: BackfillMode,
 ) -> Result<(CodexWatcher, ImportStats), CliError> {
-    let input = fs::read_to_string(path)?;
     let mut state = TranscriptState::default();
     let stats = match backfill {
-        BackfillMode::All => import_codex_chunk(server, path, &input, &mut state, workspace),
+        BackfillMode::All => {
+            let input = fs::read_to_string(path)?;
+            import_codex_chunk(server, path, &input, &mut state, workspace)
+        }
         BackfillMode::Recent => {
+            let input = fs::read_to_string(path)?;
             let stats = import_recent_codex_story(server, path, &input, workspace);
             prime_codex_state(path, &input, &mut state);
             stats
         }
         BackfillMode::None => {
-            prime_codex_state(path, &input, &mut state);
+            let prime_input = bounded_tail_prime_input(path)?;
+            prime_codex_state(path, &prime_input, &mut state);
             ImportStats::default()
         }
     };
@@ -3576,17 +3682,21 @@ fn initial_claude_watch_state(
     workspace: Option<&WorkspaceFilter>,
     backfill: BackfillMode,
 ) -> Result<(ClaudeWatcher, ImportStats), CliError> {
-    let input = fs::read_to_string(path)?;
     let mut state = ClaudeState::default();
     let stats = match backfill {
-        BackfillMode::All => import_claude_chunk(server, path, &input, &mut state, workspace),
+        BackfillMode::All => {
+            let input = fs::read_to_string(path)?;
+            import_claude_chunk(server, path, &input, &mut state, workspace)
+        }
         BackfillMode::Recent => {
+            let input = fs::read_to_string(path)?;
             let stats = import_recent_claude_story(server, path, &input, workspace);
             prime_claude_state(path, &input, &mut state);
             stats
         }
         BackfillMode::None => {
-            prime_claude_state(path, &input, &mut state);
+            let prime_input = bounded_tail_prime_input(path)?;
+            prime_claude_state(path, &prime_input, &mut state);
             ImportStats::default()
         }
     };
