@@ -50,7 +50,7 @@ impl Default for SummaryBudget {
             max_chips: 5,
             max_evidence_items: 8,
             max_capsule_chars: 720,
-            max_feed_rollup_stories: 32,
+            max_feed_rollup_stories: 256,
         }
     }
 }
@@ -176,8 +176,10 @@ pub struct GuardrailViolation {
 }
 
 const PROMPT_LEAKAGE_VIOLATION: &str = "prompt-leakage";
+pub const INTERNAL_SUMMARIZER_MARKER: &str = "agent-feed-internal-summarizer-v1";
 
 const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
+    r"(?i)\bagent-feed-internal-summarizer-v1\b[\s.,;:]*",
     r"(?i)\braw\s+prompts?,\s*command output,\s*diffs?,\s*paths?,\s*(?:and\s+)?repo names?\s+omitted\b[\s.,;:]*",
     r"(?i)\braw\s+(?:detail|details|diff|diffs|prompt|prompts|output|logs?|tool output|command output)\s+(?:is\s+|are\s+)?omitted\b[\s.,;:]*",
     r"(?i)\buse only the redacted story facts\b[\s.,;:]*",
@@ -1052,19 +1054,63 @@ fn summarize_feed_inner(
         .cloned()
         .collect::<VecDeque<_>>();
     for batch in batches {
-        let mut request = SummaryRequest::new(feed_id, config.mode, batch);
+        let mut request = SummaryRequest::new(feed_id, config.mode, batch.clone());
         request.recent_summaries = recent.iter().cloned().collect();
-        let mut summary = summarize_request_inner(&request, config, processor, image_processor)?;
-        if !apply_publish_decision(&mut summary, &request, &config.publish) {
-            continue;
+        match summarize_request_inner(&request, config, processor, image_processor) {
+            Ok(summary) => {
+                push_publishable_summary(
+                    summary,
+                    &request,
+                    &config.publish,
+                    &mut recent,
+                    &mut summaries,
+                );
+            }
+            Err(SummaryError::GuardrailRejected(_)) if batch.len() > 1 => {
+                for story in batch {
+                    let mut single_request =
+                        SummaryRequest::new(feed_id, FeedSummaryMode::PerStory, vec![story]);
+                    single_request.recent_summaries = recent.iter().cloned().collect();
+                    match summarize_request_inner(
+                        &single_request,
+                        config,
+                        processor,
+                        image_processor,
+                    ) {
+                        Ok(summary) => push_publishable_summary(
+                            summary,
+                            &single_request,
+                            &config.publish,
+                            &mut recent,
+                            &mut summaries,
+                        ),
+                        Err(SummaryError::GuardrailRejected(_)) => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+            Err(SummaryError::GuardrailRejected(_)) => {}
+            Err(err) => return Err(err),
         }
-        recent.push_front(RecentSummary::from(&summary));
-        while recent.len() > config.publish.recent_window.max(1) {
-            recent.pop_back();
-        }
-        summaries.push(summary);
     }
     Ok(summaries)
+}
+
+fn push_publishable_summary(
+    mut summary: FeedSummary,
+    request: &SummaryRequest,
+    policy: &PublishDecisionConfig,
+    recent: &mut VecDeque<RecentSummary>,
+    summaries: &mut Vec<FeedSummary>,
+) {
+    if !apply_publish_decision(&mut summary, request, policy) {
+        return;
+    }
+    recent.push_front(RecentSummary::from(&summary));
+    while recent.len() > policy.recent_window.max(1) {
+        recent.pop_back();
+    }
+    summaries.push(summary);
 }
 
 pub fn summarize_request(
@@ -1739,13 +1785,6 @@ fn apply_publish_decision(
         return false;
     }
 
-    if summary.score >= policy.severe_score_bypass {
-        summary.metadata.publish_action = PublishAction::Publish;
-        summary.metadata.publish_reason =
-            "high-severity summary bypassed duplicate suppression".to_string();
-        return true;
-    }
-
     let duplicate = nearest.is_some()
         && nearest_headline >= policy.max_headline_similarity
         && (nearest_headline == 100
@@ -1756,6 +1795,13 @@ fn apply_publish_decision(
             "headline did not meaningfully change from a recent published summary (headline similarity {nearest_headline}, deck similarity {nearest_deck})"
         );
         return false;
+    }
+
+    if summary.score >= policy.severe_score_bypass {
+        summary.metadata.publish_action = PublishAction::Publish;
+        summary.metadata.publish_reason =
+            "high-severity summary bypassed duplicate suppression".to_string();
+        return true;
     }
 
     summary.metadata.publish_action = PublishAction::Publish;
@@ -1924,7 +1970,7 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         format!("recent_published:\n{recent}")
     };
     let prompt = format!(
-        "Return one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries. Write with this style: {style}. Favor a projection-safe headline with clear actor, action, object, and outcome. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries. Write with this style: {style}. Favor a projection-safe headline with clear actor, action, object, and outcome. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
         request.feed_id, request.mode, recent, stories
     );
     clamp_chars(&prompt, max_prompt_chars)
@@ -1932,7 +1978,7 @@ fn processor_prompt(request: &SummaryRequest) -> String {
 
 fn image_processor_prompt(request: &ImageRequest) -> String {
     let base = format!(
-        "Return one JSON object. Either return {{\"image\": null, \"reason\": \"...\"}} when no useful projection-safe image exists, or return {{\"image\": {{\"uri\": \"...\", \"alt\": \"...\", \"source\": \"generated\"}}}}. Generate or reference only display-safe imagery. Do not include raw prompts, readable code, command output, diffs, secrets, tokens, credentials, exact paths, repo names, emails, or personal data. Use this visual style: {}.\nheadline={}\ndeck={}\nlower_third={}\nchips={}\nfamily={:?}\nscore={}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object. Either return {{\"image\": null, \"reason\": \"...\"}} when no useful projection-safe image exists, or return {{\"image\": {{\"uri\": \"...\", \"alt\": \"...\", \"source\": \"generated\"}}}}. Generate or reference only display-safe imagery. Do not include raw prompts, readable code, command output, diffs, secrets, tokens, credentials, exact paths, repo names, emails, or personal data. Use this visual style: {}.\nheadline={}\ndeck={}\nlower_third={}\nchips={}\nfamily={:?}\nscore={}",
         request.policy.prompt_style,
         request.headline,
         request.deck,
@@ -1975,6 +2021,13 @@ fn parse_processor_output_with_meta(output: &str) -> Result<ParsedProcessorOutpu
             codex_session_id = value
                 .get("payload")
                 .and_then(|payload| payload.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .or(codex_session_id);
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("thread.started") {
+            codex_session_id = value
+                .get("thread_id")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
                 .or(codex_session_id);
@@ -2023,6 +2076,16 @@ fn parse_processor_output_with_meta(output: &str) -> Result<ParsedProcessorOutpu
 }
 
 fn codex_message_text(value: &serde_json::Value) -> Option<String> {
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("item.completed") {
+        let item = value.get("item")?;
+        if item.get("type").and_then(serde_json::Value::as_str) == Some("agent_message") {
+            return item
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+    }
+
     let payload = value.get("payload")?;
     if value.get("type").and_then(serde_json::Value::as_str) == Some("event_msg")
         && payload.get("type").and_then(serde_json::Value::as_str) == Some("task_complete")
@@ -2207,10 +2270,24 @@ fn clamp_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
     }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
     let mut output = input
         .chars()
         .take(max_chars.saturating_sub(3))
         .collect::<String>();
+    if let Some((index, _)) = output
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        && index >= max_chars.saturating_sub(3) / 2
+    {
+        output.truncate(index);
+    }
+    output = output
+        .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ':' | '-'))
+        .to_string();
     output.push_str("...");
     output
 }
@@ -2240,6 +2317,20 @@ mod tests {
         story.headline = "codex verified tests".to_string();
         story.deck = "tests passed after the update.".to_string();
         story
+    }
+
+    #[test]
+    fn clamp_chars_uses_word_boundary_for_public_copy() {
+        let clamped = clamp_chars(
+            "tests still report failures despite one passing verification suite",
+            64,
+        );
+
+        assert_eq!(
+            clamped,
+            "tests still report failures despite one passing verification..."
+        );
+        assert!(!clamped.contains("verification s"));
     }
 
     #[test]
@@ -2368,6 +2459,31 @@ mod tests {
     }
 
     #[test]
+    fn exact_duplicate_high_severity_summary_is_still_suppressed() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let existing = RecentSummary {
+            headline: "codex found failing tests".to_string(),
+            deck: "tests are red. test command failed.".to_string(),
+            story_family: StoryFamily::Test,
+            score: 90,
+        };
+        let mut failed = verified_story(90);
+        failed.headline = existing.headline.clone();
+        failed.deck = existing.deck.clone();
+
+        let summaries = summarize_feed_with_recent(
+            "local:workstation",
+            &[failed],
+            &config,
+            std::slice::from_ref(&existing),
+        )
+        .expect("summary compiles");
+
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
     fn guardrails_mask_pii_and_reject_credentials() {
         let guardrails = SummaryGuardrails::strict_p2p();
         let (cleaned, violations) = guardrails
@@ -2378,6 +2494,83 @@ mod tests {
 
         let rejected = guardrails.clean_text("token sk-live_secret");
         assert!(matches!(rejected, Err(SummaryError::GuardrailRejected(_))));
+    }
+
+    #[test]
+    fn guardrail_rejected_story_does_not_block_feed_publish() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+
+        let good = verified_story(90);
+        let mut bad = story("codex found sk-liveSecret", 90);
+        bad.headline = "codex found sk-liveSecret".to_string();
+        bad.deck = "token sk-liveSecret appeared in output.".to_string();
+        let summaries =
+            summarize_feed("local:workstation", &[bad, good], &config).expect("summarizes");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].headline, "codex verified tests");
+        let display = serde_json::to_string(&summaries).expect("summaries serialize");
+        assert!(!display.contains("sk-liveSecret"));
+    }
+
+    #[test]
+    fn rejected_rollup_falls_back_to_safe_story_summaries() {
+        struct RejectingRollupProcessor;
+        impl SummaryProcessor for RejectingRollupProcessor {
+            fn name(&self) -> &str {
+                "rejecting-rollup"
+            }
+
+            fn summarize(
+                &self,
+                request: &SummaryRequest,
+            ) -> Result<ProcessorSummary, SummaryError> {
+                if request.stories.len() > 1 {
+                    return Ok(ProcessorSummary {
+                        headline: "codex found sk-liveSecret".to_string(),
+                        deck: "token sk-liveSecret appeared in output.".to_string(),
+                        lower_third: Some("processor · redacted".to_string()),
+                        chips: vec!["processor".to_string()],
+                        publish: None,
+                        publish_reason: None,
+                        memory_digest: None,
+                        semantic_fingerprint: None,
+                    });
+                }
+                let story = &request.stories[0];
+                Ok(ProcessorSummary {
+                    headline: story.headline.clone(),
+                    deck: story.deck.clone(),
+                    lower_third: Some("processor · redacted".to_string()),
+                    chips: story.chips.clone(),
+                    publish: None,
+                    publish_reason: None,
+                    memory_digest: None,
+                    semantic_fingerprint: None,
+                })
+            }
+        }
+
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::FeedRollup;
+
+        let good = verified_story(90);
+        let mut bad = story("codex found sk-liveSecret", 90);
+        bad.headline = "codex found sk-liveSecret".to_string();
+        bad.deck = "token sk-liveSecret appeared in output.".to_string();
+        let summaries = summarize_feed_with_processor(
+            "local:workstation",
+            &[bad, good],
+            &config,
+            &RejectingRollupProcessor,
+        )
+        .expect("summarizes");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].headline, "codex verified tests");
+        let display = serde_json::to_string(&summaries).expect("summaries serialize");
+        assert!(!display.contains("sk-liveSecret"));
     }
 
     #[test]
@@ -2414,6 +2607,26 @@ mod tests {
         assert_eq!(
             parsed.summary.semantic_fingerprint.as_deref(),
             Some("publish:gating")
+        );
+    }
+
+    #[test]
+    fn codex_exec_json_processor_output_extracts_item_completed_summary() {
+        let output = r#"{"type":"thread.started","thread_id":"019dc642-bc8e-7091-9f3a-348b14357257"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"headline\":\"codex summarized active feed work\",\"deck\":\"capture fixes now produce settled stories from real transcripts.\",\"chips\":[\"codex\",\"capture\"],\"memory_digest\":\"capture summaries are flowing\",\"semantic_fingerprint\":\"capture:stories\"}"}}
+{"type":"turn.completed"}"#;
+
+        let parsed = parse_processor_output_with_meta(output).expect("codex exec json parses");
+
+        assert_eq!(
+            parsed.codex_session_id.as_deref(),
+            Some("019dc642-bc8e-7091-9f3a-348b14357257")
+        );
+        assert_eq!(parsed.summary.headline, "codex summarized active feed work");
+        assert_eq!(
+            parsed.summary.semantic_fingerprint.as_deref(),
+            Some("capture:stories")
         );
     }
 

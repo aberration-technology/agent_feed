@@ -19,8 +19,9 @@ use agent_feed_server::{ServerConfig, serve_with_ready};
 use agent_feed_story::{CompiledStory, StoryCompiler, compile_events};
 use agent_feed_summarize::{
     DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
-    GuardrailPattern, ImageDecisionMode, ImageProcessorConfig, RecentSummary, SummaryConfig,
-    SummaryError, SummaryProcessorConfig, summarize_feed, summarize_feed_with_recent,
+    GuardrailPattern, INTERNAL_SUMMARIZER_MARKER, ImageDecisionMode, ImageProcessorConfig,
+    RecentSummary, SummaryConfig, SummaryError, SummaryProcessorConfig, summarize_feed,
+    summarize_feed_with_recent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
@@ -2011,6 +2012,7 @@ fn print_import_complete(label: &str, stats: ImportStats) {
 mod tests {
     use super::*;
     use agent_feed_story::StoryFamily;
+    use agent_feed_summarize::{PublishAction, SummaryMetadata};
 
     fn temp_test_root(name: &str) -> PathBuf {
         let root =
@@ -2110,6 +2112,60 @@ mod tests {
             panic!("expected p2p publish command");
         };
         assert_eq!(network_id, "agent-feed-lab");
+    }
+
+    #[test]
+    fn signed_publish_capsules_use_github_feed_id_when_authenticated() {
+        let publisher = PublisherIdentity::github(
+            35904762,
+            "mosure".to_string(),
+            Some("mitchell mosure".to_string()),
+            Some("https://api.feed.aberration.technology/avatar/github/35904762".to_string()),
+        );
+        let summary = FeedSummary {
+            story_window: "feed-rollup".to_string(),
+            source_agent_kinds: vec!["codex".to_string()],
+            headline: "codex advanced the feed publisher".to_string(),
+            deck: "capture and summarization produced a p2p-safe story.".to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["codex".to_string(), "publish".to_string()],
+            image: None,
+            story_family: StoryFamily::IdleRecap,
+            severity: agent_feed_core::Severity::Notice,
+            score: 88,
+            privacy_class: agent_feed_core::PrivacyClass::Redacted,
+            evidence_event_ids: Vec::new(),
+            metadata: SummaryMetadata {
+                processor: "test".to_string(),
+                policy: "p2p-strict".to_string(),
+                image_processor: "disabled".to_string(),
+                publish_action: PublishAction::Publish,
+                publish_reason: "test accepted".to_string(),
+                headline_fingerprint: "codex:feed:publisher".to_string(),
+                max_headline_similarity: 0,
+                max_deck_similarity: 0,
+                guardrail_version: 1,
+                input_stories: 1,
+                output_chars: 64,
+                external_cost_allowed: false,
+                image_enabled: false,
+                violations: Vec::new(),
+            },
+        };
+
+        let capsules =
+            signed_capsules_from_summaries("workstation", &[summary], Some(&publisher), None, 1)
+                .expect("capsule signs");
+
+        assert_eq!(capsules[0].value.feed_id, "github:35904762:workstation");
+        assert_eq!(
+            capsules[0]
+                .value
+                .publisher
+                .as_ref()
+                .and_then(|publisher| publisher.github_login.as_deref()),
+            Some("mosure")
+        );
     }
 
     #[test]
@@ -2964,7 +3020,7 @@ mod tests {
                     "timestamp": "2026-04-24T03:16:50.000Z",
                     "payload": {
                         "type": "user_message",
-                        "message": "You are the private local headline memory for one agent feed. summary_memory_key=feed:test"
+                        "message": INTERNAL_SUMMARIZER_MARKER
                     }
                 }),
             ],
@@ -3005,7 +3061,7 @@ mod tests {
             [json!({
                 "type": "user",
                 "message": {
-                    "content": "Return one JSON object with headline, deck, lower_third, chips. Use only the redacted story facts below."
+                    "content": INTERNAL_SUMMARIZER_MARKER
                 }
             })],
         );
@@ -3028,6 +3084,40 @@ mod tests {
                 .events
                 .is_empty()
         );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn summary_prompt_discussion_does_not_mark_real_session_internal() {
+        let root = temp_test_root("active-codex-summary-discussion");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let real = sessions.join("real-summary-discussion.jsonl");
+        write_jsonl(
+            &real,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "real-summary-discussion", "cwd": root}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:16:50.000Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": "Please review this prompt: Return one JSON object with headline, deck, lower_third, chips. Use only the redacted story facts below."
+                    }
+                }),
+            ],
+        );
+
+        let paths =
+            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 1, None)
+                .expect("active sessions resolve");
+
+        assert_eq!(paths, vec![real]);
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
@@ -3429,7 +3519,7 @@ fn signed_capsules(
     publisher: Option<&PublisherIdentity>,
     signing_secret: Option<&str>,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
-    let feed_id = format!("local:{feed}");
+    let feed_id = publish_feed_id_for_publisher(feed, publisher);
     let summaries = summarize_feed(&feed_id, stories, summary_config)?;
     info!(
         %feed_id,
@@ -3447,7 +3537,7 @@ fn signed_capsules_from_summaries(
     signing_secret: Option<&str>,
     start_seq: u64,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
-    let feed_id = format!("local:{feed}");
+    let feed_id = publish_feed_id_for_publisher(feed, publisher);
     signed_capsules_from_summaries_with_feed_id(
         &feed_id,
         summaries,
@@ -3488,6 +3578,13 @@ fn signed_capsules_from_summaries_with_feed_id(
             }
         })
         .collect()
+}
+
+fn publish_feed_id_for_publisher(feed: &str, publisher: Option<&PublisherIdentity>) -> String {
+    match publisher.and_then(|publisher| publisher.github_user_id) {
+        Some(github_user_id) => format!("github:{github_user_id}:{feed}"),
+        None => local_feed_id(feed),
+    }
 }
 
 struct SummaryCliOptions<'a> {
@@ -4385,14 +4482,7 @@ fn active_claude_session_paths(
 
 const AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES: usize = 256 * 1024;
 
-const AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS: &[&str] = &[
-    "private local headline memory for one agent feed",
-    "summary_memory_key=",
-    "Return one JSON object with headline, deck, lower_third, chips",
-    "Use only the redacted story facts below",
-    "Return one JSON object. Either return",
-    "headline image exists",
-];
+const AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS: &[&str] = &[INTERNAL_SUMMARIZER_MARKER];
 
 fn is_agent_feed_internal_transcript_path(path: &Path) -> Result<bool, CliError> {
     let sample = transcript_sample(path, AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES)?;
@@ -4423,9 +4513,50 @@ fn transcript_sample(path: &Path, max_bytes: usize) -> Result<String, CliError> 
 }
 
 fn is_agent_feed_internal_transcript(input: &str) -> bool {
-    AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS
-        .iter()
-        .any(|marker| input.contains(marker))
+    input.lines().any(|line| {
+        if !AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS
+            .iter()
+            .any(|marker| line.contains(marker))
+        {
+            return false;
+        }
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| transcript_user_payload_contains_internal_marker(&value))
+    })
+}
+
+fn transcript_user_payload_contains_internal_marker(value: &Value) -> bool {
+    let top_type = value.get("type").and_then(Value::as_str);
+    if top_type == Some("user")
+        && value
+            .get("message")
+            .is_some_and(value_contains_internal_marker)
+    {
+        return true;
+    }
+    let Some(payload) = value.get("payload") else {
+        return false;
+    };
+    if payload.get("type").and_then(Value::as_str) == Some("user_message")
+        && payload
+            .get("message")
+            .is_some_and(value_contains_internal_marker)
+    {
+        return true;
+    }
+    false
+}
+
+fn value_contains_internal_marker(value: &Value) -> bool {
+    match value {
+        Value::String(value) => AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS
+            .iter()
+            .any(|marker| value.contains(marker)),
+        Value::Array(values) => values.iter().any(value_contains_internal_marker),
+        Value::Object(map) => map.values().any(value_contains_internal_marker),
+        _ => false,
+    }
 }
 
 fn session_matches_workspace(

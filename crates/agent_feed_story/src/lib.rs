@@ -524,7 +524,26 @@ fn headline(window: &StoryWindow) -> String {
             }
         }
         StoryFamily::FileChange => format!("{agent} changed {object}"),
-        StoryFamily::Incident => format!("{agent} hit {}", object),
+        StoryFamily::Incident => {
+            if window
+                .signals
+                .latest_kind
+                .is_some_and(|kind| kind == EventKind::TurnFail)
+            {
+                if window
+                    .signals
+                    .latest_summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.to_ascii_lowercase().contains("interrupt"))
+                {
+                    format!("{agent} was interrupted")
+                } else {
+                    format!("{agent} turn failed")
+                }
+            } else {
+                format!("{agent} hit {}", object)
+            }
+        }
         StoryFamily::Mcp => format!("{agent} saw mcp degradation"),
         StoryFamily::Plan => format!("{agent} updated the plan"),
         StoryFamily::Command => format!("{agent} completed {object}"),
@@ -727,6 +746,21 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
     if turn_only_tool_failure {
         return true;
     }
+    let generic_turn_without_signal = window.key.family == StoryFamily::Turn
+        && window.counters.tool_failures == 0
+        && window.counters.files_changed == 0
+        && window.counters.tests_failed == 0
+        && window.counters.tests_passed == 0
+        && window.counters.permissions == 0
+        && window.counters.mcp_failures == 0
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_none_or(summary_is_redundant);
+    if generic_turn_without_signal {
+        return true;
+    }
     combined.contains("activity settled") || combined.contains("hit [project] command")
 }
 
@@ -803,7 +837,10 @@ fn safe_sentence(input: &str) -> String {
 fn summary_is_redundant(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
     let trimmed = lowered.trim_start();
-    if trimmed.starts_with("status ") || trimmed.starts_with("exit ") {
+    if trimmed.starts_with("status ")
+        || trimmed.starts_with("exit ")
+        || trimmed.starts_with("turn completed in ")
+    {
         return true;
     }
     [
@@ -947,6 +984,31 @@ mod tests {
         );
         assert!(stories[0].deck.contains("1 tool failures"));
         assert!(!stories[0].headline.contains("shell command failed"));
+    }
+
+    #[test]
+    fn duration_only_turn_completion_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("turn completed in 304s.".to_string());
+        complete.score_hint = Some(82);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn interrupted_turn_has_specific_headline() {
+        let mut compiler = StoryCompiler::default();
+        let mut failed = event(EventKind::TurnFail, "codex turn failed");
+        failed.summary = Some("interrupted by operator.".to_string());
+        failed.score_hint = Some(92);
+        failed.severity = Severity::Warning;
+        let stories = compiler.ingest(failed);
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].headline, "codex was interrupted");
+        assert!(!stories[0].headline.contains("hit agent_feed"));
     }
 
     #[test]

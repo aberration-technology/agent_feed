@@ -1443,6 +1443,9 @@ mod tests {
             "release triage finished",
         );
         event.agent = "codex".to_string();
+        event.project = Some("agent_feed".to_string());
+        event.summary =
+            Some("release triage finished with risk notes ready for review".to_string());
         event.score_hint = Some(84);
         let story = compile_events([event]).remove(0);
         let capsule = StoryCapsule::from_story(feed_id, 1, "github:123", &story)
