@@ -682,8 +682,6 @@ impl SummaryProcessor for CodexSessionMemoryProcessor {
             args.push("--json".to_string());
             args.push("--sandbox".to_string());
             args.push("read-only".to_string());
-            args.push("--ask-for-approval".to_string());
-            args.push("never".to_string());
             args.push("--skip-git-repo-check".to_string());
             args.push("-".to_string());
         }
