@@ -213,6 +213,17 @@ mod tests {
     }
 
     #[test]
+    fn browser_network_source_count_uses_feed_identity_not_chips() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("source_key:"));
+        assert!(html.contains("function bulletinSourceKey"));
+        assert!(html.contains("bulletin.feed_id || bulletin.feedId"));
+        assert!(html.contains("bulletin.lower_third || bulletin.lowerThird"));
+        assert!(!html.contains("const firstChip = bulletin.chips?.[0];\n    const label"));
+    }
+
+    #[test]
     fn browser_console_logs_feed_lifecycle_events() {
         let html = render_index_with_config(Some("remote"), &config(true));
 

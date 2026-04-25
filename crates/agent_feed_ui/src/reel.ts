@@ -1644,6 +1644,10 @@ function remoteHeadlineToBulletin(route, item, index) {
     mode: item.mode || "dispatch",
     priority: item.priority || item.score || 75,
     dwell_ms: item.dwell_ms || item.dwellMs || 14000,
+    source_key:
+      item.feed_id ||
+      `${publisherLogin || route.login || "network"}/${item.feed_label || item.label || route.feed || "*"}`,
+    feed_label: item.feed_label || item.label || route.feed || "",
     eyebrow: `feed / ${route.network} / ${route.feedMode === "following" ? "following" : "discover"}`,
     headline: headlineText,
     deck: item.deck || item.summary || "settled story capsule published to the network.",
@@ -2279,10 +2283,9 @@ function updateClock() {
 function updateSourceCount() {
   const sources = new Set();
   for (const bulletin of bulletins) {
-    const firstChip = bulletin.chips?.[0];
-    const label = typeof firstChip === "string" ? firstChip : firstChip?.label;
-    if (label) {
-      sources.add(label);
+    const source = bulletinSourceKey(bulletin);
+    if (source) {
+      sources.add(source);
     }
   }
   if (sources.size > 0) {
@@ -2290,6 +2293,24 @@ function updateSourceCount() {
   } else {
     setText(sourceCount, "0 stories");
   }
+}
+
+function bulletinSourceKey(bulletin) {
+  if (bulletin.source_key || bulletin.sourceKey) {
+    return String(bulletin.source_key || bulletin.sourceKey);
+  }
+  if (bulletin.feed_id || bulletin.feedId) {
+    return String(bulletin.feed_id || bulletin.feedId);
+  }
+  const publisherLogin = bulletin.publisher?.github_login || bulletin.publisher?.login || "";
+  if (publisherLogin || bulletin.feed_label) {
+    return `${publisherLogin || "feed"}/${bulletin.feed_label || "*"}`;
+  }
+  if (bulletin.lower_third || bulletin.lowerThird) {
+    return String(bulletin.lower_third || bulletin.lowerThird);
+  }
+  const firstChip = bulletin.chips?.[0];
+  return typeof firstChip === "string" ? firstChip : firstChip?.label || "";
 }
 
 updateClock();
