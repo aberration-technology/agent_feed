@@ -124,6 +124,21 @@ mod tests {
     }
 
     #[test]
+    fn discovery_publishers_link_to_user_discovery_feed() {
+        let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
+
+        assert!(html.contains("function userDiscoveryUrl"));
+        assert!(html.contains("return `/${encodeURIComponent(login)}/*"));
+        assert!(html.contains("publisher.dataset.href = profileUrl;"));
+        assert!(html.contains("open @${login} discovery feed"));
+        assert!(html.contains("timelinePublisher(item, { profile: {} }, route)"));
+        assert!(
+            html.contains("const node = document.createElement(profileUrl ? \"a\" : \"div\");")
+        );
+        assert!(html.contains(".publisher[data-href]"));
+    }
+
+    #[test]
     fn browser_console_logs_feed_lifecycle_events() {
         let html = render_index_with_config(Some("remote"), &UiConfig { p2p_enabled: true });
 

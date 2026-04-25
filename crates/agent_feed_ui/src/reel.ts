@@ -31,6 +31,25 @@ const FEED_MIN_MODEL_VERSION = 1;
 const githubAuthCallback = parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
 
+if (publisher) {
+  publisher.addEventListener("click", (event) => {
+    const href = publisher.dataset.href;
+    if (!href) {
+      return;
+    }
+    event.preventDefault();
+    logInfo("feed.publisher.navigate", { href });
+    window.location.assign(href);
+  });
+  publisher.addEventListener("keydown", (event) => {
+    if (!publisher.dataset.href || !["Enter", " "].includes(event.key)) {
+      return;
+    }
+    event.preventDefault();
+    publisher.click();
+  });
+}
+
 function logEvent(level, event, detail = {}) {
   const payload = {
     event,
@@ -177,6 +196,10 @@ function renderPublisher(nextPublisher) {
   }
   if (!nextPublisher) {
     publisher.hidden = true;
+    publisher.removeAttribute("data-href");
+    publisher.removeAttribute("role");
+    publisher.removeAttribute("tabindex");
+    publisher.removeAttribute("aria-label");
     publisherAvatar.removeAttribute("src");
     setText(publisherLabel, "");
     return;
@@ -191,6 +214,18 @@ function renderPublisher(nextPublisher) {
     publisherAvatar.src = avatar;
   } else {
     publisherAvatar.removeAttribute("src");
+  }
+  const profileUrl = nextPublisher.profile_url || userDiscoveryUrl(login, remoteRoute);
+  if (profileUrl) {
+    publisher.dataset.href = profileUrl;
+    publisher.setAttribute("role", "link");
+    publisher.setAttribute("tabindex", "0");
+    publisher.setAttribute("aria-label", `open @${login} discovery feed`);
+  } else {
+    publisher.removeAttribute("data-href");
+    publisher.removeAttribute("role");
+    publisher.removeAttribute("tabindex");
+    publisher.removeAttribute("aria-label");
   }
   publisher.hidden = false;
 }
@@ -1435,9 +1470,10 @@ function renderGlobalTimeline(route, snapshot) {
       const card = document.createElement("article");
       card.className = "timeline-card";
       card.tabIndex = 0;
+      card.appendChild(timelinePublisher(item, { profile: {} }, route));
       const meta = document.createElement("div");
       meta.className = "timeline-meta";
-      meta.textContent = item.lower_third || item.publisher_label || "network headline";
+      meta.textContent = item.feed_label || item.label || "network headline";
       const title = document.createElement("h2");
       title.textContent = item.headline || item.title || "settled story";
       const copy = document.createElement("p");
@@ -1450,7 +1486,7 @@ function renderGlobalTimeline(route, snapshot) {
       const card = document.createElement("article");
       card.className = "timeline-card";
       card.tabIndex = 0;
-      card.appendChild(timelinePublisher(feed, { profile: {} }));
+      card.appendChild(timelinePublisher(feed, { profile: {} }, route));
       const meta = document.createElement("div");
       meta.className = "timeline-meta";
       meta.textContent = feed.label || feed.feed_label || "feed";
@@ -1493,6 +1529,25 @@ function rootModeLink(route, mode, label, current = false) {
     link.setAttribute("aria-current", "page");
   }
   return link;
+}
+
+function userDiscoveryUrl(login, route = undefined) {
+  if (!login || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(login)) {
+    return "";
+  }
+  const params = new URLSearchParams();
+  params.set("feed_mode", "discovery");
+  if (route?.network && route.network !== "mainnet") {
+    params.set("network", route.network);
+  }
+  if (
+    route?.interactive ||
+    new URLSearchParams(window.location.search).get("view") === "timeline"
+  ) {
+    params.set("view", "timeline");
+  }
+  const query = params.toString();
+  return `/${encodeURIComponent(login)}/*${query ? `?${query}` : ""}`;
 }
 
 function renderTimeline(route, ticket) {
@@ -1564,7 +1619,7 @@ function renderTimeline(route, ticket) {
     const card = document.createElement("article");
     card.className = "timeline-card";
     card.tabIndex = 0;
-    card.appendChild(timelinePublisher(feed, ticket));
+    card.appendChild(timelinePublisher(feed, ticket, route));
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
     meta.textContent = feedLabel;
@@ -1681,9 +1736,15 @@ function feedLink(login, label, text, current = false) {
   return link;
 }
 
-function timelinePublisher(feed, ticket) {
-  const node = document.createElement("div");
+function timelinePublisher(feed, ticket, route = undefined) {
+  const login = publisherLoginForProfile(feed, ticket);
+  const profileUrl = userDiscoveryUrl(login, route);
+  const node = document.createElement(profileUrl ? "a" : "div");
   node.className = "publisher";
+  if (profileUrl) {
+    node.href = profileUrl;
+    node.setAttribute("aria-label", `open @${login} discovery feed`);
+  }
   const img = document.createElement("img");
   img.alt = "";
   img.loading = "lazy";
@@ -1700,7 +1761,7 @@ function timelinePublisher(feed, ticket) {
     img.src = avatar;
   }
   const label = document.createElement("span");
-  label.textContent = publisherText(feed, ticket);
+  label.textContent = login ? `@${login}` : "verified";
   node.append(img, label);
   return node;
 }
@@ -1744,13 +1805,17 @@ function relativeTime(value) {
   return `${Math.round(hours / 24)}d ago`;
 }
 
-function publisherText(feed, ticket) {
-  const login =
+function publisherLoginForProfile(feed, ticket) {
+  return (
     feed.publisher_login ||
+    feed.github_login ||
+    feed.publisher?.github_login ||
     feed.owner?.current_login ||
     ticket.profile?.login ||
-    "verified";
-  return `@${login}`;
+    ""
+  )
+    .replace(/^@/, "")
+    .split(/\s|\//)[0];
 }
 
 function updateSourceCountFromFeeds(feeds) {

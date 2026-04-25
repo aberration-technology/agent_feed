@@ -210,6 +210,21 @@ body.controls-visible .mode-switcher,
   color: var(--fg);
 }
 
+.publisher:is(a),
+.publisher[data-href] {
+  color: var(--fg);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.publisher:is(a):hover span,
+.publisher:is(a):focus-visible span,
+.publisher[data-href]:hover span,
+.publisher[data-href]:focus-visible span {
+  color: var(--secondary);
+  text-decoration: underline;
+}
+
 .publisher:has(img:not([src])) img {
   display: none;
 }
