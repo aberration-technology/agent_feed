@@ -143,6 +143,9 @@ pub mod codex {
                 )
                 .optional_summary(state.model.as_deref().map(|model| format!("model {model}"))),
             )),
+            ("event_msg", "task_complete") => task_complete_event(state, timestamp, payload),
+            ("event_msg", "turn_aborted") => task_failed_event(state, timestamp, payload),
+            ("event_msg", "item_completed") => item_completed_event(state, timestamp, payload),
             ("event_msg", "exec_command_end") => command_end_event(state, timestamp, payload),
             ("event_msg", "patch_apply_end") => patch_event(state, timestamp, payload),
             ("event_msg", "agent_message") => Some(build_event(
@@ -161,6 +164,81 @@ pub mod codex {
             }
             _ => None,
         }
+    }
+
+    fn task_complete_event(
+        state: &TranscriptState,
+        timestamp: Option<&str>,
+        payload: &Value,
+    ) -> Option<AgentEvent> {
+        let summary = payload
+            .get("last_agent_message")
+            .and_then(Value::as_str)
+            .and_then(display_safe_agent_sentence)
+            .or_else(|| {
+                payload
+                    .get("duration_ms")
+                    .and_then(Value::as_u64)
+                    .map(|duration| format!("turn completed in {}s.", duration / 1000))
+            })
+            .unwrap_or_else(|| "turn completed.".to_string());
+        Some(build_event(
+            state,
+            timestamp,
+            TranscriptEvent::new(
+                EventKind::TurnComplete,
+                "codex turn completed",
+                82,
+                Severity::Notice,
+            )
+            .summary(summary),
+        ))
+    }
+
+    fn task_failed_event(
+        state: &TranscriptState,
+        timestamp: Option<&str>,
+        payload: &Value,
+    ) -> Option<AgentEvent> {
+        let summary = payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .and_then(display_safe_agent_sentence)
+            .unwrap_or_else(|| "turn stopped before completion.".to_string());
+        Some(build_event(
+            state,
+            timestamp,
+            TranscriptEvent::new(
+                EventKind::TurnFail,
+                "codex turn failed",
+                92,
+                Severity::Warning,
+            )
+            .summary(summary),
+        ))
+    }
+
+    fn item_completed_event(
+        state: &TranscriptState,
+        timestamp: Option<&str>,
+        payload: &Value,
+    ) -> Option<AgentEvent> {
+        let item = payload.get("item")?;
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if item_type != "Plan" {
+            return None;
+        }
+        Some(build_event(
+            state,
+            timestamp,
+            TranscriptEvent::new(
+                EventKind::PlanUpdate,
+                "codex updated the plan",
+                74,
+                Severity::Notice,
+            )
+            .summary("plan update recorded without raw plan text."),
+        ))
     }
 
     fn command_end_event(
@@ -417,6 +495,61 @@ pub mod codex {
             return command_from_arguments(Some(&parsed));
         }
         None
+    }
+
+    fn display_safe_agent_sentence(value: &str) -> Option<String> {
+        let sentence = value
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                !line.is_empty()
+                    && !line.starts_with("```")
+                    && !line.starts_with('#')
+                    && !line.starts_with("- ")
+                    && !line.starts_with("* ")
+            })?
+            .trim_matches(['`', '"', '\''])
+            .trim();
+        if sentence.is_empty() {
+            return None;
+        }
+        let lowered = sentence.to_ascii_lowercase();
+        if [
+            "secret",
+            "token",
+            "password",
+            "api key",
+            "stdout",
+            "stderr",
+            "diff --git",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+        {
+            return None;
+        }
+        Some(clamp_words(sentence, 24))
+    }
+
+    fn clamp_words(input: &str, max_words: usize) -> String {
+        let mut words = input.split_whitespace();
+        let mut output = Vec::new();
+        for _ in 0..max_words {
+            if let Some(word) = words.next() {
+                output.push(word);
+            }
+        }
+        if output.is_empty() {
+            return String::new();
+        }
+        let mut value = output.join(" ");
+        if words.next().is_some() {
+            value.push_str("...");
+        }
+        if !value.ends_with(['.', '!', '?']) {
+            value.push('.');
+        }
+        value
     }
 
     fn command_value_to_string(value: &Value) -> Option<String> {
@@ -1039,11 +1172,12 @@ mod tests {
 {"type":"event_msg","timestamp":"2026-04-24T03:16:50.000Z","payload":{"type":"task_started","turn_id":"turn_1"}}
 {"type":"event_msg","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"exec_command_end","status":"completed","exit_code":0,"duration":"120ms","command":["cargo","test"],"stdout":"secret output"}}
 {"type":"event_msg","timestamp":"2026-04-24T03:17:02.000Z","payload":{"type":"patch_apply_end","success":true,"changes":{"src/lib.rs":{}}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:05.000Z","payload":{"type":"task_complete","turn_id":"turn_1","last_agent_message":"Implemented the release flow.\n\nSecret token output omitted.","duration_ms":15000}}
 "#;
 
         let events = normalize_transcript(transcript, None).expect("transcript normalizes");
 
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert_eq!(events[0].kind, EventKind::SessionStart);
         assert_eq!(
             events[0].session_id.as_deref(),
@@ -1061,6 +1195,43 @@ mod tests {
         );
         assert_eq!(events[3].kind, EventKind::FileChanged);
         assert_eq!(events[3].files, vec!["src/lib.rs"]);
+        assert_eq!(events[4].kind, EventKind::TurnComplete);
+        assert_eq!(events[4].title, "codex turn completed");
+        assert_eq!(
+            events[4].summary.as_deref(),
+            Some("Implemented the release flow.")
+        );
+        assert!(
+            !events[4]
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Secret")
+        );
+    }
+
+    #[test]
+    fn codex_transcript_normalizes_plan_and_aborted_turn_events() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:16:50.000Z","payload":{"type":"item_completed","turn_id":"turn_1","item":{"type":"Plan","text":"raw plan text"}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:05.000Z","payload":{"type":"turn_aborted","turn_id":"turn_1","reason":"interrupted by operator"}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].kind, EventKind::PlanUpdate);
+        assert_eq!(
+            events[1].summary.as_deref(),
+            Some("plan update recorded without raw plan text.")
+        );
+        assert_eq!(events[2].kind, EventKind::TurnFail);
+        assert_eq!(
+            events[2].summary.as_deref(),
+            Some("interrupted by operator.")
+        );
     }
 
     #[test]
