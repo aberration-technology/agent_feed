@@ -1810,6 +1810,17 @@ mod tests {
     }
 
     #[test]
+    fn signed_feed_id_uses_durable_github_user_id_when_available() {
+        let publisher = PublisherIdentity::github(123, "mosure", None, None);
+
+        assert_eq!(
+            signed_feed_id("workstation", Some(&publisher)),
+            "github:123:workstation"
+        );
+        assert_eq!(signed_feed_id("workstation", None), "local:workstation");
+    }
+
+    #[test]
     fn codex_active_accepts_workspace_scope() {
         let cli = Cli::try_parse_from([
             "agent-feed",
@@ -2667,7 +2678,11 @@ fn signed_capsules(
     summary_config: &SummaryConfig,
     publisher: Option<&PublisherIdentity>,
 ) -> Result<Vec<Signed<StoryCapsule>>, CliError> {
-    let feed_id = format!("local:{feed}");
+    let feed_id = signed_feed_id(feed, publisher);
+    let author = publisher
+        .and_then(|publisher| publisher.github_user_id)
+        .map(|github_user_id| format!("github:{github_user_id}"))
+        .unwrap_or_else(|| "local:codex".to_string());
     let summaries = summarize_feed(&feed_id, stories, summary_config)?;
     info!(
         %feed_id,
@@ -2682,7 +2697,7 @@ fn signed_capsules(
             let mut capsule = StoryCapsule::from_summary(
                 feed_id.clone(),
                 (index + 1) as u64,
-                "local:codex",
+                author.clone(),
                 summary,
             )?;
             if let Some(publisher) = publisher {
@@ -2691,6 +2706,14 @@ fn signed_capsules(
             Signed::sign_capsule(capsule, "local-codex").map_err(CliError::from)
         })
         .collect()
+}
+
+fn signed_feed_id(feed: &str, publisher: Option<&PublisherIdentity>) -> String {
+    let feed = feed.trim();
+    match publisher.and_then(|publisher| publisher.github_user_id) {
+        Some(github_user_id) => format!("github:{github_user_id}:{feed}"),
+        None => format!("local:{feed}"),
+    }
 }
 
 struct SummaryCliOptions<'a> {

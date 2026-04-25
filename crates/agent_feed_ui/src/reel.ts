@@ -1004,7 +1004,7 @@ async function startRemoteRoute(route) {
     return;
   }
   setupModeSwitcher(route);
-  if (route.feedMode === "subscribed") {
+  if (route.feedMode === "subscribed" && route.kind === "global") {
     startSubscribedRoute(route);
     return;
   }
@@ -1165,10 +1165,14 @@ async function startUserRoute(route) {
       ticket.candidate_feeds = compatibleFeeds;
     }
     const feedCount = compatibleFeeds.length;
+    const headlines = snapshotHeadlines(ticket).filter((item) =>
+      headlineMatchesRoute(item, route),
+    );
     logInfo("feed.user.ticket", {
       login: ticket.profile?.login || route.login,
       github_user_id: ticket.github_user_id || ticket.resolved_github_id,
       feeds: feedCount,
+      headlines: headlines.length,
       incompatible_feeds: incompatibleFeeds,
       expires_at: ticket.expires_at,
     });
@@ -1181,10 +1185,16 @@ async function startUserRoute(route) {
       ], ticket.profile);
       return;
     }
-    if (feedCount === 0) {
+    if (headlines.length && !route.interactive) {
+      applyRemoteHeadlines(route, headlines);
+      return;
+    }
+    if (feedCount === 0 && headlines.length === 0) {
       renderRemoteState(route, "no-feeds", [
         "github identity found",
-        "no visible settled story streams",
+        route.feedMode === "subscribed"
+          ? "no selected feed is currently publishing"
+          : "no visible settled story streams",
       ], ticket.profile);
       logInfo("feed.user.no_visible_streams", {
         login: ticket.profile?.login || route.login,
@@ -1224,6 +1234,14 @@ function snapshotFeeds(snapshot) {
 
 function snapshotHeadlines(snapshot) {
   return snapshot.headlines || snapshot.stories || snapshot.capsules || [];
+}
+
+function headlineMatchesRoute(item, route) {
+  const label = item.feed_label || item.feedLabel || item.label || "";
+  if (route.feed && route.feed !== "*") {
+    return label === route.feed;
+  }
+  return true;
 }
 
 function compatibilityStatus(remote) {
@@ -1351,7 +1369,7 @@ function remoteHeadlineToBulletin(route, item, index) {
     mode: item.mode || "dispatch",
     priority: item.priority || item.score || 75,
     dwell_ms: item.dwell_ms || item.dwellMs || 14000,
-    eyebrow: `feed / ${route.network} / discovery`,
+    eyebrow: routeEyebrow(route),
     headline: headlineText,
     deck: item.deck || item.summary || "settled story capsule published to the network.",
     lower_third: item.lower_third || item.lowerThird || item.publisher_label || "verified peer",
@@ -1483,10 +1501,14 @@ function renderTimeline(route, ticket) {
     return;
   }
   const feeds = ticket.feeds || ticket.candidate_feeds || [];
+  const headlines = snapshotHeadlines(ticket).filter((item) =>
+    headlineMatchesRoute(item, route),
+  );
   logInfo("feed.timeline.render", {
     login: ticket.profile?.login || route.login,
     selection: route.selection,
     feeds: feeds.length,
+    headlines: headlines.length,
     wildcard: route.feed === "*" || !route.feed,
   });
   if (stage) {
@@ -1516,6 +1538,23 @@ function renderTimeline(route, ticket) {
   }
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
+
+  for (const item of headlines) {
+    const card = document.createElement("article");
+    card.className = "timeline-card";
+    card.tabIndex = 0;
+    const meta = document.createElement("div");
+    meta.className = "timeline-meta";
+    meta.textContent =
+      item.lower_third ||
+      `${item.publisher_login || route.login} / ${item.feed_label || "feed"}`;
+    const title = document.createElement("h2");
+    title.textContent = item.headline || item.title || "settled story";
+    const copy = document.createElement("p");
+    copy.textContent = item.deck || item.summary || "story-only capsule";
+    card.append(meta, title, copy);
+    timeline.appendChild(card);
+  }
 
   for (const feed of feeds) {
     const feedLabel = feed.label || feed.feed_label || "feed";

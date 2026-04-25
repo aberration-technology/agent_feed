@@ -671,6 +671,8 @@ impl FeedDirectoryEntry {
 pub struct RemoteHeadlineView {
     pub feed_id: FeedId,
     pub feed_label: String,
+    #[serde(default)]
+    pub publisher_github_user_id: Option<u64>,
     pub publisher_login: String,
     pub publisher_display_name: Option<String>,
     pub publisher_avatar: Option<AvatarRef>,
@@ -706,6 +708,7 @@ impl RemoteHeadlineView {
         Ok(Self {
             feed_id: entry.feed_id.clone(),
             feed_label: entry.feed_label.clone(),
+            publisher_github_user_id: Some(entry.owner.github_user_id.get()),
             publisher_login: publisher
                 .github_login
                 .clone()
