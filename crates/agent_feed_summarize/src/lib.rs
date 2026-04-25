@@ -1732,18 +1732,18 @@ fn apply_publish_decision(
     summary.metadata.max_deck_similarity = nearest_deck;
     summary.metadata.headline_fingerprint = headline_fingerprint(&summary.headline);
 
-    if summary.score >= policy.severe_score_bypass {
-        summary.metadata.publish_action = PublishAction::Publish;
-        summary.metadata.publish_reason =
-            "high-severity summary bypassed duplicate suppression".to_string();
-        return true;
-    }
-
     if is_generic_or_low_signal_summary(summary) {
         summary.metadata.publish_action = PublishAction::SkipProcessor;
         summary.metadata.publish_reason =
             "summary quality gate rejected a generic low-context headline".to_string();
         return false;
+    }
+
+    if summary.score >= policy.severe_score_bypass {
+        summary.metadata.publish_action = PublishAction::Publish;
+        summary.metadata.publish_reason =
+            "high-severity summary bypassed duplicate suppression".to_string();
+        return true;
     }
 
     let duplicate = nearest.is_some()
@@ -2264,6 +2264,23 @@ mod tests {
         incident.deck = "shell command failed.".to_string();
         incident.score = 84;
         incident.severity = Severity::Warning;
+
+        let summaries =
+            summarize_feed("local:workstation", &[incident], &config).expect("summary compiles");
+
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn severe_generic_low_context_summaries_still_do_not_publish() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut incident = story("codex command failed", 95);
+        incident.family = StoryFamily::Incident;
+        incident.headline = "codex shell command failed".to_string();
+        incident.deck = "shell command failed.".to_string();
+        incident.score = 95;
+        incident.severity = Severity::Critical;
 
         let summaries =
             summarize_feed("local:workstation", &[incident], &config).expect("summary compiles");

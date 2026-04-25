@@ -251,21 +251,25 @@ impl StoryCompiler {
 
     #[must_use]
     pub fn ingest(&mut self, event: AgentEvent) -> Vec<CompiledStory> {
+        let primary_key = story_key(&event);
+        if primary_key.family != StoryFamily::Turn {
+            self.touch_turn_rollup(&event);
+        }
+
         if is_never_publish_event(&event) {
-            self.touch_window(event);
+            self.touch_window_with_key(primary_key, event);
             return Vec::new();
         }
 
-        let key = story_key(&event);
         let now = event.occurred_at.unwrap_or(event.received_at);
         let mut window = self
             .windows
-            .remove(&key)
-            .unwrap_or_else(|| StoryWindow::new(key.clone(), now));
+            .remove(&primary_key)
+            .unwrap_or_else(|| StoryWindow::new(primary_key.clone(), now));
         window.observe(&event);
 
         if !should_settle(&event, &window) {
-            self.windows.insert(key, window);
+            self.windows.insert(primary_key, window);
             return Vec::new();
         }
 
@@ -295,13 +299,31 @@ impl StoryCompiler {
         stories
     }
 
-    fn touch_window(&mut self, event: AgentEvent) {
-        let key = story_key(&event);
+    fn touch_window_with_key(&mut self, key: StoryKey, event: AgentEvent) {
         let now = event.occurred_at.unwrap_or(event.received_at);
         self.windows
             .entry(key.clone())
             .or_insert_with(|| StoryWindow::new(key, now))
             .observe(&event);
+    }
+
+    fn touch_turn_rollup(&mut self, event: &AgentEvent) {
+        if event.session_id.is_none() && event.turn_id.is_none() {
+            return;
+        }
+        let key = StoryKey {
+            feed_id: None,
+            agent: event.agent.clone(),
+            project_hash: event.project.clone(),
+            session_id: event.session_id.clone(),
+            turn_id: event.turn_id.clone(),
+            family: StoryFamily::Turn,
+        };
+        let now = event.occurred_at.unwrap_or(event.received_at);
+        self.windows
+            .entry(key.clone())
+            .or_insert_with(|| StoryWindow::new(key, now))
+            .observe(event);
     }
 
     fn compile_window(&self, window: StoryWindow) -> Option<CompiledStory> {
@@ -507,12 +529,19 @@ fn headline(window: &StoryWindow) -> String {
         StoryFamily::Plan => format!("{agent} updated the plan"),
         StoryFamily::Command => format!("{agent} completed {object}"),
         StoryFamily::IdleRecap => format!("{agent} activity settled"),
-        StoryFamily::Turn => format!("{agent} completed {object}"),
+        StoryFamily::Turn => turn_headline(window, agent, &object),
     }
 }
 
 fn deck(window: &StoryWindow) -> String {
     let mut parts = Vec::new();
+    if window.key.family == StoryFamily::Turn
+        && let Some(summary) = &window.signals.latest_summary
+        && !summary.is_empty()
+        && !summary_is_redundant(summary)
+    {
+        parts.push(safe_sentence(summary));
+    }
     if window.counters.files_changed > 0 {
         parts.push(format!(
             "{} changed files",
@@ -536,6 +565,7 @@ fn deck(window: &StoryWindow) -> String {
     if let Some(summary) = &window.signals.latest_summary
         && !summary.is_empty()
         && parts.len() < 2
+        && window.key.family != StoryFamily::Turn
         && !summary_is_redundant(summary)
     {
         parts.push(safe_sentence(summary));
@@ -580,6 +610,85 @@ fn object_label(window: &StoryWindow) -> String {
     story_family_label(window.key.family).to_string()
 }
 
+fn turn_headline(window: &StoryWindow, agent: &str, object: &str) -> String {
+    if let Some(summary) = window
+        .signals
+        .latest_summary
+        .as_deref()
+        .and_then(|summary| summary_headline(agent, summary))
+    {
+        return summary;
+    }
+    if window.counters.tests_failed > 0 {
+        return format!("{agent} found failing tests");
+    }
+    if window.counters.tests_passed > 0 && window.counters.files_changed > 0 {
+        return format!("{agent} verified the update");
+    }
+    if window.counters.tests_passed > 0 {
+        return format!("{agent} verified tests");
+    }
+    if window.counters.files_changed > 0 {
+        return format!(
+            "{agent} finished {} file update",
+            window.counters.files_changed.min(99)
+        );
+    }
+    format!("{agent} completed {object}")
+}
+
+fn summary_headline(agent: &str, summary: &str) -> Option<String> {
+    if summary_is_redundant(summary) {
+        return None;
+    }
+    let sentence = safe_sentence(summary);
+    let normalized = sentence.trim_matches(['.', '!', '?']).trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    let lowered = normalized.to_ascii_lowercase();
+    if [
+        "done",
+        "completed",
+        "turn completed",
+        "task complete",
+        "finished",
+        "ok",
+    ]
+    .iter()
+    .any(|generic| lowered == *generic)
+    {
+        return None;
+    }
+    let without_pronoun = normalized
+        .strip_prefix("I ")
+        .or_else(|| normalized.strip_prefix("i "))
+        .unwrap_or(normalized);
+    let first = without_pronoun
+        .split_whitespace()
+        .take(10)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if first.is_empty() {
+        None
+    } else if first
+        .to_ascii_lowercase()
+        .starts_with(&agent.to_ascii_lowercase())
+    {
+        Some(first)
+    } else {
+        Some(format!("{agent} {}", lower_initial(&first)))
+    }
+}
+
+fn lower_initial(input: &str) -> String {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
+}
+
 fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> bool {
     if window.signals.highest_score >= 90 {
         return false;
@@ -601,6 +710,21 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
             || combined.contains("command failed")
             || combined.contains("tool failures"))
     {
+        return true;
+    }
+    let turn_only_tool_failure = window.key.family == StoryFamily::Turn
+        && window.counters.tool_failures > 0
+        && window.counters.files_changed == 0
+        && window.counters.tests_failed == 0
+        && window.counters.tests_passed == 0
+        && window.counters.permissions == 0
+        && window.counters.mcp_failures == 0
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_none_or(summary_is_redundant);
+    if turn_only_tool_failure {
         return true;
     }
     combined.contains("activity settled") || combined.contains("hit [project] command")
@@ -678,12 +802,17 @@ fn safe_sentence(input: &str) -> String {
 
 fn summary_is_redundant(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
+    let trimmed = lowered.trim_start();
+    if trimmed.starts_with("status ") || trimmed.starts_with("exit ") {
+        return true;
+    }
     [
         "changed files",
         "raw diff omitted",
         "raw output omitted",
-        "status ",
-        "exit ",
+        "raw transcript omitted",
+        "raw content omitted",
+        "without raw content",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -751,6 +880,73 @@ mod tests {
         );
         assert!(!stories[0].deck.contains("raw detail omitted"));
         assert!(!stories[0].deck.contains("cargo test --all"));
+    }
+
+    #[test]
+    fn turn_completion_rolls_up_prior_context() {
+        let mut compiler = StoryCompiler::default();
+        let mut start = event(EventKind::CommandExec, "codex started a command");
+        start.command = Some("cargo test --all".to_string());
+        assert!(compiler.ingest(start).is_empty());
+
+        let mut changed = event(EventKind::FileChanged, "codex patch applied");
+        changed.files = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
+        changed.summary = Some("2 changed files. raw diff omitted.".to_string());
+        changed.score_hint = Some(82);
+        assert_eq!(compiler.ingest(changed).len(), 1);
+
+        let mut pass = event(EventKind::TestPass, "codex tests passed");
+        pass.command = Some("cargo test --all".to_string());
+        pass.summary = Some("test command passed.".to_string());
+        pass.score_hint = Some(76);
+        assert_eq!(compiler.ingest(pass).len(), 1);
+
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("Implemented the release feed capture path.".to_string());
+        complete.score_hint = Some(82);
+        let stories = compiler.ingest(complete);
+
+        let turn = stories
+            .iter()
+            .find(|story| story.family == StoryFamily::Turn)
+            .expect("turn story publishes");
+        assert_eq!(
+            turn.headline,
+            "codex implemented the release feed capture path"
+        );
+        assert!(
+            turn.deck
+                .contains("Implemented the release feed capture path")
+        );
+        assert!(turn.deck.contains("2 changed files"));
+        assert!(turn.deck.contains("tests passed"));
+        assert!(!turn.deck.contains("cargo test --all"));
+    }
+
+    #[test]
+    fn generic_tool_failure_can_settle_with_meaningful_turn_summary() {
+        let mut compiler = StoryCompiler::default();
+        let mut failed = event(EventKind::ToolFail, "codex command failed");
+        failed.summary = Some("exit 1. raw output omitted.".to_string());
+        failed.command = Some("git status --short".to_string());
+        failed.score_hint = Some(84);
+        failed.severity = Severity::Warning;
+        assert!(compiler.ingest(failed).is_empty());
+
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary =
+            Some("Verified the repository status after the command failure.".to_string());
+        complete.score_hint = Some(82);
+        let stories = compiler.ingest(complete);
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].family, StoryFamily::Turn);
+        assert_eq!(
+            stories[0].headline,
+            "codex verified the repository status after the command failure"
+        );
+        assert!(stories[0].deck.contains("1 tool failures"));
+        assert!(!stories[0].headline.contains("shell command failed"));
     }
 
     #[test]

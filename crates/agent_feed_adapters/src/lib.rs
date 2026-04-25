@@ -12,6 +12,23 @@ pub enum AdapterError {
     Json(#[from] serde_json::Error),
 }
 
+fn is_test_command(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    lowered.contains("cargo test")
+        || lowered.contains("cargo nextest")
+        || lowered.contains("pytest")
+        || lowered.contains("npm test")
+        || lowered.contains("pnpm test")
+        || lowered.contains("yarn test")
+        || lowered.contains("bun test")
+        || lowered.contains("go test")
+        || lowered.contains("swift test")
+        || lowered.contains("zig test")
+        || lowered.contains("dotnet test")
+        || lowered.contains("gradle test")
+        || lowered.contains("mvn test")
+}
+
 pub mod codex {
     use super::*;
 
@@ -254,39 +271,62 @@ pub mod codex {
         let success = status == "completed" && exit_code.unwrap_or(0) == 0;
         let command = command_from_payload(payload);
         let duration = payload.get("duration").and_then(Value::as_str);
-        let summary = match (exit_code, duration) {
-            (Some(code), Some(duration)) => {
-                format!("exit {code}; duration {duration}. raw output omitted.")
+        let summary = if command.as_deref().is_some_and(is_test_command) {
+            match (success, duration) {
+                (true, Some(duration)) => format!("test command passed; duration {duration}."),
+                (true, None) => "test command passed.".to_string(),
+                (false, Some(duration)) => format!("test command failed; duration {duration}."),
+                (false, None) => "test command failed.".to_string(),
             }
-            (Some(code), None) => format!("exit {code}. raw output omitted."),
-            (None, Some(duration)) => {
-                format!("status {status}; duration {duration}. raw output omitted.")
+        } else {
+            match (exit_code, duration) {
+                (Some(code), Some(duration)) => {
+                    format!("exit {code}; duration {duration}. raw output omitted.")
+                }
+                (Some(code), None) => format!("exit {code}. raw output omitted."),
+                (None, Some(duration)) => {
+                    format!("status {status}; duration {duration}. raw output omitted.")
+                }
+                (None, None) => format!("status {status}. raw output omitted."),
             }
-            (None, None) => format!("status {status}. raw output omitted."),
+        };
+        let (kind, title, score, severity) = if command.as_deref().is_some_and(is_test_command) {
+            if success {
+                (
+                    EventKind::TestPass,
+                    "codex tests passed",
+                    76,
+                    Severity::Notice,
+                )
+            } else {
+                (
+                    EventKind::TestFail,
+                    "codex tests failed",
+                    90,
+                    Severity::Warning,
+                )
+            }
+        } else if success {
+            (
+                EventKind::ToolComplete,
+                "codex command completed",
+                48,
+                Severity::Info,
+            )
+        } else {
+            (
+                EventKind::ToolFail,
+                "codex command failed",
+                84,
+                Severity::Warning,
+            )
         };
         Some(build_event(
             state,
             timestamp,
-            TranscriptEvent::new(
-                if success {
-                    EventKind::ToolComplete
-                } else {
-                    EventKind::ToolFail
-                },
-                if success {
-                    "codex command completed"
-                } else {
-                    "codex command failed"
-                },
-                if success { 48 } else { 84 },
-                if success {
-                    Severity::Info
-                } else {
-                    Severity::Warning
-                },
-            )
-            .summary(summary)
-            .optional_command(command),
+            TranscriptEvent::new(kind, title, score, severity)
+                .summary(summary)
+                .optional_command(command),
         ))
     }
 
@@ -633,6 +673,9 @@ pub mod claude {
         pub project: Option<String>,
         pub model: Option<String>,
         pub transcript_path: Option<String>,
+        pub last_tool: Option<String>,
+        pub last_command: Option<String>,
+        pub last_files: Vec<String>,
     }
 
     pub fn normalize_stream_json(value: Value) -> Result<AgentEvent, AdapterError> {
@@ -810,34 +853,60 @@ pub mod claude {
             "PostToolUse" => {
                 let failed = tool_response_failed(value.get("tool_response"));
                 let files = files_from_tool_input(value.get("tool_input"));
+                let command = command_from_tool_input(value.get("tool_input"));
+                let test_command = command.as_deref().is_some_and(is_test_command);
                 Some(build_event(
                     state,
                     None,
                     ClaudeEvent::new(
-                        if failed {
+                        if test_command && failed {
+                            EventKind::TestFail
+                        } else if test_command {
+                            EventKind::TestPass
+                        } else if failed {
                             EventKind::ToolFail
                         } else if is_file_tool(tool_name) {
                             EventKind::FileChanged
                         } else {
                             EventKind::ToolComplete
                         },
-                        if failed {
+                        if test_command && failed {
+                            "claude tests failed".to_string()
+                        } else if test_command {
+                            "claude tests passed".to_string()
+                        } else if failed {
                             format!("claude {tool_name} failed")
                         } else if is_file_tool(tool_name) {
                             "claude changed files".to_string()
                         } else {
                             format!("claude {tool_name} completed")
                         },
-                        if failed { 86 } else { 58 },
+                        if test_command && failed {
+                            90
+                        } else if test_command {
+                            76
+                        } else if failed {
+                            86
+                        } else {
+                            58
+                        },
                         if failed {
                             Severity::Warning
+                        } else if test_command {
+                            Severity::Notice
                         } else {
                             Severity::Info
                         },
                     )
-                    .summary("tool lifecycle captured without raw output.")
+                    .summary(if test_command && failed {
+                        "test command failed."
+                    } else if test_command {
+                        "test command passed."
+                    } else {
+                        "tool lifecycle captured without raw output."
+                    })
                     .tool(tool_name)
-                    .optional_command(command_from_tool_input(value.get("tool_input")))
+                    .optional_command(command)
                     .files(files),
                 ))
             }
@@ -883,7 +952,7 @@ pub mod claude {
     }
 
     fn assistant_event(
-        state: &ClaudeState,
+        state: &mut ClaudeState,
         timestamp: Option<&str>,
         message: &Value,
     ) -> Option<AgentEvent> {
@@ -900,6 +969,11 @@ pub mod claude {
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
             let input = tool_use.get("input");
+            let command = command_from_tool_input(input);
+            let files = files_from_tool_input(input);
+            state.last_tool = Some(name.to_string());
+            state.last_command = command.clone();
+            state.last_files = files.clone();
             return Some(build_event(
                 state,
                 timestamp,
@@ -919,8 +993,8 @@ pub mod claude {
                 )
                 .summary("tool call captured without raw output.")
                 .tool(name)
-                .optional_command(command_from_tool_input(input))
-                .files(files_from_tool_input(input)),
+                .optional_command(command)
+                .files(files),
             ));
         }
 
@@ -988,28 +1062,62 @@ pub mod claude {
             .get("is_error")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let command = state.last_command.clone();
+        let tool = state
+            .last_tool
+            .clone()
+            .unwrap_or_else(|| "tool".to_string());
+        let files = state.last_files.clone();
+        let test_command = command.as_deref().is_some_and(is_test_command);
         Some(build_event(
             state,
             timestamp,
             ClaudeEvent::new(
-                if failed {
+                if test_command && failed {
+                    EventKind::TestFail
+                } else if test_command {
+                    EventKind::TestPass
+                } else if failed {
                     EventKind::ToolFail
                 } else {
                     EventKind::ToolComplete
                 },
-                if failed {
+                if test_command && failed {
+                    "claude tests failed"
+                } else if test_command {
+                    "claude tests passed"
+                } else if failed {
                     "claude tool failed"
                 } else {
                     "claude tool completed"
                 },
-                if failed { 84 } else { 48 },
+                if test_command && failed {
+                    90
+                } else if test_command {
+                    76
+                } else if failed {
+                    84
+                } else {
+                    48
+                },
                 if failed {
                     Severity::Warning
+                } else if test_command {
+                    Severity::Notice
                 } else {
                     Severity::Info
                 },
             )
-            .summary("tool result captured without raw output."),
+            .summary(if test_command && failed {
+                "test command failed."
+            } else if test_command {
+                "test command passed."
+            } else {
+                "tool result captured without raw output."
+            })
+            .tool(tool)
+            .optional_command(command)
+            .files(files),
         ))
     }
 
@@ -1184,7 +1292,7 @@ mod tests {
             Some("019dbd7d-4f56-7a11-9d9d-038a73a694af")
         );
         assert_eq!(events[1].kind, EventKind::TurnStart);
-        assert_eq!(events[2].kind, EventKind::ToolComplete);
+        assert_eq!(events[2].kind, EventKind::TestPass);
         assert_eq!(events[2].command.as_deref(), Some("cargo test"));
         assert!(
             !events[2]
@@ -1244,7 +1352,7 @@ mod tests {
 
         let events = normalize_transcript(transcript, None).expect("transcript normalizes");
 
-        assert_eq!(events[1].kind, EventKind::ToolFail);
+        assert_eq!(events[1].kind, EventKind::TestFail);
         assert_eq!(events[1].command.as_deref(), Some("cargo test --all"));
     }
 
@@ -1299,6 +1407,29 @@ mod tests {
                 .contains("hidden")
         );
         assert_eq!(events[2].kind, EventKind::TurnComplete);
+    }
+
+    #[test]
+    fn claude_tool_result_uses_prior_bash_context_for_test_signal() {
+        let stream = r#"
+{"type":"system","subtype":"init","session_id":"claude-1","cwd":"/home/mosure/repos/agent_feed","model":"claude-sonnet-4-6"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test --all"}}]}}
+{"type":"tool_result","is_error":true,"content":"raw failing output"}
+"#;
+
+        let events = normalize_stream(stream, None).expect("stream normalizes");
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].kind, EventKind::TestFail);
+        assert_eq!(events[2].title, "claude tests failed");
+        assert_eq!(events[2].command.as_deref(), Some("cargo test --all"));
+        assert!(
+            !events[2]
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("raw failing output")
+        );
     }
 
     #[test]

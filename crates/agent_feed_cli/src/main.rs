@@ -2010,6 +2010,7 @@ fn print_import_complete(label: &str, stats: ImportStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_feed_story::StoryFamily;
 
     fn temp_test_root(name: &str) -> PathBuf {
         let root =
@@ -2595,6 +2596,169 @@ mod tests {
 
         let unfiltered = collect_codex_events(&transcript, None).expect("unfiltered collection");
         assert!(unfiltered.events.len() > collected.events.len());
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_transcript_compiles_meaningful_settled_stories() {
+        let root = temp_test_root("codex-meaningful-stories");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "codex-meaningful-test", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-04-24T03:16:49.697Z",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "status": "failed",
+                        "exit_code": 1,
+                        "duration": "120ms",
+                        "command": ["/usr/bin/zsh", "-lc", "cargo test --all"]
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:02.000Z",
+                    "payload": {
+                        "type": "patch_apply_end",
+                        "success": true,
+                        "changes": {"src/lib.rs": {}, "crates/feed/src/main.rs": {}}
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:05.000Z",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn_1",
+                        "last_agent_message": "Fixed the capture pipeline and left one integration test failing.",
+                        "duration_ms": 15000
+                    }
+                }),
+            ],
+        );
+
+        let stories = compile_codex_stories(std::slice::from_ref(&transcript), None)
+            .expect("stories compile");
+        let display = serde_json::to_string(&stories)
+            .expect("stories serialize")
+            .to_ascii_lowercase();
+
+        assert!(
+            stories
+                .iter()
+                .any(|story| story.family == StoryFamily::Test)
+        );
+        assert!(
+            stories
+                .iter()
+                .any(|story| story.family == StoryFamily::Turn)
+        );
+        assert!(display.contains("failing tests") || display.contains("tests are red"));
+        assert!(!display.contains("shell command failed"));
+        assert!(!display.contains("cargo test --all"));
+
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let summaries =
+            summarize_feed("github:35904762:workstation", &stories, &config).expect("summarizes");
+        let summary_display = serde_json::to_string(&summaries)
+            .expect("summaries serialize")
+            .to_ascii_lowercase();
+
+        assert!(!summaries.is_empty());
+        assert!(!summary_display.contains("shell command failed"));
+        assert!(!summary_display.contains("cargo test --all"));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn claude_stream_compiles_meaningful_settled_stories() {
+        let root = temp_test_root("claude-meaningful-stories");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let stream = root.join("claude.jsonl");
+        write_jsonl(
+            &stream,
+            [
+                json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "claude-meaningful-test",
+                    "cwd": workspace,
+                    "model": "claude-sonnet-4-6"
+                }),
+                json!({
+                    "type": "assistant",
+                    "message": {
+                        "content": [{
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "input": {"command": "cargo test --all"}
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "tool_result",
+                    "is_error": true,
+                    "content": "raw failing output"
+                }),
+                json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_ms": 9000
+                }),
+            ],
+        );
+
+        let stories =
+            compile_claude_stories(std::slice::from_ref(&stream), None).expect("stories compile");
+        let display = serde_json::to_string(&stories)
+            .expect("stories serialize")
+            .to_ascii_lowercase();
+
+        assert!(
+            stories
+                .iter()
+                .any(|story| story.family == StoryFamily::Test)
+        );
+        assert!(
+            stories
+                .iter()
+                .any(|story| story.family == StoryFamily::Turn)
+        );
+        assert!(display.contains("failing tests") || display.contains("tests are red"));
+        assert!(!display.contains("shell command failed"));
+        assert!(!display.contains("cargo test --all"));
+        assert!(!display.contains("raw failing output"));
+
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let summaries =
+            summarize_feed("github:35904762:workstation", &stories, &config).expect("summarizes");
+        let summary_display = serde_json::to_string(&summaries)
+            .expect("summaries serialize")
+            .to_ascii_lowercase();
+
+        assert!(!summaries.is_empty());
+        assert!(!summary_display.contains("shell command failed"));
+        assert!(!summary_display.contains("cargo test --all"));
+        assert!(!summary_display.contains("raw failing output"));
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
