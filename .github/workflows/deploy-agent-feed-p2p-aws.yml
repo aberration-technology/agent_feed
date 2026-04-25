@@ -400,14 +400,14 @@ jobs:
 
           ready_payload="$(curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/readyz")"
           grep -Eq 'ready|"state":"ready"' <<<"$ready_payload"
-          curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/browser-seed" \
-            | grep -q '"signature"'
-          curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/network/snapshot?network=mainnet" \
-            | grep -q '"feed_mode":"discovery"'
-          curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/resolve/github/${canary}?feed_mode=discovery" \
-            | grep -q '"github_user_id"'
-          curl -fsSL --connect-timeout 5 --max-time 20 "${browser_url}/${canary}?feed_mode=discovery" \
-            | grep -q '<title>feed</title>'
+          seed_payload="$(curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/browser-seed")"
+          grep -q '"signature"' <<<"$seed_payload"
+          snapshot_payload="$(curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/network/snapshot?network=mainnet")"
+          grep -q '"feed_mode":"discovery"' <<<"$snapshot_payload"
+          resolver_payload="$(curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/resolve/github/${canary}?feed_mode=discovery")"
+          grep -q '"github_user_id"' <<<"$resolver_payload"
+          route_payload="$(curl -fsSL --connect-timeout 5 --max-time 20 "${browser_url}/${canary}?feed_mode=discovery")"
+          grep -q '<title>feed</title>' <<<"$route_payload"
 
       - name: dispatch pages publish
         if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}
