@@ -84,6 +84,7 @@ pub struct StorySignals {
     pub latest_summary: Option<String>,
     pub latest_tool: Option<String>,
     pub latest_command_class: Option<String>,
+    pub command_topics: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -127,6 +128,15 @@ impl StoryWindow {
         self.signals.latest_tool.clone_from(&event.tool);
         if let Some(command) = event.command.as_deref().and_then(command_class) {
             self.signals.latest_command_class = Some(command);
+        }
+        if let Some(topic) = event.command.as_deref().and_then(command_topic)
+            && !self
+                .signals
+                .command_topics
+                .iter()
+                .any(|existing| existing == topic)
+        {
+            self.signals.command_topics.push(topic.to_string());
         }
         for file in event.files.iter().take(8) {
             if !self.signals.files.iter().any(|existing| existing == file) {
@@ -284,8 +294,11 @@ impl StoryCompiler {
     pub fn flush(&mut self) -> Vec<CompiledStory> {
         let windows = std::mem::take(&mut self.windows);
         let mut stories = Vec::new();
-        for mut window in windows.into_values() {
-            if window.signals.highest_score < self.config.min_score {
+        for (key, mut window) in windows {
+            if story_score(&window) < self.config.min_score {
+                if should_retain_open_window(&window) {
+                    self.windows.insert(key, window);
+                }
                 continue;
             }
             window.state = StoryWindowState::Settled;
@@ -327,7 +340,7 @@ impl StoryCompiler {
     }
 
     fn compile_window(&self, window: StoryWindow) -> Option<CompiledStory> {
-        let score = window.signals.highest_score;
+        let score = story_score(&window);
         let context_score = context_score(&window);
         if score < self.config.min_score || context_score < self.config.min_context_score {
             return None;
@@ -412,6 +425,12 @@ pub fn compile_events(events: impl IntoIterator<Item = AgentEvent>) -> Vec<Compi
     stories
 }
 
+fn should_retain_open_window(window: &StoryWindow) -> bool {
+    window.key.family == StoryFamily::Turn
+        && window.signals.highest_score >= 30
+        && window.counters.events < 128
+}
+
 fn story_key(event: &AgentEvent) -> StoryKey {
     StoryKey {
         feed_id: None,
@@ -473,6 +492,7 @@ fn is_never_publish_event(event: &AgentEvent) -> bool {
 
 fn context_score(window: &StoryWindow) -> u8 {
     let mut score = 0u8;
+    let story_score = story_score(window);
     if !window.key.agent.is_empty() {
         score = score.saturating_add(18);
     }
@@ -489,7 +509,7 @@ fn context_score(window: &StoryWindow) -> u8 {
     if outcome_label(window).is_some() {
         score = score.saturating_add(22);
     }
-    if window.signals.highest_score >= DEFAULT_MIN_SCORE {
+    if story_score >= DEFAULT_MIN_SCORE {
         score = score.saturating_add(16);
     }
     if matches!(
@@ -497,6 +517,14 @@ fn context_score(window: &StoryWindow) -> u8 {
         Severity::Warning | Severity::Critical
     ) {
         score = score.saturating_add(8);
+    }
+    score.min(100)
+}
+
+fn story_score(window: &StoryWindow) -> u8 {
+    let mut score = window.signals.highest_score;
+    if has_command_burst(window) {
+        score = score.max(68 + window.counters.commands.min(8) as u8);
     }
     score.min(100)
 }
@@ -560,6 +588,11 @@ fn deck(window: &StoryWindow) -> String {
         && !summary_is_redundant(summary)
     {
         parts.push(safe_sentence(summary));
+    }
+    if let Some(deck) = command_burst_deck(window)
+        && parts.is_empty()
+    {
+        parts.push(deck);
     }
     if window.counters.files_changed > 0 {
         parts.push(format!(
@@ -652,6 +685,9 @@ fn turn_headline(window: &StoryWindow, agent: &str, object: &str) -> String {
             "{agent} finished {} file update",
             window.counters.files_changed.min(99)
         );
+    }
+    if let Some(label) = command_burst_label(window) {
+        return format!("{agent} {label}");
     }
     format!("{agent} completed {object}")
 }
@@ -758,7 +794,7 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
             .latest_summary
             .as_deref()
             .is_none_or(summary_is_redundant);
-    if generic_turn_without_signal {
+    if generic_turn_without_signal && !has_command_burst(window) {
         return true;
     }
     combined.contains("activity settled") || combined.contains("hit [project] command")
@@ -806,6 +842,118 @@ fn command_class(command: &str) -> Option<String> {
     }
 }
 
+fn command_topic(command: &str) -> Option<&'static str> {
+    let lowered = command.to_ascii_lowercase();
+    let first = lowered.split_whitespace().next().unwrap_or_default();
+    if first.is_empty() {
+        return None;
+    }
+    if lowered.contains("gh run")
+        || lowered.contains("github")
+        || lowered.contains("workflow")
+        || lowered.contains("ci")
+    {
+        return Some("ci status");
+    }
+    if first == "cargo"
+        || first == "just"
+        || first == "pytest"
+        || first == "npm"
+        || first == "pnpm"
+        || first == "yarn"
+        || lowered.contains(" test")
+    {
+        return Some("verification");
+    }
+    if first == "rg"
+        || first == "sed"
+        || first == "nl"
+        || first == "cat"
+        || first == "find"
+        || lowered.contains("grep")
+    {
+        return Some("code inspection");
+    }
+    if first == "git" {
+        return Some("repository state");
+    }
+    if first == "curl" || first == "wget" {
+        return Some("remote service check");
+    }
+    Some("shell checks")
+}
+
+fn has_command_burst(window: &StoryWindow) -> bool {
+    window.key.family == StoryFamily::Turn
+        && window.counters.commands >= 4
+        && window.counters.files_changed == 0
+        && window.counters.tests_failed == 0
+        && window.counters.tests_passed == 0
+        && window.counters.permissions == 0
+        && window.counters.mcp_failures == 0
+}
+
+fn command_burst_label(window: &StoryWindow) -> Option<&'static str> {
+    if !has_command_burst(window) {
+        return None;
+    }
+    if has_command_topic(window, "ci status") {
+        return Some("checked ci status");
+    }
+    if has_command_topic(window, "verification") {
+        return Some("ran verification checks");
+    }
+    if has_command_topic(window, "code inspection") {
+        return Some("inspected code paths");
+    }
+    if has_command_topic(window, "repository state") {
+        return Some("checked repository state");
+    }
+    if has_command_topic(window, "remote service check") {
+        return Some("checked remote services");
+    }
+    Some("worked through shell checks")
+}
+
+fn command_burst_deck(window: &StoryWindow) -> Option<String> {
+    let scope = command_burst_scope(window)?;
+    Some(format!(
+        "{} safe command events settled around {}",
+        window.counters.commands.min(99),
+        scope
+    ))
+}
+
+fn has_command_topic(window: &StoryWindow, topic: &str) -> bool {
+    window
+        .signals
+        .command_topics
+        .iter()
+        .any(|existing| existing == topic)
+}
+
+fn command_burst_scope(window: &StoryWindow) -> Option<&'static str> {
+    if !has_command_burst(window) {
+        return None;
+    }
+    if has_command_topic(window, "ci status") {
+        return Some("ci status");
+    }
+    if has_command_topic(window, "verification") {
+        return Some("verification");
+    }
+    if has_command_topic(window, "code inspection") {
+        return Some("code inspection");
+    }
+    if has_command_topic(window, "repository state") {
+        return Some("repository state");
+    }
+    if has_command_topic(window, "remote service check") {
+        return Some("remote service checks");
+    }
+    Some("shell checks")
+}
+
 fn severity_rank(severity: Severity) -> u8 {
     match severity {
         Severity::Debug => 0,
@@ -850,6 +998,8 @@ fn summary_is_redundant(input: &str) -> bool {
         "raw transcript omitted",
         "raw content omitted",
         "without raw content",
+        "command lifecycle captured",
+        "without command output",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -1038,6 +1188,54 @@ mod tests {
 
         assert!(compiler.ingest(failed).is_empty());
         assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn command_burst_flushes_safe_turn_story() {
+        let mut compiler = StoryCompiler::default();
+        for index in 0..4 {
+            let kind = if index % 2 == 0 {
+                EventKind::CommandExec
+            } else {
+                EventKind::ToolComplete
+            };
+            let mut command = event(kind, "codex command completed");
+            command.summary = Some(if kind == EventKind::CommandExec {
+                "command lifecycle captured without command output.".to_string()
+            } else {
+                "exit 0. raw output omitted.".to_string()
+            });
+            command.command =
+                Some("gh run view 24941390598 --repo example/project --json status".to_string());
+            command.score_hint = Some(48);
+            assert!(compiler.ingest(command).is_empty());
+            if index == 1 {
+                assert!(
+                    compiler.flush().is_empty(),
+                    "low-score turn windows should be retained until enough context arrives"
+                );
+            }
+        }
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].family, StoryFamily::Turn);
+        assert_eq!(stories[0].headline, "codex checked ci status");
+        assert!(stories[0].deck.contains("safe command events"));
+        assert!(stories[0].deck.contains("ci status"));
+        let display = format!(
+            "{} {} {} {}",
+            stories[0].headline,
+            stories[0].deck,
+            stories[0].lower_third,
+            stories[0].chips.join(" ")
+        );
+        assert!(!display.contains("gh run view"));
+        assert!(!display.contains("--repo"));
+        assert!(!display.contains("completed gh command"));
+        assert!(!display.contains("command lifecycle captured"));
+        assert!(!display.contains("without command output"));
     }
 
     #[test]

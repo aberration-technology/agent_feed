@@ -26,9 +26,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio::time as tokio_time;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::{StreamExt, once};
 use tower_http::trace::TraceLayer;
@@ -38,6 +40,8 @@ pub struct ServerConfig {
     pub security: SecurityConfig,
     pub p2p_enabled: bool,
 }
+
+const STORY_FLUSH_INTERVAL: Duration = Duration::from_secs(15);
 
 impl ServerConfig {
     #[must_use]
@@ -112,6 +116,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         story: Mutex::new(StoryCompiler::default()),
         metrics: Metrics::default(),
     });
+    spawn_story_flush_loop(state.clone());
 
     Router::new()
         .route("/", get(root_index))
@@ -143,6 +148,22 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         ))
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+fn spawn_story_flush_loop(state: Arc<AppState>) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        tracing::debug!("story flush loop skipped outside tokio runtime");
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio_time::interval(STORY_FLUSH_INTERVAL);
+        loop {
+            interval.tick().await;
+            if let Err(err) = flush_story_windows(state.clone()).await {
+                tracing::error!(error = ?err, "story flush loop failed");
+            }
+        }
+    });
 }
 
 async fn display_token_auth(
@@ -555,25 +576,7 @@ async fn ingest_event(
         .push(event);
 
     state.metrics.record_ingested();
-    for bulletin in bulletins {
-        state
-            .reel
-            .lock()
-            .map_err(|_| {
-                tracing::error!("reel buffer lock poisoned during ingest");
-                AppError::StatePoisoned
-            })?
-            .push(bulletin.clone());
-        state.metrics.record_emitted();
-        match state.tx.send(bulletin) {
-            Ok(receivers) => {
-                tracing::debug!(%event_id, event_kind, receivers, "story bulletin sent to sse subscribers");
-            }
-            Err(err) => {
-                tracing::debug!(%event_id, event_kind, error = %err, "story bulletin stored without sse subscribers");
-            }
-        }
-    }
+    emit_bulletins(&state, bulletins, "ingest")?;
 
     tracing::info!(
         %event_id,
@@ -585,6 +588,72 @@ async fn ingest_event(
     );
 
     Ok(Json(response))
+}
+
+async fn flush_story_windows(state: Arc<AppState>) -> Result<usize, AppError> {
+    let stories = state
+        .story
+        .lock()
+        .map_err(|_| {
+            tracing::error!("story compiler lock poisoned during flush");
+            AppError::StatePoisoned
+        })?
+        .flush();
+    if stories.is_empty() {
+        return Ok(0);
+    }
+    let bulletins = stories
+        .iter()
+        .map(agent_feed_story::CompiledStory::to_bulletin)
+        .collect::<Vec<_>>();
+    let count = bulletins.len();
+    emit_bulletins(&state, bulletins, "flush")?;
+    tracing::info!(
+        stories = stories.len(),
+        bulletins = count,
+        "story windows flushed"
+    );
+    Ok(count)
+}
+
+fn emit_bulletins(
+    state: &Arc<AppState>,
+    bulletins: Vec<Bulletin>,
+    origin: &'static str,
+) -> Result<(), AppError> {
+    for bulletin in bulletins {
+        let bulletin_id = bulletin.id.to_string();
+        let headline = bulletin.headline.clone();
+        state
+            .reel
+            .lock()
+            .map_err(|_| {
+                tracing::error!("reel buffer lock poisoned during bulletin emit");
+                AppError::StatePoisoned
+            })?
+            .push(bulletin.clone());
+        state.metrics.record_emitted();
+        match state.tx.send(bulletin) {
+            Ok(receivers) => {
+                tracing::debug!(
+                    %bulletin_id,
+                    %origin,
+                    receivers,
+                    "story bulletin sent to sse subscribers"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    %bulletin_id,
+                    %origin,
+                    error = %err,
+                    "story bulletin stored without sse subscribers"
+                );
+            }
+        }
+        tracing::info!(%bulletin_id, %origin, %headline, "story bulletin emitted");
+    }
+    Ok(())
 }
 
 fn ingest_response(event: &AgentEvent, bulletins: &[Bulletin]) -> IngestView {
@@ -783,5 +852,44 @@ mod tests {
         assert_eq!(view.captured_sources[0].agent, "codex");
         assert_eq!(view.captured_sources[0].sessions, 1);
         assert_eq!(view.last_event_kind.as_deref(), Some("adapter.health"));
+    }
+
+    #[tokio::test]
+    async fn flush_emits_safe_command_burst_story() {
+        let state = test_state();
+        for _ in 0..4 {
+            let mut event = AgentEvent::new(
+                SourceKind::Codex,
+                EventKind::ToolComplete,
+                "codex command completed",
+            );
+            event.agent = "codex".to_string();
+            event.adapter = "codex.exec-json".to_string();
+            event.project = Some("agent_feed".to_string());
+            event.session_id = Some("session".to_string());
+            event.turn_id = Some("turn".to_string());
+            event.summary = Some("exit 0. raw output omitted.".to_string());
+            event.command =
+                Some("gh run view 24941390598 --repo example/project --json status".to_string());
+            event.score_hint = Some(48);
+
+            let Json(view) = ingest_event(state.clone(), event)
+                .await
+                .expect("event ingests");
+            assert!(view.bulletin_ids.is_empty());
+        }
+
+        let flushed = flush_story_windows(state.clone())
+            .await
+            .expect("story flushes");
+
+        assert_eq!(flushed, 1);
+        let snapshot = state.reel.lock().expect("reel lock").snapshot();
+        assert_eq!(snapshot.bulletins.len(), 1);
+        let bulletin = &snapshot.bulletins[0];
+        assert_eq!(bulletin.headline, "codex checked ci status");
+        let display = serde_json::to_string(bulletin).expect("bulletin serializes");
+        assert!(!display.contains("gh run view"));
+        assert!(!display.contains("--repo"));
     }
 }

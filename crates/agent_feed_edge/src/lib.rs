@@ -1475,6 +1475,8 @@ fn remote_copy_has_public_quality_issue(copy: &str) -> bool {
         "m0 signal path",
         "p2p capsule coverage advanced",
         "verification s",
+        "command lifecycle captured",
+        "without command output",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -2279,10 +2281,14 @@ mod tests {
         let mut generic = base.clone();
         generic.headline = "codex moved feed work forward".to_string();
         generic.deck = "p2p capsule coverage advanced; tests passed.".to_string();
+        let mut capture_placeholder = base.clone();
+        capture_placeholder.headline =
+            "codex command lifecycle captured without command output".to_string();
 
         store.push(local);
         store.push(bad);
         store.push(generic);
+        store.push(capture_placeholder);
         store.push(base);
         let snapshot = network_snapshot_value(&config(), &store);
 

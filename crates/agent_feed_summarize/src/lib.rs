@@ -1717,6 +1717,15 @@ const PUBLIC_COPY_REPLACEMENTS: &[(&str, &str)] = &[
     (r"(?i)\bred runs\b", "failing runs"),
     (r"(?i)\bresponse-body\b", "response body"),
     (r"(?i)\bverification s\b", "verification"),
+    (
+        r"(?i)\bcommand lifecycle captured without command output\b",
+        "safe shell activity settled",
+    ),
+    (
+        r"(?i)\bcommand lifecycle captured\b",
+        "safe shell activity settled",
+    ),
+    (r"(?i)\bwithout command output\b", ""),
 ];
 
 fn ensure_terminal_sentence(input: &str) -> String {
@@ -2944,12 +2953,13 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
             Ok(ProcessorSummary {
                 headline: "Codex advances production scaffold; test gate stays red".to_string(),
-                deck: "Production scaffold, m0 signal path, real stream handling, summarization, capsule tests, error logging, and response-body delivery advanced across the feed work. Tests still report failures despite one passing verification s.".to_string(),
+                deck: "Production scaffold, m0 signal path, real stream handling, summarization, capsule tests, error logging, and response-body delivery advanced across the feed work. Tests still report failures despite one passing verification s. Command lifecycle captured without command output.".to_string(),
                 lower_third: Some("@mosure / workstation".to_string()),
                 chips: vec![
                     "production scaffold".to_string(),
                     "m0 signal path".to_string(),
                     "tests red".to_string(),
+                    "command lifecycle captured".to_string(),
                 ],
                 publish: None,
                 publish_reason: None,
@@ -2987,6 +2997,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(!display.contains("advanced"));
         assert!(!display.contains("advances"));
         assert!(!display.contains("verification s"));
+        assert!(!display.contains("command lifecycle captured"));
+        assert!(!display.contains("without command output"));
         assert!(summaries[0].deck.ends_with('.'));
     }
 
