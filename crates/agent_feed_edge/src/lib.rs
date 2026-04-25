@@ -1467,7 +1467,11 @@ fn remote_copy_has_public_quality_issue(copy: &str) -> bool {
         "agent feed scaffold",
         "test gate",
         "test line",
+        "tests remain red",
+        "fixture",
         "m0 signal path",
+        "advances",
+        "advanced",
         "verification s",
     ]
     .iter()
@@ -2270,9 +2274,13 @@ mod tests {
         local.feed_id = "local:workstation".to_string();
         let mut bad = base.clone();
         bad.headline = "Codex advances production scaffold; test gate stays red".to_string();
+        let mut generic = base.clone();
+        generic.headline = "codex moved feed work forward".to_string();
+        generic.deck = "p2p capsule coverage advanced; tests passed.".to_string();
 
         store.push(local);
         store.push(bad);
+        store.push(generic);
         store.push(base);
         let snapshot = network_snapshot_value(&config(), &store);
 

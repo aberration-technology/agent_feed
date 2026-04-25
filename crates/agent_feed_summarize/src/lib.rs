@@ -1683,17 +1683,34 @@ const PUBLIC_COPY_REPLACEMENTS: &[(&str, &str)] = &[
     (r"(?i)\bproduction scaffold\b", "feed implementation"),
     (r"(?i)\bproduction flow\b", "feed publishing"),
     (r"(?i)\bagent feed scaffold\b", "agent feed implementation"),
+    (r"(?i)\bagent feed work\b", "agent feed"),
     (r"(?i)\bscaffold\b", "implementation"),
     (r"(?i)\bfixture-driven\b", "mock"),
     (r"(?i)\bfixture events\b", "mock events"),
+    (r"(?i)\bfixture\b", "mock"),
     (r"(?i)\bm[0-9]+(?:\.[0-9]+)?\s+signal path\b", "signal path"),
     (r"(?i)\bm[0-9]+(?:\.[0-9]+)?\b", ""),
     (r"(?i)\btest gate stays red\b", "tests are still failing"),
     (r"(?i)\btest line remains red\b", "tests are still failing"),
+    (r"(?i)\btests?\s+remain\s+red\b", "tests are still failing"),
+    (
+        r"(?i)\btests?\s+remain\s+failing\b",
+        "tests are still failing",
+    ),
     (r"(?i)\btests?\s+red\b", "tests failing"),
     (r"(?i)\bcurrent public outcome remains\b", ""),
     (r"(?i)\bmoved forward\b", "changed"),
     (r"(?i)\badvanced across the feed\b", "changed"),
+    (r"(?i)\bcoverage advanced\b", "coverage landed"),
+    (r"(?i)\badvances\b", "moves"),
+    (r"(?i)\badvanced\b", "landed"),
+    (
+        r"(?i)\bclosed the summarization pass\b",
+        "finished summarization",
+    ),
+    (r"(?i)\blater verified passing\b", "verified passing"),
+    (r"(?i)\bearlier red runs\b", "earlier failing runs"),
+    (r"(?i)\bred runs\b", "failing runs"),
     (r"(?i)\bresponse-body\b", "response body"),
     (r"(?i)\bverification s\b", "verification"),
 ];
@@ -2923,7 +2940,7 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
             Ok(ProcessorSummary {
                 headline: "Codex advances production scaffold; test gate stays red".to_string(),
-                deck: "Production scaffold, m0 signal path, real stream handling, summarization, capsule tests, error logging, and response-body delivery were implemented across the feed work. Tests still report failures despite one passing verification s.".to_string(),
+                deck: "Production scaffold, m0 signal path, real stream handling, summarization, capsule tests, error logging, and response-body delivery advanced across the feed work. Tests still report failures despite one passing verification s.".to_string(),
                 lower_third: Some("@mosure / workstation".to_string()),
                 chips: vec![
                     "production scaffold".to_string(),
@@ -2950,7 +2967,7 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
 
         assert_eq!(
             summaries[0].headline,
-            "codex advances feed implementation; tests are still failing"
+            "codex moves feed implementation; tests are still failing"
         );
         let display = format!(
             "{} {} {}",
@@ -2963,6 +2980,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(!display.contains("m0"));
         assert!(!display.contains("test gate"));
         assert!(!display.contains("test line"));
+        assert!(!display.contains("advanced"));
+        assert!(!display.contains("advances"));
         assert!(!display.contains("verification s"));
         assert!(summaries[0].deck.ends_with('.'));
     }
