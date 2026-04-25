@@ -1821,6 +1821,19 @@ mod tests {
     }
 
     #[test]
+    fn builtin_agent_summarizers_are_allowed_to_fallback() {
+        let mut config = SummaryConfig::p2p_default();
+        config.processor = SummaryProcessorConfig::CodexExec;
+        assert!(agent_processor_fallback_enabled(&config));
+
+        config.processor = SummaryProcessorConfig::ClaudeCodeExec;
+        assert!(agent_processor_fallback_enabled(&config));
+
+        config.processor = SummaryProcessorConfig::Deterministic;
+        assert!(!agent_processor_fallback_enabled(&config));
+    }
+
+    #[test]
     fn codex_active_accepts_workspace_scope() {
         let cli = Cli::try_parse_from([
             "agent-feed",
@@ -2683,7 +2696,7 @@ fn signed_capsules(
         .and_then(|publisher| publisher.github_user_id)
         .map(|github_user_id| format!("github:{github_user_id}"))
         .unwrap_or_else(|| "local:codex".to_string());
-    let summaries = summarize_feed(&feed_id, stories, summary_config)?;
+    let summaries = summarize_feed_with_cli_fallback(&feed_id, stories, summary_config)?;
     info!(
         %feed_id,
         stories = stories.len(),
@@ -2706,6 +2719,36 @@ fn signed_capsules(
             Signed::sign_capsule(capsule, "local-codex").map_err(CliError::from)
         })
         .collect()
+}
+
+fn summarize_feed_with_cli_fallback(
+    feed_id: &str,
+    stories: &[CompiledStory],
+    summary_config: &SummaryConfig,
+) -> Result<Vec<agent_feed_summarize::FeedSummary>, CliError> {
+    match summarize_feed(feed_id, stories, summary_config) {
+        Ok(summaries) => Ok(summaries),
+        Err(SummaryError::Processor(error)) if agent_processor_fallback_enabled(summary_config) => {
+            warn!(
+                processor = summary_config.processor.name(),
+                error = %error,
+                "agent summarizer failed; falling back to deterministic redacted summary"
+            );
+            let mut fallback = summary_config.clone();
+            fallback.processor = SummaryProcessorConfig::Deterministic;
+            fallback.image.processor = ImageProcessorConfig::Disabled;
+            fallback.image.enabled = false;
+            summarize_feed(feed_id, stories, &fallback).map_err(CliError::from)
+        }
+        Err(error) => Err(CliError::from(error)),
+    }
+}
+
+fn agent_processor_fallback_enabled(summary_config: &SummaryConfig) -> bool {
+    matches!(
+        summary_config.processor,
+        SummaryProcessorConfig::CodexExec | SummaryProcessorConfig::ClaudeCodeExec
+    )
 }
 
 fn signed_feed_id(feed: &str, publisher: Option<&PublisherIdentity>) -> String {
