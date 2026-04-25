@@ -1207,7 +1207,7 @@ async function startGlobalDiscoveryRoute(route) {
       renderRemoteState(route, "waiting", [
         `network directory found ${feeds.length} feeds`,
         "connected · waiting for first story",
-        "raw events unavailable",
+        "showing settled story streams",
       ]);
       updateSourceCountFromFeeds(feeds);
       return;
@@ -1481,7 +1481,7 @@ async function startFollowingRoute(route) {
   renderRemoteState(route, "resolving", [
     `checking ${targets.length} followed ${targets.length === 1 ? "feed" : "feeds"}`,
     "requesting accessible story snapshots",
-    "raw events unavailable",
+    "showing settled story streams",
   ]);
   const results = await Promise.all(targets.map((target) => fetchFollowingTarget(route, target)));
   const tickets = results.filter((result) => result.ticket).map((result) => result.ticket);
@@ -1733,8 +1733,7 @@ function renderGlobalTimeline(route, snapshot) {
       const title = document.createElement("h2");
       title.textContent = "waiting for published headline";
       const copy = document.createElement("p");
-      copy.textContent =
-        "this feed is visible on the network. settled story capsules will appear without raw events.";
+      copy.textContent = "this feed is visible on the network. settled stories will appear as they publish.";
       card.append(meta, title, copy, timelineStatus(feed, route), timelineActions(feed, route));
       timeline.appendChild(card);
     }
@@ -1866,8 +1865,7 @@ function renderTimeline(route, ticket) {
     const title = document.createElement("h2");
     title.textContent = `waiting for ${feedLabel}`;
     const copy = document.createElement("p");
-    copy.textContent =
-      "settled story capsules will appear here as a vertical feed. raw events remain unavailable.";
+    copy.textContent = "settled stories will appear here as a vertical feed.";
     card.append(meta, title, copy, timelineStatus(feed, route), timelineActions(feed, route));
     timeline.appendChild(card);
   }
