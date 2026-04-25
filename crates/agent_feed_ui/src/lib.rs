@@ -200,6 +200,19 @@ mod tests {
     }
 
     #[test]
+    fn browser_user_route_filters_headlines_without_throwing() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("function headlineMatchesRoute"));
+        assert!(html.contains("const requestedFeeds = requestedFeedLabels(route);"));
+        assert!(html.contains("function requestedFeedLabels"));
+        assert!(html.contains("function headlineFeedLabels"));
+        assert!(html.contains("clean === `${String(login || \"\").replace(/^@/, \"\")}/*`"));
+        assert!(html.contains(".filter((item) => headlineMatchesRoute(item, route))"));
+        assert!(html.contains("params.set(\"streams\", \"all\");"));
+    }
+
+    #[test]
     fn browser_console_logs_feed_lifecycle_events() {
         let html = render_index_with_config(Some("remote"), &config(true));
 

@@ -1660,6 +1660,75 @@ function remoteHeadlineToBulletin(route, item, index) {
   };
 }
 
+function headlineMatchesRoute(item, route) {
+  if (!item || !route) {
+    return false;
+  }
+  if (route.kind === "global") {
+    return true;
+  }
+  const expectedLogin = normalizeRouteLogin(route.login);
+  const publisherLogin = normalizeRouteLogin(publisherLoginFromHeadline(item));
+  if (expectedLogin && publisherLogin && expectedLogin !== publisherLogin) {
+    return false;
+  }
+  const requestedFeeds = requestedFeedLabels(route);
+  if (!requestedFeeds.length) {
+    return true;
+  }
+  const headlineFeeds = headlineFeedLabels(item);
+  return requestedFeeds.some((feed) => headlineFeeds.includes(feed));
+}
+
+function normalizeRouteLogin(value) {
+  return String(value || "").replace(/^@/, "").toLowerCase();
+}
+
+function requestedFeedLabels(route) {
+  if (route.feed && route.feed !== "*") {
+    return [normalizeFeedLabel(route.feed)];
+  }
+  const params = new URLSearchParams(route.query || "");
+  const streams = params.get("streams") || "";
+  if (!streams || matchesWildcardStream(streams, route.login)) {
+    return [];
+  }
+  return streams
+    .split(",")
+    .map((value) => value.trim().replace(/^@/, ""))
+    .map((value) => (value.includes("/") ? value.split("/").pop() : value))
+    .map(normalizeFeedLabel)
+    .filter(Boolean);
+}
+
+function matchesWildcardStream(value, login) {
+  const clean = String(value || "").trim().replace(/^@/, "");
+  return (
+    clean === "all" ||
+    clean === "*" ||
+    clean === `${String(login || "").replace(/^@/, "")}/*`
+  );
+}
+
+function headlineFeedLabels(item) {
+  const labels = [
+    item.feed_label,
+    item.label,
+    item.stream_label,
+    item.stream_id,
+    item.feed?.label,
+  ];
+  const feedId = String(item.feed_id || item.feedId || "");
+  if (feedId.includes(":")) {
+    labels.push(feedId.split(":").pop());
+  }
+  return labels.map(normalizeFeedLabel).filter(Boolean);
+}
+
+function normalizeFeedLabel(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 function publisherLoginFromHeadline(item) {
   const value =
     item.publisher_login ||
