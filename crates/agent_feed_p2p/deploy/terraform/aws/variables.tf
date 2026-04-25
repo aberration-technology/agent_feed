@@ -34,7 +34,7 @@ variable "tls_contact_email" {
 }
 
 variable "browser_app_base_url" {
-  description = "Public GitHub Pages browser shell base URL."
+  description = "Public browser shell base URL."
   type        = string
   default     = "https://feed.aberration.technology"
 }
@@ -46,7 +46,7 @@ variable "edge_domain_name" {
 }
 
 variable "browser_app_pages_domain_target" {
-  description = "GitHub Pages origin host used by the edge to fetch the browser shell."
+  description = "GitHub Pages origin host used by Caddy to fetch the browser shell."
   type        = string
   default     = "aberration-technology.github.io"
 }

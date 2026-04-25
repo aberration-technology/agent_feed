@@ -9,7 +9,7 @@ output "browser_app_url" {
 }
 
 output "browser_app_hostname" {
-  description = "GitHub Pages custom hostname."
+  description = "Public browser shell hostname."
   value       = local.browser_app_hostname_normalized
 }
 

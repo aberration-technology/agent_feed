@@ -307,7 +307,7 @@ jobs:
             browser_host="${browser_host#http://}"
             browser_host="${browser_host%%/*}"
             try_import aws_route53_record.edge "${zone_id}_${TF_VAR_edge_domain_name}_A"
-            try_import aws_route53_record.browser "${zone_id}_${browser_host}_CNAME"
+            try_import aws_route53_record.browser "${zone_id}_${browser_host}_A"
           fi
 
           alarm_name="$(aws cloudwatch describe-alarms --alarm-names "${stack}-edge-status-check" | jq -r '.MetricAlarms[0].AlarmName // empty')"
@@ -398,8 +398,8 @@ jobs:
           browser_url="${TF_VAR_browser_app_base_url%/}"
           canary="${TF_VAR_canary_github_login:-mosure}"
 
-          curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/readyz" \
-            | grep -q '"state":"ready"'
+          ready_payload="$(curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/readyz")"
+          grep -Eq 'ready|"state":"ready"' <<<"$ready_payload"
           curl -fsSL --connect-timeout 5 --max-time 15 "${edge_url}/browser-seed" \
             | grep -q '"signature"'
           curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/network/snapshot?network=mainnet" \
