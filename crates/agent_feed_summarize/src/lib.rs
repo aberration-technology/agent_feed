@@ -191,7 +191,7 @@ const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
     r"(?i)\bno policy or omission text\b[\s.,;:]*",
 ];
 
-pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; terse contextual headline; strong verb/object/outcome; no dashboard copy; no policy or omission text; no raw logs";
+pub const DEFAULT_SUMMARY_PROMPT_STYLE: &str = "austere technical broadcast; lowercase; terse contextual headline; strong verb/object/outcome; plain work language; no milestone labels; no production/scaffold/gate/test-line metaphors; no dashboard copy; no policy or omission text; no raw logs";
 pub const DEFAULT_SUMMARY_PROMPT_MAX_CHARS: usize = 3000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1577,6 +1577,7 @@ fn build_summary(
             violations,
         },
     };
+    polish_public_summary(&mut summary);
     fit_capsule_budget(&mut summary, budget, guardrails)?;
     if processor_publish == Some(false)
         && config.publish.allow_processor_skip
@@ -1633,6 +1634,85 @@ fn fit_capsule_budget(
         summary.deck = "settled story activity reached the feed.".to_string();
     }
     Ok(())
+}
+
+fn polish_public_summary(summary: &mut FeedSummary) {
+    summary.headline = polish_public_copy(&summary.headline);
+    summary.deck = ensure_terminal_sentence(&polish_public_copy(&summary.deck));
+    summary.lower_third = polish_public_copy(&summary.lower_third);
+    summary.chips = summary
+        .chips
+        .iter()
+        .map(|chip| polish_public_copy(chip))
+        .filter(|chip| !chip.trim().is_empty())
+        .fold(Vec::<String>::new(), |mut chips, chip| {
+            if !chips.iter().any(|existing| existing == &chip) {
+                chips.push(chip);
+            }
+            chips
+        });
+    if summary.chips.is_empty() {
+        summary.chips.push("redacted".to_string());
+    }
+}
+
+fn polish_public_copy(input: &str) -> String {
+    let mut output = input.trim().to_string();
+    for (pattern, replacement) in PUBLIC_COPY_REPLACEMENTS {
+        output = Regex::new(pattern)
+            .expect("public copy replacement pattern is valid")
+            .replace_all(&output, *replacement)
+            .to_string();
+    }
+    output = Regex::new(r"\s+")
+        .expect("space regex is valid")
+        .replace_all(&output, " ")
+        .trim()
+        .trim_matches(['.', ',', ';', ':', '-'])
+        .trim()
+        .to_string();
+    output = output
+        .replace(" ;", ";")
+        .replace("; ;", ";")
+        .replace(" .", ".")
+        .replace(" ,", ",");
+    lower_known_agent_prefix(&output)
+}
+
+const PUBLIC_COPY_REPLACEMENTS: &[(&str, &str)] = &[
+    (r"(?i)\bproduction scaffold\b", "feed implementation"),
+    (r"(?i)\bproduction flow\b", "feed publishing"),
+    (r"(?i)\bagent feed scaffold\b", "agent feed implementation"),
+    (r"(?i)\bscaffold\b", "implementation"),
+    (r"(?i)\bfixture-driven\b", "mock"),
+    (r"(?i)\bfixture events\b", "mock events"),
+    (r"(?i)\bm[0-9]+(?:\.[0-9]+)?\s+signal path\b", "signal path"),
+    (r"(?i)\bm[0-9]+(?:\.[0-9]+)?\b", ""),
+    (r"(?i)\btest gate stays red\b", "tests are still failing"),
+    (r"(?i)\btest line remains red\b", "tests are still failing"),
+    (r"(?i)\btests?\s+red\b", "tests failing"),
+    (r"(?i)\bcurrent public outcome remains\b", ""),
+    (r"(?i)\bmoved forward\b", "changed"),
+    (r"(?i)\badvanced across the feed\b", "changed"),
+    (r"(?i)\bresponse-body\b", "response body"),
+    (r"(?i)\bverification s\b", "verification"),
+];
+
+fn ensure_terminal_sentence(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.ends_with(['.', '!', '?']) {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}.")
+}
+
+fn lower_known_agent_prefix(input: &str) -> String {
+    for agent in ["Codex", "Claude"] {
+        if let Some(rest) = input.strip_prefix(agent) {
+            return format!("{}{}", agent.to_ascii_lowercase(), rest);
+        }
+    }
+    input.to_string()
 }
 
 fn strip_prompt_leakage(input: &str) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
@@ -1819,6 +1899,9 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
     let headline = normalize_text(&summary.headline);
     let deck = normalize_text(&summary.deck);
     let combined = format!("{headline} {deck}");
+    if public_copy_has_banned_terms(&combined) {
+        return true;
+    }
     [
         "feed activity settled",
         "activity settled",
@@ -1838,6 +1921,26 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
             && !combined.contains("test")
             && !combined.contains("verified")
             && !combined.contains("complete"))
+}
+
+fn public_copy_has_banned_terms(normalized: &str) -> bool {
+    [
+        "production scaffold",
+        "production flow",
+        "agent feed scaffold",
+        "test gate",
+        "test line",
+        "fixture-driven",
+        "fixture events",
+        "moved forward",
+        "advanced across the feed",
+        "verification s",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+        || Regex::new(r"\bm[0-9]+(?:\.[0-9]+)?\b")
+            .expect("milestone regex is valid")
+            .is_match(normalized)
 }
 
 #[must_use]
@@ -2808,6 +2911,60 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(!summaries[0].headline.contains("alice@example.com"));
         assert!(!summaries[0].headline.contains("secret_repo"));
         assert!(!summaries[0].chips.iter().any(|chip| chip.contains('@')));
+    }
+
+    struct UglyPublicCopyProcessor;
+
+    impl SummaryProcessor for UglyPublicCopyProcessor {
+        fn name(&self) -> &str {
+            "ugly-public-copy"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "Codex advances production scaffold; test gate stays red".to_string(),
+                deck: "Production scaffold, m0 signal path, real stream handling, summarization, capsule tests, error logging, and response-body delivery were implemented across the feed work. Tests still report failures despite one passing verification s.".to_string(),
+                lower_third: Some("@mosure / workstation".to_string()),
+                chips: vec![
+                    "production scaffold".to_string(),
+                    "m0 signal path".to_string(),
+                    "tests red".to_string(),
+                ],
+                publish: None,
+                publish_reason: None,
+                memory_digest: None,
+                semantic_fingerprint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn processor_public_copy_is_polished_before_publish() {
+        let summaries = summarize_feed_with_processor(
+            "github:35904762:workstation",
+            &[verified_story(92)],
+            &SummaryConfig::p2p_default(),
+            &UglyPublicCopyProcessor,
+        )
+        .expect("ugly processor output is polished");
+
+        assert_eq!(
+            summaries[0].headline,
+            "codex advances feed implementation; tests are still failing"
+        );
+        let display = format!(
+            "{} {} {}",
+            summaries[0].headline,
+            summaries[0].deck,
+            summaries[0].chips.join(" ")
+        )
+        .to_ascii_lowercase();
+        assert!(!display.contains("production scaffold"));
+        assert!(!display.contains("m0"));
+        assert!(!display.contains("test gate"));
+        assert!(!display.contains("test line"));
+        assert!(!display.contains("verification s"));
+        assert!(summaries[0].deck.ends_with('.'));
     }
 
     struct LeakyPromptProcessor;

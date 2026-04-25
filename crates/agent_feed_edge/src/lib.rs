@@ -701,7 +701,13 @@ impl SnapshotStore {
     fn headlines(&self) -> Vec<RemoteHeadlineView> {
         self.headlines
             .lock()
-            .map(|headlines| headlines.iter().cloned().collect())
+            .map(|headlines| {
+                headlines
+                    .iter()
+                    .filter(|headline| public_headline_is_visible(headline))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -709,7 +715,13 @@ impl SnapshotStore {
         let mut feeds = self
             .feeds
             .lock()
-            .map(|feeds| feeds.iter().cloned().collect::<Vec<_>>())
+            .map(|feeds| {
+                feeds
+                    .iter()
+                    .filter(|feed| public_feed_is_visible(feed))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         merge_resolve_feed_views(&mut feeds, feed_views_from_headlines(self.headlines()));
         feeds
@@ -1416,7 +1428,9 @@ fn headline_matches_github_route(
     let identity_matches = headline.publisher_github_user_id == Some(github_user_id)
         || (headline.publisher_github_user_id.is_none()
             && headline.publisher_login.eq_ignore_ascii_case(github_login));
-    identity_matches && route.stream_filter.permits_label(&headline.feed_label)
+    identity_matches
+        && public_headline_is_visible(headline)
+        && route.stream_filter.permits_label(&headline.feed_label)
 }
 
 fn feed_matches_github_route(
@@ -1427,7 +1441,37 @@ fn feed_matches_github_route(
 ) -> bool {
     let identity_matches = feed.publisher_github_user_id == Some(github_user_id)
         || feed.publisher_login.eq_ignore_ascii_case(github_login);
-    identity_matches && route.stream_filter.permits_label(&feed.label)
+    identity_matches
+        && public_feed_is_visible(feed)
+        && route.stream_filter.permits_label(&feed.label)
+}
+
+fn public_feed_is_visible(feed: &ResolveFeedView) -> bool {
+    !feed.feed_id.starts_with("local:")
+}
+
+fn public_headline_is_visible(headline: &RemoteHeadlineView) -> bool {
+    !headline.feed_id.starts_with("local:")
+        && !remote_copy_has_public_quality_issue(&format!(
+            "{} {} {}",
+            headline.headline,
+            headline.deck,
+            headline.chips.join(" ")
+        ))
+}
+
+fn remote_copy_has_public_quality_issue(copy: &str) -> bool {
+    let normalized = copy.to_ascii_lowercase();
+    [
+        "production scaffold",
+        "agent feed scaffold",
+        "test gate",
+        "test line",
+        "m0 signal path",
+        "verification s",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serde_json::Value {
@@ -2163,7 +2207,7 @@ mod tests {
     fn network_snapshot_store_dedupes_and_exposes_headlines() {
         let store = SnapshotStore::default();
         let headline = RemoteHeadlineView {
-            feed_id: "local:workstation".to_string(),
+            feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
             publisher_github_user_id: Some(123),
@@ -2205,10 +2249,53 @@ mod tests {
     }
 
     #[test]
+    fn network_snapshot_hides_local_and_bad_public_copy() {
+        let store = SnapshotStore::default();
+        let base = RemoteHeadlineView {
+            feed_id: "github:123:workstation".to_string(),
+            feed_label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            verified: true,
+            headline: "codex finished release pass".to_string(),
+            deck: "settled story capsule reached the edge.".to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["verified".to_string(), "codex".to_string()],
+            image: None,
+        };
+        let mut local = base.clone();
+        local.feed_id = "local:workstation".to_string();
+        let mut bad = base.clone();
+        bad.headline = "Codex advances production scaffold; test gate stays red".to_string();
+
+        store.push(local);
+        store.push(bad);
+        store.push(base);
+        let snapshot = network_snapshot_value(&config(), &store);
+
+        let headlines = snapshot["headlines"].as_array().expect("headlines");
+        assert_eq!(headlines.len(), 1);
+        assert_eq!(
+            headlines[0]["headline"],
+            serde_json::json!("codex finished release pass")
+        );
+        let feeds = snapshot["feeds"].as_array().expect("feeds");
+        assert!(feeds.iter().all(|feed| {
+            !feed["feed_id"]
+                .as_str()
+                .expect("feed id")
+                .starts_with("local:")
+        }));
+    }
+
+    #[test]
     fn network_snapshot_store_exposes_feed_presence_before_headline() {
         let store = SnapshotStore::default();
         store.upsert_feed(ResolveFeedView {
-            feed_id: "local:workstation".to_string(),
+            feed_id: "github:123:workstation".to_string(),
             label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
             visibility: "public".to_string(),
@@ -2289,7 +2376,7 @@ mod tests {
     fn github_route_headline_filter_uses_stable_id_and_stream_label() {
         let route = RemoteUserRoute::parse("/mosure/workstation", None).expect("route parses");
         let matching = RemoteHeadlineView {
-            feed_id: "local:workstation".to_string(),
+            feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
             publisher_github_user_id: Some(123),
