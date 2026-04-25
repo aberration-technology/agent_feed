@@ -169,6 +169,7 @@ pub struct GuardrailViolation {
 }
 
 const PROMPT_LEAKAGE_VIOLATION: &str = "prompt-leakage";
+const SUMMARY_QUALITY_VIOLATION: &str = "summary-quality";
 
 const PROMPT_LEAKAGE_PATTERNS: &[&str] = &[
     r"(?i)\braw\s+prompts?,\s*command output,\s*diffs?,\s*paths?,\s*(?:and\s+)?repo names?\s+omitted\b[\s.,;:]*",
@@ -1277,7 +1278,6 @@ fn build_summary(
         "feed-rollup".to_string()
     };
 
-    let headline_fingerprint = headline_fingerprint(&headline);
     let mut summary = FeedSummary {
         story_window,
         source_agent_kinds,
@@ -1298,7 +1298,7 @@ fn build_summary(
             publish_action: PublishAction::Publish,
             publish_reason: processor_publish_reason
                 .unwrap_or_else(|| "local publish policy accepted the summary".to_string()),
-            headline_fingerprint,
+            headline_fingerprint: String::new(),
             max_headline_similarity: 0,
             max_deck_similarity: 0,
             guardrail_version: guardrails.version,
@@ -1312,6 +1312,7 @@ fn build_summary(
             violations,
         },
     };
+    repair_low_quality_summary(&mut summary, request, config)?;
     fit_capsule_budget(&mut summary, budget, guardrails)?;
     if processor_publish == Some(false)
         && config.publish.allow_processor_skip
@@ -1325,9 +1326,207 @@ fn build_summary(
                 "processor reported no meaningful feed change".to_string();
         }
     }
+    summary.metadata.headline_fingerprint = headline_fingerprint(&summary.headline);
     summary.metadata.output_chars =
         summary.headline.len() + summary.deck.len() + summary.lower_third.len();
     Ok(summary)
+}
+
+fn repair_low_quality_summary(
+    summary: &mut FeedSummary,
+    request: &SummaryRequest,
+    config: &SummaryConfig,
+) -> Result<(), SummaryError> {
+    let mut repaired = false;
+
+    if weak_headline(&summary.headline, request) {
+        let (fallback, violations) = clean_and_clamp(
+            &quality_fallback_headline(request),
+            config.budget.max_headline_chars,
+            &config.guardrails,
+        )?;
+        summary.metadata.violations.extend(violations);
+        if !fallback.is_empty() {
+            summary.headline = fallback;
+        }
+        repaired = true;
+    }
+
+    if weak_deck(&summary.deck) {
+        let (fallback, violations) = clean_and_clamp(
+            &quality_fallback_deck(request),
+            config.budget.max_deck_chars,
+            &config.guardrails,
+        )?;
+        summary.metadata.violations.extend(violations);
+        if !fallback.is_empty() {
+            summary.deck = fallback;
+        }
+        repaired = true;
+    }
+
+    if contains_placeholder_or_policy_copy(&summary.lower_third) {
+        summary.lower_third = "feed · redacted".to_string();
+        repaired = true;
+    }
+
+    let before_chips = summary.chips.len();
+    summary
+        .chips
+        .retain(|chip| !contains_placeholder_or_policy_copy(chip));
+    if summary.chips.len() != before_chips {
+        repaired = true;
+    }
+    if summary.chips.is_empty() {
+        summary.chips.push("redacted".to_string());
+        repaired = true;
+    }
+
+    if repaired {
+        push_summary_quality_violation(&mut summary.metadata.violations);
+    }
+    Ok(())
+}
+
+fn push_summary_quality_violation(violations: &mut Vec<GuardrailViolation>) {
+    if violations
+        .iter()
+        .any(|violation| violation.name == SUMMARY_QUALITY_VIOLATION)
+    {
+        return;
+    }
+    violations.push(GuardrailViolation {
+        name: SUMMARY_QUALITY_VIOLATION.to_string(),
+        action: GuardrailAction::Mask,
+    });
+}
+
+fn weak_headline(headline: &str, request: &SummaryRequest) -> bool {
+    if contains_placeholder_or_policy_copy(headline) {
+        return true;
+    }
+    let normalized = normalize_text(headline);
+    if normalized.is_empty() {
+        return true;
+    }
+    if request.stories.len() == 1 {
+        let story = &request.stories[0];
+        return normalized == "feed activity settled"
+            || normalized == format!("{} activity settled", normalize_text(&story.agent))
+            || (story.family == StoryFamily::Incident
+                && (normalized.contains("hit project command")
+                    || normalized.ends_with("hit command")
+                    || normalized.ends_with("incident settled")));
+    }
+    false
+}
+
+fn weak_deck(deck: &str) -> bool {
+    if contains_placeholder_or_policy_copy(deck) {
+        return true;
+    }
+    matches!(
+        normalize_text(deck).as_str(),
+        "" | "1 tool failures" | "one tool failures"
+    )
+}
+
+fn contains_placeholder_or_policy_copy(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("[project]")
+        || lower.contains("raw detail omitted")
+        || lower.contains("raw details omitted")
+        || lower.contains("raw output omitted")
+        || lower.contains("raw prompt")
+        || lower.contains("command output")
+        || lower.contains("repo names omitted")
+        || lower.contains("policy/omission")
+        || lower.contains("do not include")
+        || lower.contains("redacted story facts")
+        || lower.contains("use only the redacted")
+}
+
+fn quality_fallback_headline(request: &SummaryRequest) -> String {
+    if request.stories.len() != 1 {
+        return fallback_headline(request);
+    }
+    let story = &request.stories[0];
+    let agent = story.agent.as_str();
+    let display = format!("{} {}", story.headline, story.deck).to_ascii_lowercase();
+    match story.family {
+        StoryFamily::Incident => {
+            if display.contains("test command failed") {
+                format!("{agent} test command failed")
+            } else if display.contains("build command failed") {
+                format!("{agent} build command failed")
+            } else if display.contains("vcs command failed") {
+                format!("{agent} vcs command failed")
+            } else if display.contains("shell command failed") {
+                format!("{agent} shell command failed")
+            } else if display.contains("task command failed") {
+                format!("{agent} task command failed")
+            } else {
+                format!("{agent} hit a tool failure")
+            }
+        }
+        StoryFamily::Test => {
+            if display.contains("fail")
+                || matches!(story.severity, Severity::Warning | Severity::Critical)
+            {
+                format!("{agent} found failing tests")
+            } else {
+                format!("{agent} verified tests")
+            }
+        }
+        StoryFamily::Permission => format!("{agent} hit a permission boundary"),
+        StoryFamily::Command => format!("{agent} completed command work"),
+        StoryFamily::FileChange => format!("{agent} changed files"),
+        StoryFamily::Mcp => format!("{agent} saw mcp degradation"),
+        StoryFamily::Plan => format!("{agent} updated the plan"),
+        StoryFamily::Turn => format!("{agent} completed a turn"),
+        StoryFamily::IdleRecap => format!("{agent} activity settled"),
+    }
+}
+
+fn quality_fallback_deck(request: &SummaryRequest) -> String {
+    if request.stories.len() != 1 {
+        return fallback_deck(request);
+    }
+    let story = &request.stories[0];
+    let display = format!("{} {}", story.headline, story.deck).to_ascii_lowercase();
+    match story.family {
+        StoryFamily::Incident => {
+            if display.contains("test command failed") {
+                "test command failed.".to_string()
+            } else if display.contains("build command failed") {
+                "build command failed.".to_string()
+            } else if display.contains("vcs command failed") {
+                "vcs command failed.".to_string()
+            } else if display.contains("shell command failed") {
+                "shell command failed.".to_string()
+            } else if display.contains("task command failed") {
+                "task command failed.".to_string()
+            } else {
+                "tool failed during the turn.".to_string()
+            }
+        }
+        StoryFamily::Test => {
+            if display.contains("fail")
+                || matches!(story.severity, Severity::Warning | Severity::Critical)
+            {
+                "tests need attention.".to_string()
+            } else {
+                "tests passed.".to_string()
+            }
+        }
+        StoryFamily::Permission => "permission boundary reached.".to_string(),
+        StoryFamily::Command => "command activity settled.".to_string(),
+        StoryFamily::FileChange => "file changes settled.".to_string(),
+        StoryFamily::Mcp => "mcp degraded during the turn.".to_string(),
+        StoryFamily::Plan => "plan changed.".to_string(),
+        StoryFamily::Turn => "turn completed.".to_string(),
+        StoryFamily::IdleRecap => "feed activity settled.".to_string(),
+    }
 }
 
 fn clean_and_clamp(
@@ -1513,17 +1712,25 @@ fn apply_publish_decision(
     summary.metadata.max_deck_similarity = nearest_deck;
     summary.metadata.headline_fingerprint = headline_fingerprint(&summary.headline);
 
-    if summary.score >= policy.severe_score_bypass {
-        summary.metadata.publish_action = PublishAction::Publish;
-        summary.metadata.publish_reason =
-            "high-severity summary bypassed duplicate suppression".to_string();
-        return true;
-    }
-
     let duplicate = nearest.is_some()
         && nearest_headline >= policy.max_headline_similarity
         && (nearest_headline == 100
             || nearest_deck >= policy.max_deck_similarity_when_headline_matches);
+    let exact_duplicate = duplicate && nearest_headline == 100 && nearest_deck == 100;
+    if exact_duplicate {
+        summary.metadata.publish_action = PublishAction::SkipDuplicate;
+        summary.metadata.publish_reason =
+            "headline exactly matched a recent published summary".to_string();
+        return false;
+    }
+
+    if summary.score >= policy.severe_score_bypass {
+        summary.metadata.publish_action = PublishAction::Publish;
+        summary.metadata.publish_reason =
+            "high-severity summary bypassed fuzzy duplicate suppression".to_string();
+        return true;
+    }
+
     if duplicate {
         summary.metadata.publish_action = PublishAction::SkipDuplicate;
         summary.metadata.publish_reason = format!(
@@ -2169,6 +2376,109 @@ mod tests {
                 .iter()
                 .any(|violation| violation.name == PROMPT_LEAKAGE_VIOLATION)
         );
+    }
+
+    fn weak_incident_story() -> CompiledStory {
+        let mut incident = story("codex hit secret_repo command", 92);
+        incident.family = StoryFamily::Incident;
+        incident.headline = "codex hit [project] command".to_string();
+        incident.deck = "1 tool failures.".to_string();
+        incident.score = 92;
+        incident.severity = Severity::Warning;
+        incident
+    }
+
+    #[test]
+    fn deterministic_summary_repairs_project_command_incident() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let stories = vec![weak_incident_story()];
+
+        let summaries =
+            summarize_feed("local:workstation", &stories, &config).expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        let display = format!("{} {}", summary.headline, summary.deck);
+        assert_eq!(summary.headline, "codex hit a tool failure");
+        assert_eq!(summary.deck, "tool failed during the turn.");
+        assert!(!display.contains("[project]"));
+        assert!(!display.contains("1 tool failures"));
+        assert!(
+            summary
+                .metadata
+                .violations
+                .iter()
+                .any(|violation| violation.name == SUMMARY_QUALITY_VIOLATION)
+        );
+    }
+
+    struct PlaceholderIncidentProcessor;
+
+    impl SummaryProcessor for PlaceholderIncidentProcessor {
+        fn name(&self) -> &str {
+            "placeholder-incident"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "codex hit [project] command".to_string(),
+                deck: "1 tool failures.".to_string(),
+                lower_third: Some("codex · [project] · incident".to_string()),
+                chips: vec!["[project]".to_string(), "redacted".to_string()],
+                publish: None,
+                publish_reason: None,
+            })
+        }
+    }
+
+    #[test]
+    fn external_processor_placeholder_output_is_repaired() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let stories = vec![weak_incident_story()];
+
+        let summaries = summarize_feed_with_processor(
+            "local:workstation",
+            &stories,
+            &config,
+            &PlaceholderIncidentProcessor,
+        )
+        .expect("processor output is repaired");
+
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        let display = format!(
+            "{} {} {} {}",
+            summary.headline,
+            summary.deck,
+            summary.lower_third,
+            summary.chips.join(" ")
+        );
+        assert!(!display.contains("[project]"));
+        assert!(!display.contains("1 tool failures"));
+        assert_eq!(summary.lower_third, "feed · redacted");
+        assert_eq!(summary.chips, vec!["redacted"]);
+    }
+
+    #[test]
+    fn severe_exact_duplicate_summary_is_still_skipped() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let first_story = weak_incident_story();
+        let first = summarize_feed(
+            "local:workstation",
+            std::slice::from_ref(&first_story),
+            &config,
+        )
+        .expect("first summary compiles");
+
+        let recent = vec![RecentSummary::from(&first[0])];
+        let second =
+            summarize_feed_with_recent("local:workstation", &[first_story], &config, &recent)
+                .expect("second summary compiles");
+
+        assert!(second.is_empty());
     }
 
     struct DecliningProcessor;

@@ -67,7 +67,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_cli"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "agent_feed_adapters",
  "agent_feed_auth_github",
@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_story"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "agent_feed_core",
  "agent_feed_highlight",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "agent_feed_summarize"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "agent_feed_core",
  "agent_feed_story",
