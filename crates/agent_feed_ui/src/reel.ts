@@ -25,9 +25,10 @@ let activeIndex = 0;
 let dwellTimer = undefined;
 let controlsTimer = undefined;
 
+const FEED_COMPATIBILITY = window.FEED_COMPATIBILITY || {};
 const FEED_PROTOCOL_VERSION = 1;
-const FEED_MODEL_VERSION = 2;
-const FEED_MIN_MODEL_VERSION = 2;
+const FEED_MODEL_VERSION = Number(FEED_COMPATIBILITY.model_version ?? FEED_COMPATIBILITY.modelVersion ?? 3);
+const FEED_MIN_MODEL_VERSION = Number(FEED_COMPATIBILITY.min_model_version ?? FEED_COMPATIBILITY.minModelVersion ?? 3);
 
 const githubAuthCallback = parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
