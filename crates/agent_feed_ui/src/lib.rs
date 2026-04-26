@@ -353,11 +353,9 @@ mod tests {
 
         assert!(!html.contains("id=\"mode-local\""));
         assert!(!html.contains("http://127.0.0.1:7777/reel"));
-        assert!(
-            html.contains(
-                "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : `${route.login}/*`;"
-            )
-        );
+        assert!(html.contains(
+            "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : \"feeds\";"
+        ));
         assert!(html.contains("params.set(\"all\", \"true\");"));
         assert!(
             html.contains("[\"discovery\", \"discover\", \"hero\", \"public\"].includes(explicit)")
@@ -365,6 +363,10 @@ mod tests {
         assert!(html.contains("hosted feed pages do not link to loopback reels"));
         assert!(html.contains("modeFollowing.textContent = \"following\";"));
         assert!(html.contains("timelineModeLink(route, \"following\", \"following\""));
+        assert!(html.contains("return `${login}/*`;"));
+        assert!(html.contains("link.dataset.kind = \"mode\";"));
+        assert!(html.contains("link.dataset.kind = \"feed\";"));
+        assert!(html.contains(".timeline-feeds a[data-kind=\"mode\"]"));
     }
 
     #[test]

@@ -492,12 +492,21 @@ body.controls-visible .stage-actions,
   text-decoration: none;
 }
 
+.timeline-feeds a[data-kind="mode"] {
+  border-color: transparent;
+  color: color-mix(in srgb, var(--muted), transparent 18%);
+}
+
 .timeline-feeds a:hover,
 .timeline-feeds a[aria-current],
 .timeline-feeds a:focus-visible {
   border-color: var(--accent);
   color: var(--accent);
   outline: none;
+}
+
+.timeline-feeds a[data-kind="mode"][aria-current] {
+  border-color: rgba(216, 124, 124, 0.28);
 }
 
 .timeline-card {

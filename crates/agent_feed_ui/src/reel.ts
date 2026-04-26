@@ -438,9 +438,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   renderChips([
     route.feedMode === "following"
       ? "following"
-      : route.kind === "global"
-        ? "discover"
-        : "selected",
+      : routeDisplayMode(route),
     route.network,
     state === "version-mismatch" ? "version" : "redacted",
   ]);
@@ -1056,7 +1054,7 @@ function routeFeedMode(params, scope = "user") {
       message: "per-user discovery is represented by user/* wildcard routes",
     });
   }
-  return "selected";
+  return "discovery";
 }
 
 function routeFollowingTargets(login, params) {
@@ -1186,7 +1184,7 @@ function routeSelection(login, params) {
   if (streams && !streams.includes(",")) {
     return `${login}/${streams}`;
   }
-  return login;
+  return `${login}/*`;
 }
 
 function p2pEnabled() {
@@ -1198,7 +1196,7 @@ function setupModeSwitcher(route) {
     hideModeSwitcher();
     return;
   }
-  modeDiscovery.textContent = route.kind === "global" ? "discover" : `${route.login}/*`;
+  modeDiscovery.textContent = route.kind === "global" ? "discover" : "feeds";
   modeFollowing.textContent = "following";
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
   modeFollowing.setAttribute("href", modeUrl(route, "following"));
@@ -2400,6 +2398,7 @@ function timelineModeLink(route, mode, label, current = false) {
   const link = document.createElement("a");
   link.href = modeUrl(route, mode);
   link.textContent = label;
+  link.dataset.kind = "mode";
   if (current) {
     link.setAttribute("aria-current", "page");
   }
@@ -2460,8 +2459,6 @@ function renderTimeline(route, ticket) {
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
-  nav.appendChild(timelineModeLink(route, "discovery", "discover", route.feedMode !== "following"));
-  nav.appendChild(timelineModeLink(route, "following", "following", route.feedMode === "following"));
   nav.appendChild(
     feedLink(route.login, "*", "all feeds", !route.feed || route.feed === "*"),
   );
@@ -2469,6 +2466,7 @@ function renderTimeline(route, ticket) {
     const feedLabel = feed.label || feed.feed_label || "feed";
     nav.appendChild(feedLink(route.login, feedLabel, feedLabel, route.feed === feedLabel));
   }
+  nav.appendChild(timelineModeLink(route, "following", "following", false));
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
 
@@ -2573,8 +2571,8 @@ function renderFollowingTimeline(route, targets, results) {
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
-  nav.appendChild(timelineModeLink(route, "discovery", "discover", false));
   nav.appendChild(timelineModeLink(route, "following", "following", true));
+  nav.appendChild(timelineModeLink(route, "discovery", route.kind === "user" ? "feeds" : "discover", false));
   for (const target of targets) {
     const link = document.createElement("a");
     link.href = followingTargetUrl(target);
@@ -2645,6 +2643,14 @@ function followingTargetUrl(target) {
   const clean = target.replace(/^@/, "");
   const [login, feed = "*"] = clean.split("/");
   return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=following&view=timeline&following=${encodeURIComponent(target)}`;
+}
+
+function userFeedPath(login, label) {
+  const cleanLogin = encodeURIComponent(login);
+  if (!label || label === "*") {
+    return `/${cleanLogin}/*`;
+  }
+  return `/${cleanLogin}/${encodeURIComponent(label)}`;
 }
 
 function timelineActions(feed, route) {
@@ -2784,8 +2790,9 @@ function requestAccessButton(target) {
 
 function feedLink(login, label, text, current = false) {
   const link = document.createElement("a");
-  link.href = `/${encodeURIComponent(login)}/${encodeURIComponent(label)}?view=timeline`;
+  link.href = `${userFeedPath(login, label)}?view=timeline`;
   link.textContent = text;
+  link.dataset.kind = "feed";
   if (current) {
     link.setAttribute("aria-current", "page");
   }
