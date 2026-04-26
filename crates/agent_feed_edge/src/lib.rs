@@ -883,6 +883,8 @@ fn fabric_probe_payload(edge: &EdgeConfig, transport: &str) -> String {
         "transport": transport,
         "network_id": edge.network_id,
         "edge": edge.edge_domain,
+        "bootstrap_topology": "single_bootstrap",
+        "data_plane": "edge_snapshot_fallback",
         "state": "ready"
     })
     .to_string()
@@ -914,6 +916,8 @@ async fn readyz() -> Json<serde_json::Value> {
         "model_version": agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
         "min_model_version": agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION,
         "release_version": agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION,
+        "bootstrap_topology": "single_bootstrap",
+        "data_plane": "edge_snapshot_fallback",
     }))
 }
 
@@ -1551,6 +1555,8 @@ fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serd
         "edge_base_url": config.edge_domain,
         "browser_app_base_url": config.browser_app_base_url,
         "bootstrap_peers": config.bootstrap_peers,
+        "bootstrap_topology": "single_bootstrap",
+        "data_plane": "edge_snapshot_fallback",
         "feed_mode": "discovery",
         "story_only": true,
         "raw_events": false,

@@ -11,6 +11,366 @@ use agent_feed_summarize::headline_similarity;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+pub const MAINNET_NETWORK_ID: &str = "agent-feed-mainnet";
+pub const MAINNET_EDGE_HOST: &str = "api.feed.aberration.technology";
+pub const MAINNET_EDGE_BASE_URL: &str = "https://api.feed.aberration.technology";
+pub const MAINNET_P2P_PORT: u16 = 7747;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EdgeFallbackMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl EdgeFallbackMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    #[must_use]
+    pub fn allows_edge_publish(self) -> bool {
+        matches!(self, Self::Auto | Self::On)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum P2pDataPlane {
+    #[default]
+    EdgeSnapshotFallback,
+    NativeLibp2p,
+    BrowserLibp2p,
+}
+
+impl P2pDataPlane {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EdgeSnapshotFallback => "edge_snapshot_fallback",
+            Self::NativeLibp2p => "native_libp2p",
+            Self::BrowserLibp2p => "browser_libp2p",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BootstrapTopology {
+    #[default]
+    SingleBootstrap,
+    MultiBootstrap,
+}
+
+impl BootstrapTopology {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleBootstrap => "single_bootstrap",
+            Self::MultiBootstrap => "multi_bootstrap",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P2pCommandKind {
+    JoinNetwork,
+    PublishDirectoryEntry,
+    PublishCapsule,
+    FollowFeed,
+    RequestSnapshot,
+    RegisterRendezvous,
+    ProvideFeed,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum P2pEventKind {
+    Ready,
+    PeerDiscovered,
+    DirectoryEntryReceived,
+    FeedFollowed,
+    CapsuleReceived,
+    SnapshotReceived,
+    PublishAccepted,
+    PublishRejected,
+    Degraded,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P2pPeerSpec {
+    pub network_id: NetworkId,
+    pub peer_id: PeerIdString,
+    pub principal: String,
+    pub compatibility: ProtocolCompatibility,
+}
+
+impl P2pPeerSpec {
+    #[must_use]
+    pub fn new(
+        network_id: impl Into<String>,
+        peer_id: impl Into<String>,
+        principal: impl Into<String>,
+    ) -> Self {
+        Self {
+            network_id: network_id.into(),
+            peer_id: peer_id.into(),
+            principal: principal.into(),
+            compatibility: ProtocolCompatibility::current(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum P2pCommand {
+    JoinFabric {
+        peer: P2pPeerSpec,
+        roles: BTreeSet<PeerRole>,
+    },
+    RegisterBrowserHandoff {
+        peer_id: PeerIdString,
+        addrs: Vec<String>,
+    },
+    AnnounceFeed {
+        peer_id: PeerIdString,
+        profile: FeedProfile,
+    },
+    AnnounceDirectoryEntry {
+        peer_id: PeerIdString,
+        entry: FeedDirectoryEntry,
+    },
+    CacheDirectoryEntry {
+        peer_id: PeerIdString,
+        entry: FeedDirectoryEntry,
+    },
+    DiscoverGithubUser {
+        peer_id: PeerIdString,
+        github_user_id: GithubUserId,
+    },
+    DiscoverGithubOrg {
+        peer_id: PeerIdString,
+        org: GithubOrgName,
+    },
+    DiscoverGithubTeam {
+        peer_id: PeerIdString,
+        org: GithubOrgName,
+        team: GithubTeamSlug,
+    },
+    FollowFeed {
+        peer_id: PeerIdString,
+        feed_id: FeedId,
+    },
+    GrantSubscription {
+        publisher_peer_id: PeerIdString,
+        subscriber_peer_id: PeerIdString,
+        feed_id: FeedId,
+    },
+    CertifyGithubOrgAccess {
+        peer_id: PeerIdString,
+        org: GithubOrgName,
+        teams: BTreeSet<GithubTeamSlug>,
+    },
+    PublishCapsule {
+        peer_id: PeerIdString,
+        capsule: Signed<StoryCapsule>,
+    },
+    RequestSnapshot {
+        peer_id: PeerIdString,
+        feed_id: FeedId,
+        limit: usize,
+    },
+    DrainInbox {
+        peer_id: PeerIdString,
+    },
+    Shutdown,
+}
+
+impl P2pCommand {
+    #[must_use]
+    pub fn kind(&self) -> P2pCommandKind {
+        match self {
+            Self::JoinFabric { .. } => P2pCommandKind::JoinNetwork,
+            Self::AnnounceDirectoryEntry { .. } | Self::CacheDirectoryEntry { .. } => {
+                P2pCommandKind::PublishDirectoryEntry
+            }
+            Self::PublishCapsule { .. } => P2pCommandKind::PublishCapsule,
+            Self::FollowFeed { .. } => P2pCommandKind::FollowFeed,
+            Self::RequestSnapshot { .. } | Self::DrainInbox { .. } => {
+                P2pCommandKind::RequestSnapshot
+            }
+            Self::RegisterBrowserHandoff { .. } => P2pCommandKind::RegisterRendezvous,
+            Self::AnnounceFeed { .. }
+            | Self::DiscoverGithubUser { .. }
+            | Self::DiscoverGithubOrg { .. }
+            | Self::DiscoverGithubTeam { .. }
+            | Self::GrantSubscription { .. }
+            | Self::CertifyGithubOrgAccess { .. } => P2pCommandKind::ProvideFeed,
+            Self::Shutdown => P2pCommandKind::Shutdown,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum P2pEvent {
+    Ready(P2pRuntimeStatus),
+    NetworkJoined(PeerParticipation),
+    BrowserHandoffRegistered(PeerParticipation),
+    DirectoryEntryReceived(Box<FeedDirectoryEntry>),
+    FeedDiscovered(Vec<FeedDirectoryEntry>),
+    FeedFollowed {
+        peer_id: PeerIdString,
+        feed_id: FeedId,
+    },
+    SnapshotReceived {
+        peer_id: PeerIdString,
+        feed_id: FeedId,
+        capsules: Vec<Signed<StoryCapsule>>,
+    },
+    StoryReceived {
+        peer_id: PeerIdString,
+        capsules: Vec<Signed<StoryCapsule>>,
+    },
+    PublishAccepted {
+        peer_id: PeerIdString,
+        feed_id: FeedId,
+        delivered: usize,
+    },
+    PublishRejected {
+        peer_id: PeerIdString,
+        feed_id: Option<FeedId>,
+        reason: String,
+    },
+    Degraded {
+        peer_id: Option<PeerIdString>,
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl P2pEvent {
+    #[must_use]
+    pub fn kind(&self) -> P2pEventKind {
+        match self {
+            Self::Ready(_) => P2pEventKind::Ready,
+            Self::NetworkJoined(_) | Self::BrowserHandoffRegistered(_) => {
+                P2pEventKind::PeerDiscovered
+            }
+            Self::DirectoryEntryReceived(_) => P2pEventKind::DirectoryEntryReceived,
+            Self::FeedDiscovered(_) => P2pEventKind::PeerDiscovered,
+            Self::FeedFollowed { .. } => P2pEventKind::FeedFollowed,
+            Self::SnapshotReceived { .. } => P2pEventKind::SnapshotReceived,
+            Self::StoryReceived { .. } => P2pEventKind::CapsuleReceived,
+            Self::PublishAccepted { .. } => P2pEventKind::PublishAccepted,
+            Self::PublishRejected { .. } => P2pEventKind::PublishRejected,
+            Self::Degraded { .. } => P2pEventKind::Degraded,
+            Self::Error { .. } => P2pEventKind::Error,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P2pNetworkConfig {
+    pub network_id: NetworkId,
+    pub edge_base_url: String,
+    pub bootstrap_peers: Vec<String>,
+    pub topology: BootstrapTopology,
+    pub data_plane: P2pDataPlane,
+    pub edge_fallback: EdgeFallbackMode,
+}
+
+impl P2pNetworkConfig {
+    #[must_use]
+    pub fn mainnet_single_bootstrap(edge_fallback: EdgeFallbackMode) -> Self {
+        Self {
+            network_id: MAINNET_NETWORK_ID.to_string(),
+            edge_base_url: MAINNET_EDGE_BASE_URL.to_string(),
+            bootstrap_peers: vec![
+                format!("/dns4/{MAINNET_EDGE_HOST}/tcp/{MAINNET_P2P_PORT}"),
+                format!("/dns4/{MAINNET_EDGE_HOST}/udp/{MAINNET_P2P_PORT}/quic-v1"),
+                format!("/dns4/{MAINNET_EDGE_HOST}/udp/443/webrtc-direct"),
+            ],
+            topology: BootstrapTopology::SingleBootstrap,
+            data_plane: P2pDataPlane::EdgeSnapshotFallback,
+            edge_fallback,
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> P2pRuntimeStatus {
+        P2pRuntimeStatus {
+            network_id: self.network_id.clone(),
+            compatibility: ProtocolCompatibility::current(),
+            data_plane: self.data_plane,
+            topology: self.topology,
+            edge_fallback: self.edge_fallback,
+            bootstrap_peers: self.bootstrap_peers.clone(),
+            fabric_peers: 0,
+            subscribed_feeds: 0,
+            publishing: false,
+        }
+    }
+
+    #[must_use]
+    pub fn is_single_bootstrap_topology(&self) -> bool {
+        self.topology == BootstrapTopology::SingleBootstrap
+            && single_bootstrap_host(&self.bootstrap_peers).is_some()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P2pRuntimeStatus {
+    pub network_id: NetworkId,
+    pub compatibility: ProtocolCompatibility,
+    pub data_plane: P2pDataPlane,
+    pub topology: BootstrapTopology,
+    pub edge_fallback: EdgeFallbackMode,
+    pub bootstrap_peers: Vec<String>,
+    pub fabric_peers: usize,
+    pub subscribed_feeds: usize,
+    pub publishing: bool,
+}
+
+impl P2pRuntimeStatus {
+    #[must_use]
+    pub fn projection_label(&self) -> &'static str {
+        match self.data_plane {
+            P2pDataPlane::EdgeSnapshotFallback => "edge snapshot mode",
+            P2pDataPlane::NativeLibp2p => "native p2p live",
+            P2pDataPlane::BrowserLibp2p => "browser p2p live",
+        }
+    }
+}
+
+#[must_use]
+pub fn single_bootstrap_host(peers: &[String]) -> Option<String> {
+    let mut host = None::<String>;
+    for peer in peers {
+        let candidate = dns4_host(peer)?;
+        if host.as_ref().is_some_and(|existing| existing != &candidate) {
+            return None;
+        }
+        host = Some(candidate);
+    }
+    host
+}
+
+fn dns4_host(peer: &str) -> Option<String> {
+    let mut parts = peer.split('/');
+    while let Some(part) = parts.next() {
+        if part == "dns4" {
+            return parts.next().map(ToString::to_string);
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PeerRole {
     Fabric,
@@ -55,6 +415,8 @@ impl PeerParticipation {
 pub enum P2pError {
     #[error("p2p state lock poisoned")]
     StatePoisoned,
+    #[error("peer not found: {0}")]
+    PeerNotFound(String),
     #[error("feed not found: {0}")]
     FeedNotFound(String),
     #[error("subscription denied for feed: {0}")]
@@ -117,6 +479,252 @@ impl InMemoryNetwork {
             principal: principal.into(),
             network: self.clone(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct P2pRuntime {
+    config: P2pNetworkConfig,
+    network: InMemoryNetwork,
+    peers: BTreeMap<PeerIdString, PeerNode>,
+    events: VecDeque<P2pEvent>,
+    shutdown: bool,
+}
+
+impl P2pRuntime {
+    #[must_use]
+    pub fn new(config: P2pNetworkConfig) -> Self {
+        let mut runtime = Self {
+            config,
+            network: InMemoryNetwork::new(),
+            peers: BTreeMap::new(),
+            events: VecDeque::new(),
+            shutdown: false,
+        };
+        runtime.events.push_back(P2pEvent::Ready(runtime.status()));
+        runtime
+    }
+
+    #[must_use]
+    pub fn status(&self) -> P2pRuntimeStatus {
+        let mut status = self.config.status();
+        status.fabric_peers = self
+            .peers
+            .values()
+            .filter_map(|peer| peer.participation(&peer.peer_id).ok().flatten())
+            .filter(|participation| participation.roles.contains(&PeerRole::Fabric))
+            .count();
+        status.subscribed_feeds = self
+            .peers
+            .values()
+            .filter_map(|peer| peer.participation(&peer.peer_id).ok().flatten())
+            .filter(|participation| participation.is_subscriber())
+            .count();
+        status
+    }
+
+    pub fn handle(&mut self, command: P2pCommand) -> Result<(), P2pError> {
+        if self.shutdown && !matches!(command, P2pCommand::Shutdown) {
+            self.events.push_back(P2pEvent::Degraded {
+                peer_id: None,
+                reason: "p2p runtime is shut down".to_string(),
+            });
+            return Ok(());
+        }
+        let result = self.handle_inner(command);
+        if let Err(err) = &result {
+            self.events.push_back(P2pEvent::Error {
+                message: err.to_string(),
+            });
+        }
+        result
+    }
+
+    #[must_use]
+    pub fn drain_events(&mut self) -> Vec<P2pEvent> {
+        self.events.drain(..).collect()
+    }
+
+    #[must_use]
+    pub fn network(&self) -> &InMemoryNetwork {
+        &self.network
+    }
+
+    fn handle_inner(&mut self, command: P2pCommand) -> Result<(), P2pError> {
+        match command {
+            P2pCommand::JoinFabric { peer, roles } => {
+                let peer = self.upsert_peer(peer);
+                peer.join_fabric(roles)?;
+                if let Some(participation) = peer.participation(&peer.peer_id)? {
+                    self.events
+                        .push_back(P2pEvent::NetworkJoined(participation));
+                }
+                Ok(())
+            }
+            P2pCommand::RegisterBrowserHandoff { peer_id, addrs } => {
+                let peer = self.peer(&peer_id)?;
+                peer.register_browser_handoff(addrs)?;
+                if let Some(participation) = peer.participation(&peer.peer_id)? {
+                    self.events
+                        .push_back(P2pEvent::BrowserHandoffRegistered(participation));
+                }
+                Ok(())
+            }
+            P2pCommand::AnnounceFeed { peer_id, profile } => {
+                let feed_id = profile.feed_id.clone();
+                let peer = self.peer(&peer_id)?;
+                peer.announce_feed(profile)?;
+                self.events.push_back(P2pEvent::PublishAccepted {
+                    peer_id,
+                    feed_id,
+                    delivered: 0,
+                });
+                Ok(())
+            }
+            P2pCommand::AnnounceDirectoryEntry { peer_id, entry } => {
+                let peer = self.peer(&peer_id)?;
+                peer.announce_directory_entry(entry.clone())?;
+                self.events
+                    .push_back(P2pEvent::DirectoryEntryReceived(Box::new(entry)));
+                Ok(())
+            }
+            P2pCommand::CacheDirectoryEntry { peer_id, entry } => {
+                let peer = self.peer(&peer_id)?;
+                peer.cache_directory_entry(entry.clone())?;
+                self.events
+                    .push_back(P2pEvent::DirectoryEntryReceived(Box::new(entry)));
+                Ok(())
+            }
+            P2pCommand::DiscoverGithubUser {
+                peer_id,
+                github_user_id,
+            } => {
+                let peer = self.peer(&peer_id)?;
+                let entries = peer.discover_github_user(github_user_id)?;
+                self.events.push_back(P2pEvent::FeedDiscovered(entries));
+                Ok(())
+            }
+            P2pCommand::DiscoverGithubOrg { peer_id, org } => {
+                let peer = self.peer(&peer_id)?;
+                let entries = peer.discover_github_org(&org)?;
+                self.events.push_back(P2pEvent::FeedDiscovered(entries));
+                Ok(())
+            }
+            P2pCommand::DiscoverGithubTeam { peer_id, org, team } => {
+                let peer = self.peer(&peer_id)?;
+                let entries = peer.discover_github_team(&org, &team)?;
+                self.events.push_back(P2pEvent::FeedDiscovered(entries));
+                Ok(())
+            }
+            P2pCommand::FollowFeed { peer_id, feed_id } => {
+                let peer = self.peer(&peer_id)?;
+                peer.follow(&feed_id)?;
+                self.events
+                    .push_back(P2pEvent::FeedFollowed { peer_id, feed_id });
+                Ok(())
+            }
+            P2pCommand::GrantSubscription {
+                publisher_peer_id,
+                subscriber_peer_id,
+                feed_id,
+            } => {
+                let publisher = self.peer(&publisher_peer_id)?;
+                let subscriber = self.peer(&subscriber_peer_id)?;
+                publisher.grant_subscription(&feed_id, &subscriber)?;
+                self.events.push_back(P2pEvent::PublishAccepted {
+                    peer_id: publisher_peer_id,
+                    feed_id,
+                    delivered: 0,
+                });
+                Ok(())
+            }
+            P2pCommand::CertifyGithubOrgAccess {
+                peer_id,
+                org,
+                teams,
+            } => {
+                let peer = self.peer(&peer_id)?;
+                peer.certify_github_org_access(org, teams)?;
+                self.events.push_back(P2pEvent::PublishAccepted {
+                    peer_id,
+                    feed_id: "github-org-access".to_string(),
+                    delivered: 0,
+                });
+                Ok(())
+            }
+            P2pCommand::PublishCapsule { peer_id, capsule } => {
+                let feed_id = capsule.value.feed_id.clone();
+                let peer = self.peer(&peer_id)?;
+                match peer.publish_capsule(capsule) {
+                    Ok(delivered) => {
+                        self.events.push_back(P2pEvent::PublishAccepted {
+                            peer_id,
+                            feed_id,
+                            delivered,
+                        });
+                        Ok(())
+                    }
+                    Err(err) => {
+                        self.events.push_back(P2pEvent::PublishRejected {
+                            peer_id,
+                            feed_id: Some(feed_id),
+                            reason: err.to_string(),
+                        });
+                        Err(err)
+                    }
+                }
+            }
+            P2pCommand::RequestSnapshot {
+                peer_id,
+                feed_id,
+                limit,
+            } => {
+                let peer = self.peer(&peer_id)?;
+                let capsules = peer.feed_snapshot(&feed_id, limit)?;
+                self.events.push_back(P2pEvent::SnapshotReceived {
+                    peer_id,
+                    feed_id,
+                    capsules,
+                });
+                Ok(())
+            }
+            P2pCommand::DrainInbox { peer_id } => {
+                let peer = self.peer(&peer_id)?;
+                let capsules = peer.drain()?;
+                self.events
+                    .push_back(P2pEvent::StoryReceived { peer_id, capsules });
+                Ok(())
+            }
+            P2pCommand::Shutdown => {
+                self.shutdown = true;
+                self.events.push_back(P2pEvent::Degraded {
+                    peer_id: None,
+                    reason: "p2p runtime shut down".to_string(),
+                });
+                Ok(())
+            }
+        }
+    }
+
+    fn upsert_peer(&mut self, spec: P2pPeerSpec) -> PeerNode {
+        self.peers
+            .entry(spec.peer_id.clone())
+            .or_insert_with(|| {
+                self.network.peer_with_compatibility(
+                    spec.network_id,
+                    spec.peer_id,
+                    spec.principal,
+                    spec.compatibility,
+                )
+            })
+            .clone()
+    }
+
+    fn peer(&self, peer_id: &str) -> Result<PeerNode, P2pError> {
+        self.peers
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| P2pError::PeerNotFound(peer_id.to_string()))
     }
 }
 
@@ -1353,5 +1961,249 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].value.seq, 1);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_command_flow_requires_explicit_follow() -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = P2pRuntime::new(P2pNetworkConfig::mainnet_single_bootstrap(
+            EdgeFallbackMode::Auto,
+        ));
+        let _ = runtime.drain_events();
+        runtime.handle(P2pCommand::JoinFabric {
+            peer: P2pPeerSpec::new("agent-feed-mainnet", "peer-a", "github:1"),
+            roles: [PeerRole::Publisher].into_iter().collect(),
+        })?;
+        runtime.handle(P2pCommand::JoinFabric {
+            peer: P2pPeerSpec::new("agent-feed-mainnet", "peer-b", "github:2"),
+            roles: BTreeSet::new(),
+        })?;
+        runtime.handle(P2pCommand::AnnounceFeed {
+            peer_id: "peer-a".to_string(),
+            profile: profile("feed-public", FeedVisibility::Public)?,
+        })?;
+
+        runtime.handle(P2pCommand::PublishCapsule {
+            peer_id: "peer-a".to_string(),
+            capsule: capsule("feed-public", 1)?,
+        })?;
+        runtime.handle(P2pCommand::DrainInbox {
+            peer_id: "peer-b".to_string(),
+        })?;
+        let before_follow = runtime.drain_events();
+        assert!(
+            before_follow
+                .iter()
+                .any(|event| matches!(event, P2pEvent::PublishAccepted { delivered: 0, .. }))
+        );
+        assert!(before_follow.iter().any(|event| matches!(
+            event,
+            P2pEvent::StoryReceived { capsules, .. } if capsules.is_empty()
+        )));
+
+        runtime.handle(P2pCommand::FollowFeed {
+            peer_id: "peer-b".to_string(),
+            feed_id: "feed-public".to_string(),
+        })?;
+        runtime.handle(P2pCommand::PublishCapsule {
+            peer_id: "peer-a".to_string(),
+            capsule: capsule_with_score("feed-public", 2, 95)?,
+        })?;
+        runtime.handle(P2pCommand::DrainInbox {
+            peer_id: "peer-b".to_string(),
+        })?;
+        let after_follow = runtime.drain_events();
+
+        assert!(after_follow.iter().any(|event| matches!(
+            event,
+            P2pEvent::FeedFollowed {
+                peer_id,
+                feed_id
+            } if peer_id == "peer-b" && feed_id == "feed-public"
+        )));
+        assert!(
+            after_follow
+                .iter()
+                .any(|event| matches!(event, P2pEvent::PublishAccepted { delivered: 1, .. }))
+        );
+        assert!(after_follow.iter().any(|event| matches!(
+            event,
+            P2pEvent::StoryReceived { capsules, .. } if capsules.len() == 1
+        )));
+        assert_eq!(runtime.status().subscribed_feeds, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_fabric_peer_routes_without_receiving_capsules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = P2pRuntime::new(P2pNetworkConfig::mainnet_single_bootstrap(
+            EdgeFallbackMode::Auto,
+        ));
+        let _ = runtime.drain_events();
+        let entry = directory_entry("feed-public", "workstation", FeedVisibility::Public)?;
+        runtime.handle(P2pCommand::JoinFabric {
+            peer: P2pPeerSpec::new("agent-feed-mainnet", "peer-a", "github:1"),
+            roles: [PeerRole::Publisher].into_iter().collect(),
+        })?;
+        runtime.handle(P2pCommand::JoinFabric {
+            peer: P2pPeerSpec::new("agent-feed-mainnet", "peer-fabric", "fabric:edge"),
+            roles: [PeerRole::Rendezvous, PeerRole::KadProvider]
+                .into_iter()
+                .collect(),
+        })?;
+        runtime.handle(P2pCommand::AnnounceFeed {
+            peer_id: "peer-a".to_string(),
+            profile: profile("feed-public", FeedVisibility::Public)?,
+        })?;
+        runtime.handle(P2pCommand::CacheDirectoryEntry {
+            peer_id: "peer-fabric".to_string(),
+            entry: entry.clone(),
+        })?;
+        runtime.handle(P2pCommand::DiscoverGithubUser {
+            peer_id: "peer-fabric".to_string(),
+            github_user_id: GithubUserId::new(1),
+        })?;
+        runtime.handle(P2pCommand::PublishCapsule {
+            peer_id: "peer-a".to_string(),
+            capsule: capsule_from_entry(&entry, 1)?,
+        })?;
+        runtime.handle(P2pCommand::DrainInbox {
+            peer_id: "peer-fabric".to_string(),
+        })?;
+        let events = runtime.drain_events();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            P2pEvent::FeedDiscovered(entries) if entries.len() == 1
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, P2pEvent::PublishAccepted { delivered: 0, .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            P2pEvent::StoryReceived { peer_id, capsules } if peer_id == "peer-fabric" && capsules.is_empty()
+        )));
+        assert_eq!(runtime.status().subscribed_feeds, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_snapshot_uses_ring_buffer_without_subscription()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = P2pRuntime::new(P2pNetworkConfig::mainnet_single_bootstrap(
+            EdgeFallbackMode::Auto,
+        ));
+        let _ = runtime.drain_events();
+        runtime.handle(P2pCommand::JoinFabric {
+            peer: P2pPeerSpec::new("agent-feed-mainnet", "peer-a", "github:1"),
+            roles: [PeerRole::Publisher].into_iter().collect(),
+        })?;
+        runtime.handle(P2pCommand::JoinFabric {
+            peer: P2pPeerSpec::new("agent-feed-mainnet", "peer-b", "github:2"),
+            roles: BTreeSet::new(),
+        })?;
+        runtime.handle(P2pCommand::AnnounceFeed {
+            peer_id: "peer-a".to_string(),
+            profile: profile("feed-public", FeedVisibility::Public)?,
+        })?;
+        for seq in 1..=4 {
+            runtime.handle(P2pCommand::PublishCapsule {
+                peer_id: "peer-a".to_string(),
+                capsule: capsule_with_score("feed-public", seq, 95)?,
+            })?;
+        }
+        runtime.handle(P2pCommand::RequestSnapshot {
+            peer_id: "peer-b".to_string(),
+            feed_id: "feed-public".to_string(),
+            limit: 2,
+        })?;
+        let events = runtime.drain_events();
+        let snapshot = events
+            .iter()
+            .find_map(|event| match event {
+                P2pEvent::SnapshotReceived { capsules, .. } => Some(capsules),
+                _ => None,
+            })
+            .expect("snapshot event is emitted");
+
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].value.seq, 3);
+        assert_eq!(snapshot[1].value.seq, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_unknown_peer_emits_error_event() -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = P2pRuntime::new(P2pNetworkConfig::mainnet_single_bootstrap(
+            EdgeFallbackMode::Auto,
+        ));
+        let _ = runtime.drain_events();
+
+        let err = runtime
+            .handle(P2pCommand::DrainInbox {
+                peer_id: "missing-peer".to_string(),
+            })
+            .expect_err("unknown peer is rejected");
+        let events = runtime.drain_events();
+
+        assert!(matches!(err, P2pError::PeerNotFound(peer) if peer == "missing-peer"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            P2pEvent::Error { message } if message.contains("missing-peer")
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn mainnet_config_uses_one_bootstrap_host_with_multiple_transports() {
+        let config = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto);
+
+        assert_eq!(config.topology, BootstrapTopology::SingleBootstrap);
+        assert_eq!(config.data_plane, P2pDataPlane::EdgeSnapshotFallback);
+        assert_eq!(config.edge_fallback, EdgeFallbackMode::Auto);
+        assert_eq!(
+            single_bootstrap_host(&config.bootstrap_peers).as_deref(),
+            Some(MAINNET_EDGE_HOST)
+        );
+        assert!(config.is_single_bootstrap_topology());
+        assert!(
+            config
+                .bootstrap_peers
+                .iter()
+                .any(|peer| peer.contains("/tcp/"))
+        );
+        assert!(
+            config
+                .bootstrap_peers
+                .iter()
+                .any(|peer| peer.contains("/quic-v1"))
+        );
+        assert!(
+            config
+                .bootstrap_peers
+                .iter()
+                .any(|peer| peer.contains("/webrtc-direct"))
+        );
+    }
+
+    #[test]
+    fn single_bootstrap_detection_rejects_mixed_hosts() {
+        let peers = vec![
+            "/dns4/api.feed.aberration.technology/tcp/7747".to_string(),
+            "/dns4/backup.feed.aberration.technology/tcp/7747".to_string(),
+        ];
+
+        assert_eq!(single_bootstrap_host(&peers), None);
+    }
+
+    #[test]
+    fn runtime_status_labels_edge_snapshot_fallback_honestly() {
+        let status = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::On).status();
+
+        assert_eq!(status.projection_label(), "edge snapshot mode");
+        assert_eq!(status.topology.as_str(), "single_bootstrap");
+        assert!(status.edge_fallback.allows_edge_publish());
     }
 }

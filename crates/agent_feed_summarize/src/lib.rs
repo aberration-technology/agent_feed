@@ -1385,6 +1385,28 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
         };
     }
 
+    if let Some(story) = representative_story(request) {
+        return ProcessorSummary {
+            headline: story.headline.clone(),
+            deck: story.deck.clone(),
+            lower_third: Some(strict_lower_third(
+                story.agent.as_str(),
+                story.family,
+                story.score,
+            )),
+            chips: story
+                .chips
+                .iter()
+                .filter(|chip| !chip.contains('_') && !chip.contains('/'))
+                .cloned()
+                .collect(),
+            publish: None,
+            publish_reason: None,
+            memory_digest: None,
+            semantic_fingerprint: None,
+        };
+    }
+
     let input_count = request.stories.len();
     let max_score = request
         .stories
@@ -1443,6 +1465,28 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
         memory_digest: None,
         semantic_fingerprint: None,
     }
+}
+
+fn representative_story(request: &SummaryRequest) -> Option<&CompiledStory> {
+    request
+        .stories
+        .iter()
+        .rev()
+        .filter(|story| story_has_public_outcome(story))
+        .max_by_key(|story| story.score)
+}
+
+fn story_has_public_outcome(story: &CompiledStory) -> bool {
+    let headline = normalize_text(&story.headline);
+    let deck = normalize_text(&story.deck);
+    let combined = format!("{headline} {deck}");
+    !combined.trim().is_empty()
+        && !public_copy_has_banned_terms(&combined)
+        && !is_operational_status_without_public_impact(&combined)
+        && !is_file_count_without_public_impact(&combined)
+        && !is_test_status_without_public_impact(&combined)
+        && !is_agent_activity_without_public_impact(&headline, &combined)
+        && has_public_outcome_context(&combined)
 }
 
 fn build_summary(
@@ -1637,6 +1681,10 @@ fn fit_capsule_budget(
 }
 
 fn polish_public_summary(summary: &mut FeedSummary) {
+    if let Some((headline, deck)) = impact_rewrite(&summary.headline, &summary.deck) {
+        summary.headline = headline;
+        summary.deck = deck;
+    }
     summary.headline = remove_agent_headline_prefix(&polish_public_copy(&summary.headline));
     summary.deck = ensure_terminal_sentence(&polish_public_copy(&summary.deck));
     summary.lower_third = polish_public_copy(&summary.lower_third);
@@ -1654,6 +1702,63 @@ fn polish_public_summary(summary: &mut FeedSummary) {
     if summary.chips.is_empty() {
         summary.chips.push("redacted".to_string());
     }
+}
+
+fn impact_rewrite(headline: &str, deck: &str) -> Option<(String, String)> {
+    let combined = normalize_text(&format!("{headline} {deck}"));
+    let rewrite = if combined.contains("real codex stream")
+        || combined.contains("settled summarization")
+        || combined.contains("p2p capsule")
+        || combined.contains("story capsule")
+    {
+        Some((
+            "feed turns live agent work into safer public story capsules",
+            "local activity is aggregated into settled, redacted headlines before it reaches the network",
+        ))
+    } else if combined.contains("github username")
+        || (combined.contains("github") && combined.contains("discovery"))
+    {
+        Some((
+            "github profile routes open verified public feed streams",
+            "viewer urls resolve durable github identity before subscribing to visible stories",
+        ))
+    } else if combined.contains("publisher identity")
+        || (combined.contains("verified") && combined.contains("publisher"))
+        || combined.contains("verified feed authors")
+    {
+        Some((
+            "remote headlines carry verified publisher identity",
+            "browser viewers can see the github account behind each feed story",
+        ))
+    } else if combined.contains("headline image") || combined.contains("media layer") {
+        Some((
+            "publishers can attach opt-in visuals to major feed stories",
+            "image generation stays disabled by default and runs behind feed guardrails",
+        ))
+    } else if combined.contains("org level") || combined.contains("organization") {
+        Some((
+            "organization feeds can gate discovery by github membership",
+            "teams can publish shared feeds without opening every story to the public network",
+        ))
+    } else if combined.contains("sign in") || combined.contains("oauth") {
+        Some((
+            "cli publishing now binds feeds to github sign-in",
+            "native publishers can prove account identity before sending stories to the network",
+        ))
+    } else if combined.contains("fabric") && combined.contains("subscription") {
+        Some((
+            "network routing stays separate from explicit feed subscriptions",
+            "peers can support discovery and browser handoff without auto-following private feeds",
+        ))
+    } else if combined.contains("publish gating") || combined.contains("story quality") {
+        Some((
+            "feed suppresses duplicate mechanics before publishing",
+            "the story compiler now favors outcome changes over command, file, and test chatter",
+        ))
+    } else {
+        None
+    }?;
+    Some((rewrite.0.to_string(), rewrite.1.to_string()))
 }
 
 fn polish_public_copy(input: &str) -> String {
@@ -2548,20 +2653,39 @@ fn clamp_chars(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_feed_core::{EventKind, Severity, SourceKind};
-    use agent_feed_story::compile_events;
+    use agent_feed_core::{PrivacyClass, Severity};
+    use agent_feed_story::StoryKey;
 
     fn story(title: &str, score: u8) -> CompiledStory {
-        let mut event =
-            agent_feed_core::AgentEvent::new(SourceKind::Codex, EventKind::FileChanged, title);
-        event.agent = "codex".to_string();
-        event.project = Some("secret_repo".to_string());
-        event.session_id = Some("session".to_string());
-        event.turn_id = Some(format!("turn-{score}"));
-        event.files = vec!["src/lib.rs".to_string()];
-        event.summary = Some("1 changed files. raw diff omitted.".to_string());
-        event.score_hint = Some(score);
-        compile_events([event]).remove(0)
+        CompiledStory {
+            key: StoryKey {
+                feed_id: None,
+                agent: "codex".to_string(),
+                project_hash: Some("secret_repo".to_string()),
+                session_id: Some("session".to_string()),
+                turn_id: Some(format!("turn-{score}")),
+                family: StoryFamily::FileChange,
+            },
+            created_at: time::OffsetDateTime::now_utc(),
+            family: StoryFamily::FileChange,
+            agent: "codex".to_string(),
+            project: Some("secret_repo".to_string()),
+            headline: title.to_string(),
+            deck: "1 changed files. raw diff omitted.".to_string(),
+            lower_third: format!("codex · secret_repo · file-change · score {score} · redacted"),
+            chips: vec![
+                "codex".to_string(),
+                "secret_repo".to_string(),
+                "1 files".to_string(),
+                "file-change".to_string(),
+                format!("score {score}"),
+            ],
+            severity: Severity::Notice,
+            score,
+            context_score: 92,
+            privacy: PrivacyClass::Redacted,
+            evidence_event_ids: vec!["evt_test".to_string()],
+        }
     }
 
     fn verified_story(score: u8) -> CompiledStory {
@@ -2596,6 +2720,56 @@ mod tests {
                 .expect("summary compiles");
 
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn deterministic_rollup_uses_meaningful_story_when_available() {
+        let mut generic = story("codex changed secret_repo", 78);
+        generic.deck = "2 changed files.".to_string();
+        let mut meaningful = story("browser route keeps feed identity stable", 86);
+        meaningful.family = StoryFamily::Turn;
+        meaningful.key.family = StoryFamily::Turn;
+        meaningful.deck =
+            "remote viewers can identify the account behind each public headline.".to_string();
+
+        let summaries = summarize_feed(
+            "local:workstation",
+            &[generic, meaningful],
+            &SummaryConfig::p2p_default(),
+        )
+        .expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].headline,
+            "browser route keeps feed identity stable"
+        );
+        assert!(summaries[0].deck.contains("public headline"));
+    }
+
+    #[test]
+    fn deterministic_rollup_rewrites_agent_feed_scaffold_into_public_impact() {
+        let mut story = story(
+            "implemented the remaining slice around real Codex streams, settled summarization",
+            90,
+        );
+        story.family = StoryFamily::Turn;
+        story.key.family = StoryFamily::Turn;
+        story.deck = "Implemented the remaining slice around real Codex streams, settled summarization, and p2p capsule tests.".to_string();
+
+        let summaries = summarize_feed(
+            "github:35904762:workstation",
+            &[story],
+            &SummaryConfig::p2p_default(),
+        )
+        .expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].headline,
+            "feed turns live agent work into safer public story capsules"
+        );
+        assert!(summaries[0].deck.contains("settled, redacted headlines"));
     }
 
     #[test]

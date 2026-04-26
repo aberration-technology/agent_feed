@@ -17,7 +17,11 @@ pub use agent_feed_identity::{GithubLogin, GithubUserId, PrincipalRef};
 pub use agent_feed_identity_github::{GithubProfile, GithubResolver, StaticGithubResolver};
 pub use agent_feed_ingest::{GenericIngestEvent, normalize_raw, normalize_value, parse_jsonl};
 #[cfg(feature = "p2p")]
-pub use agent_feed_p2p::{InMemoryNetwork, P2pError, PeerNode, PeerParticipation, PeerRole};
+pub use agent_feed_p2p::{
+    BootstrapTopology, EdgeFallbackMode, InMemoryNetwork, P2pCommand, P2pCommandKind, P2pDataPlane,
+    P2pError, P2pEvent, P2pEventKind, P2pNetworkConfig, P2pPeerSpec, P2pRuntime, P2pRuntimeStatus,
+    PeerNode, PeerParticipation, PeerRole,
+};
 #[cfg(feature = "p2p-browser")]
 pub use agent_feed_p2p_browser::{RemoteFeedHeadline, RemoteRouteState, RemoteRouteViewModel};
 #[cfg(feature = "p2p")]

@@ -11,6 +11,7 @@ use agent_feed_edge::{
 };
 use agent_feed_ingest::source_from_str;
 use agent_feed_install::{doctor_report, init_plan};
+use agent_feed_p2p::{EdgeFallbackMode, MAINNET_EDGE_BASE_URL, P2pDataPlane, P2pNetworkConfig};
 use agent_feed_p2p_proto::{
     FeedVisibility, ProtocolCompatibility, PublisherIdentity, Signed, StoryCapsule,
 };
@@ -63,6 +64,24 @@ enum LogFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum CliEdgeFallback {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl From<CliEdgeFallback> for EdgeFallbackMode {
+    fn from(value: CliEdgeFallback) -> Self {
+        match value {
+            CliEdgeFallback::Auto => Self::Auto,
+            CliEdgeFallback::On => Self::On,
+            CliEdgeFallback::Off => Self::Off,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -111,6 +130,13 @@ enum Commands {
         no_auth_browser: bool,
         #[arg(long, default_value_t = 20)]
         publish_interval_secs: u64,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "auto",
+            help = "edge snapshot fallback policy while native p2p transport is being brought up"
+        )]
+        edge_fallback: CliEdgeFallback,
         #[arg(long, default_value = "codex,claude")]
         agents: String,
         #[arg(long, default_value_t = 12)]
@@ -392,6 +418,13 @@ enum P2pCommand {
         edge: String,
         #[arg(long, default_value = "agent-feed-mainnet")]
         network_id: String,
+        #[arg(
+            long,
+            value_enum,
+            default_value = "auto",
+            help = "edge snapshot fallback policy while native p2p transport is being brought up"
+        )]
+        edge_fallback: CliEdgeFallback,
         #[arg(long)]
         auth_store: Option<PathBuf>,
         #[arg(
@@ -565,6 +598,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             auth_timeout_secs,
             no_auth_browser,
             publish_interval_secs,
+            edge_fallback,
             agents,
             sessions,
             workspace,
@@ -609,7 +643,18 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         .to_string(),
                 ));
             }
+            let edge_fallback = EdgeFallbackMode::from(edge_fallback);
+            if publish && edge_fallback == EdgeFallbackMode::Off {
+                return Err(CliError::Http(
+                    "`agent-feed serve --publish --edge-fallback off` needs the native p2p data plane, which is not enabled in this build yet; use --edge-fallback auto for the single-bootstrap edge snapshot path".to_string(),
+                ));
+            }
             let p2p_enabled = (p2p || publish) && !no_p2p;
+            let p2p_network = P2pNetworkConfig {
+                network_id: network_id.clone(),
+                edge_base_url: edge.clone(),
+                ..P2pNetworkConfig::mainnet_single_bootstrap(edge_fallback)
+            };
             let publish_sink = if publish {
                 let selected_agents = parse_agent_list(&agents);
                 let mut summary_config = summary_config(SummaryCliOptions {
@@ -668,6 +713,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     publisher,
                     summary_config,
                     publish_interval: Duration::from_secs(publish_interval_secs.max(1)),
+                    edge_fallback,
                 });
                 Some(sender)
             } else {
@@ -682,6 +728,9 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 feed_name = %feed,
                 %edge,
                 %network_id,
+                edge_fallback = edge_fallback.as_str(),
+                data_plane = p2p_network.data_plane.as_str(),
+                topology = p2p_network.topology.as_str(),
                 display_token_configured = security.display_token.is_some(),
                 "serving local feed"
             );
@@ -717,11 +766,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     if p2p_enabled {
                         if publish {
                             println!(
-                                "p2p publish enabled: future settled stories publish as feed `{feed}`"
+                                "p2p publish enabled: future settled stories publish as feed `{feed}` via edge snapshot fallback"
                             );
                         } else {
                             println!(
-                                "p2p browser discovery ux enabled; add --publish --feed <name> to publish future settled stories from this serve process"
+                                "p2p discovery ux enabled; add --publish --feed <name> to publish future settled stories from this serve process"
                             );
                         }
                     }
@@ -1046,16 +1095,53 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 }
             }
             P2pCommand::Status => {
-                info!("p2p status requested");
-                println!("p2p disabled; local reel is authoritative until agent-feed serve --p2p");
+                let status =
+                    P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto).status();
+                info!(
+                    network_id = %status.network_id,
+                    data_plane = status.data_plane.as_str(),
+                    topology = status.topology.as_str(),
+                    bootstrap_peers = status.bootstrap_peers.len(),
+                    "p2p status requested"
+                );
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "network_id": status.network_id,
+                        "compatibility": status.compatibility,
+                        "data_plane": status.data_plane.as_str(),
+                        "projection_label": status.projection_label(),
+                        "topology": status.topology.as_str(),
+                        "edge_fallback": status.edge_fallback.as_str(),
+                        "bootstrap_peers": status.bootstrap_peers,
+                        "fabric_peers": status.fabric_peers,
+                        "subscribed_feeds": status.subscribed_feeds,
+                        "publishing": status.publishing,
+                        "note": "current production uses one bootstrap/edge peer and edge snapshot fallback until native libp2p is enabled",
+                    }))?
+                );
             }
             P2pCommand::Peers => {
                 info!("p2p peers requested");
-                println!("no native p2p runtime is running in this process");
+                println!("native p2p runtime is not running in this process");
+                println!("single bootstrap edge: {MAINNET_EDGE_BASE_URL}");
             }
             P2pCommand::Doctor => {
-                info!("p2p doctor requested");
-                println!("p2p doctor: story capsule protocol ok; native transport not started");
+                let config = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto);
+                info!(
+                    network_id = %config.network_id,
+                    topology = config.topology.as_str(),
+                    bootstrap_peers = config.bootstrap_peers.len(),
+                    single_bootstrap = config.is_single_bootstrap_topology(),
+                    "p2p doctor requested"
+                );
+                println!("p2p doctor: story capsule protocol ok");
+                println!("p2p doctor: topology={}", config.topology.as_str());
+                println!("p2p doctor: bootstrap_host=api.feed.aberration.technology");
+                println!("p2p doctor: data_plane={}", config.data_plane.as_str());
+                println!(
+                    "p2p doctor: native libp2p transport not enabled yet; using edge snapshot fallback"
+                );
             }
             P2pCommand::Discover {
                 provider,
@@ -1184,6 +1270,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 dry_run,
                 edge,
                 network_id,
+                edge_fallback,
                 auth_store,
                 feed,
                 sessions,
@@ -1220,6 +1307,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     feed_name = %feed,
                     %edge,
                     %network_id,
+                    edge_fallback = EdgeFallbackMode::from(edge_fallback).as_str(),
                     agents = %agents,
                     selected_agents = ?selected_agents,
                     sessions,
@@ -1295,6 +1383,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 let session = if dry_run {
                     None
                 } else {
+                    if EdgeFallbackMode::from(edge_fallback) == EdgeFallbackMode::Off {
+                        return Err(CliError::Http(
+                            "`agent-feed p2p publish --edge-fallback off` needs the native p2p data plane, which is not enabled in this build yet; use --edge-fallback auto".to_string(),
+                        ));
+                    }
                     Some(load_publish_session(auth_store, &edge)?)
                 };
                 let publisher = session.as_ref().map(|session| {
@@ -1589,6 +1682,7 @@ struct ServePublishConfig {
     publisher: PublisherIdentity,
     summary_config: SummaryConfig,
     publish_interval: Duration,
+    edge_fallback: EdgeFallbackMode,
 }
 
 fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
@@ -1714,10 +1808,12 @@ fn run_serve_publisher(config: ServePublishConfig) {
         edge = %config.edge,
         network_id = %config.network_id,
         interval_ms = config.publish_interval.as_millis(),
+        edge_fallback = config.edge_fallback.as_str(),
+        data_plane = P2pDataPlane::EdgeSnapshotFallback.as_str(),
         "serve p2p publisher started"
     );
     println!(
-        "p2p publish: signed in as @{}; publishing future settled stories to `{}`",
+        "p2p publish: signed in as @{}; publishing future settled stories to `{}` via edge snapshot fallback",
         config.session.login, config.feed
     );
 
@@ -2102,16 +2198,24 @@ mod tests {
             "--dry-run",
             "--network-id",
             "agent-feed-lab",
+            "--edge-fallback",
+            "on",
         ])
         .expect("network id parses");
 
         let Commands::P2p {
-            command: P2pCommand::Publish { network_id, .. },
+            command:
+                P2pCommand::Publish {
+                    network_id,
+                    edge_fallback,
+                    ..
+                },
         } = cli.command
         else {
             panic!("expected p2p publish command");
         };
         assert_eq!(network_id, "agent-feed-lab");
+        assert_eq!(edge_fallback, CliEdgeFallback::On);
     }
 
     #[test]
@@ -2522,6 +2626,8 @@ mod tests {
             "5",
             "--summarizer",
             "deterministic",
+            "--edge-fallback",
+            "auto",
         ])
         .expect("serve publish flags parse");
 
@@ -2532,6 +2638,7 @@ mod tests {
             all_workspaces,
             publish_interval_secs,
             summarizer,
+            edge_fallback,
             ..
         } = cli.command
         else {
@@ -2544,6 +2651,7 @@ mod tests {
         assert!(all_workspaces);
         assert_eq!(publish_interval_secs, 5);
         assert_eq!(summarizer, "deterministic");
+        assert_eq!(edge_fallback, CliEdgeFallback::Auto);
     }
 
     #[test]

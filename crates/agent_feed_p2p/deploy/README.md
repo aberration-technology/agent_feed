@@ -4,10 +4,11 @@ production uses the same split-host shape as the burn_dragon p2p deployment:
 
 ```text
 feed.aberration.technology
-  public browser shell and username deep links through the edge
+  public browser shell and username deep links on github pages
 
 api.feed.aberration.technology
-  github resolver, browser seeds, directory, rendezvous/bootstrap edge
+  one bootstrap/edge peer for github auth, browser seeds, directory,
+  rendezvous/bootstrap probes, and edge snapshot fallback
 ```
 
 the local product stays local. the hosted product is called `feed` in the UI.
@@ -42,9 +43,9 @@ index.html
 feed-config.json
 ```
 
-`404.html` is intentional for the default github pages URL. production deep
-links such as `/mosure?all` are served through the edge Caddy host so they return
-`200` instead of relying on a github pages custom-domain fallback.
+`404.html` is intentional for deep links such as `/mosure?all` on github pages.
+the browser shell is not routed through the edge host, so an edge outage should
+not prevent the static page from loading.
 
 ## github environment
 
@@ -121,6 +122,11 @@ ssm-enabled instance role
 basic cloudwatch status alarm
 ```
 
+this phase intentionally deploys only one bootstrap/edge peer to keep aws cost
+low. this is not an ha topology: if the edge is down, new browser discovery,
+github auth, and edge snapshot fallback may be degraded. already connected
+native peers should not depend on the edge once the native data plane is enabled.
+
 guardrail:
 
 ```text
@@ -142,5 +148,5 @@ api.feed.aberration.technology:7747 accepts tcp p2p fabric probes
 api.feed.aberration.technology:7747 answers udp p2p fabric probes
 ```
 
-resolver and feed-discovery checks can be tightened as live publisher directory
-state becomes available.
+resolver and feed-discovery checks can be tightened as the native p2p data plane
+replaces the current edge snapshot fallback.

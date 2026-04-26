@@ -14,6 +14,7 @@ const authAction = document.querySelector("#auth-action");
 const headlineImage = document.querySelector("#headline-image");
 const headlineImageImg = document.querySelector("#headline-image-img");
 const stageProgress = document.querySelector("#stage-progress");
+const storyTime = document.querySelector("#story-time");
 const timeline = document.querySelector("#timeline");
 const modeSwitcher = document.querySelector("#mode-switcher");
 const modeDiscovery = document.querySelector("#mode-discovery");
@@ -172,6 +173,50 @@ function stopStageProgress() {
   }
 }
 
+function bulletinTimestamp(bulletin) {
+  return (
+    bulletin?.created_at ||
+    bulletin?.createdAt ||
+    bulletin?.published_at ||
+    bulletin?.publishedAt ||
+    bulletin?.story_created_at ||
+    bulletin?.storyCreatedAt ||
+    bulletin?.capsule?.created_at ||
+    bulletin?.capsule?.createdAt ||
+    ""
+  );
+}
+
+function renderStoryTime(bulletin) {
+  if (!storyTime) {
+    return;
+  }
+  const timestamp = bulletinTimestamp(bulletin);
+  if (!timestamp) {
+    clearStoryTime();
+    return;
+  }
+  storyTime.dataset.timestamp = String(timestamp);
+  storyTime.textContent = `posted ${relativeTime(timestamp)}`;
+  storyTime.hidden = false;
+}
+
+function refreshStoryTime() {
+  if (!storyTime || storyTime.hidden || !storyTime.dataset.timestamp) {
+    return;
+  }
+  storyTime.textContent = `posted ${relativeTime(storyTime.dataset.timestamp)}`;
+}
+
+function clearStoryTime() {
+  if (!storyTime) {
+    return;
+  }
+  storyTime.hidden = true;
+  storyTime.textContent = "";
+  delete storyTime.dataset.timestamp;
+}
+
 function renderBulletin(bulletin) {
   if (!bulletin) {
     logWarn("render skipped empty bulletin");
@@ -194,6 +239,7 @@ function renderBulletin(bulletin) {
     setText(deck, bulletin.deck);
     renderPublisher(bulletin.publisher || bulletin.feed_publisher);
     renderHeadlineImage(bulletin.image || bulletin.headline_image);
+    renderStoryTime(bulletin);
     clearAuthAction();
     renderChips(bulletin.chips || []);
     renderTicker(bulletin.ticker || []);
@@ -342,6 +388,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   setText(deck, lines.join(" · "));
   renderPublisher(nextPublisher || (route.kind === "global" ? undefined : { login: route.login }));
   renderHeadlineImage(undefined);
+  clearStoryTime();
   clearAuthAction();
   renderChips([
     route.feedMode === "following"
@@ -434,6 +481,7 @@ function renderP2pDisabled(route) {
   );
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
+  clearStoryTime();
   clearAuthAction();
   renderChips(["p2p off", "privacy on"]);
   renderTicker(["start with --p2p or use the hosted p2p browser shell"]);
@@ -512,6 +560,7 @@ function applySnapshot(snapshot) {
     scheduleNext(snapshot.active.dwell_ms || 14000);
   } else {
     stopStageProgress();
+    clearStoryTime();
   }
   updateSourceCount();
 }
@@ -557,6 +606,7 @@ async function hydrateStatus() {
       setText(headline, "waiting for settled story");
       const last = status.last_event_kind ? `last event ${status.last_event_kind}` : "future transcript events are being watched";
       setText(deck, `${last}. headlines publish after completion, test, file-change, or incident signals.`);
+      clearStoryTime();
       renderChips(["capture live", "future-only", "redacted"]);
       renderTicker(captures.map((capture) => `${capture.agent} ${capture.adapter}`));
     } else {
@@ -1648,6 +1698,7 @@ function remoteHeadlineToBulletin(route, item, index) {
       item.feed_id ||
       `${publisherLogin || route.login || "network"}/${item.feed_label || item.label || route.feed || "*"}`,
     feed_label: item.feed_label || item.label || route.feed || "",
+    created_at: item.created_at || item.createdAt || item.published_at || item.publishedAt,
     eyebrow: `feed / ${route.network} / ${route.feedMode === "following" ? "following" : "discover"}`,
     headline: headlineText,
     deck: item.deck || item.summary || "settled story capsule published to the network.",
@@ -1759,6 +1810,7 @@ function renderGlobalTimeline(route, snapshot) {
     stage.hidden = true;
   }
   stopStageProgress();
+  clearStoryTime();
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
@@ -1882,6 +1934,7 @@ function renderTimeline(route, ticket) {
     stage.hidden = true;
   }
   stopStageProgress();
+  clearStoryTime();
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
@@ -1993,6 +2046,7 @@ function renderFollowingTimeline(route, targets, results) {
     stage.hidden = true;
   }
   stopStageProgress();
+  clearStoryTime();
   timeline.hidden = false;
   document.body.dataset.view = "timeline";
   document.body.dataset.mode = "dispatch";
@@ -2278,6 +2332,7 @@ function updateClock() {
     clock,
     now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
   );
+  refreshStoryTime();
 }
 
 function updateSourceCount() {

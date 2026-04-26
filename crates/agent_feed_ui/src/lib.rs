@@ -92,6 +92,19 @@ mod tests {
     }
 
     #[test]
+    fn stage_story_time_is_subtle_and_story_bound() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("class=\"story-time\" id=\"story-time\" hidden"));
+        assert!(html.contains(".story-time {\n  position: absolute;"));
+        assert!(html.contains("color: rgba(255, 255, 255, 0.16);"));
+        assert!(html.contains("function renderStoryTime"));
+        assert!(html.contains("storyTime.textContent = `posted ${relativeTime(timestamp)}`;"));
+        assert!(html.contains("function clearStoryTime"));
+        assert!(html.contains("refreshStoryTime();"));
+    }
+
+    #[test]
     fn favicon_matches_feed_mark() {
         let html = render_index_with_config(Some("stage"), &config(false));
 

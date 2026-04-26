@@ -102,7 +102,9 @@ publish signed capsules under the named feed. publication is explicit and
 requires github auth; if there is no valid local auth session, the cli opens the
 github sign-in flow before it starts serving.
 
-p2p publishes signed, settled story capsules. it does not publish raw local
+the current production network uses one low-cost bootstrap/edge peer and an edge
+snapshot fallback while the native libp2p data plane is brought up. it still
+publishes only signed, settled story capsules. it does not publish raw local
 events by default. subscribers receive already-summarized feed material. to
 publish from every local workspace:
 
@@ -143,6 +145,7 @@ https://feed.aberration.technology/mosure/workstation
 
 interactive timeline views can follow feeds in the browser. following is a
 local viewer selection; private feed access remains a signed protocol grant.
+fabric peers may help discovery/routing without following any feed.
 
 ## repo shape
 

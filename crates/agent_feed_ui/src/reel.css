@@ -141,6 +141,28 @@ body.controls-visible .mode-switcher,
   opacity: 0;
 }
 
+.story-time {
+  position: absolute;
+  right: var(--pad);
+  bottom: clamp(42px, 5.5vh, 82px);
+  max-width: min(26ch, 32vw);
+  color: rgba(255, 255, 255, 0.16);
+  font-family: ui-monospace, monospace;
+  font-size: 0.58rem;
+  letter-spacing: 0;
+  line-height: 1.2;
+  overflow: hidden;
+  pointer-events: none;
+  text-align: right;
+  text-overflow: ellipsis;
+  user-select: text;
+  white-space: nowrap;
+}
+
+.story-time[hidden] {
+  display: none;
+}
+
 .stage-progress {
   position: absolute;
   left: var(--pad);
@@ -584,6 +606,10 @@ body[data-mode="breaking"] .chips span {
   }
 
   .footer-rev {
+    display: none;
+  }
+
+  .story-time {
     display: none;
   }
 

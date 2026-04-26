@@ -768,12 +768,9 @@ mod tests {
         event.files = vec!["src/lib.rs".to_string()];
         event.summary = Some("1 changed files. raw diff omitted.".to_string());
         event.score_hint = Some(82);
-        let story = compile_events([event]).remove(0);
+        let stories = compile_events([event]);
 
-        assert!(matches!(
-            StoryCapsule::from_story("feed-workstation", 1, "github:1", &story),
-            Err(ProtoError::StoryRejected)
-        ));
+        assert!(stories.is_empty());
     }
 
     #[test]

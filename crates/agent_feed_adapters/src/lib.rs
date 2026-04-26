@@ -49,7 +49,7 @@ fn display_safe_content_sentence(value: &Value) -> Option<String> {
 }
 
 fn display_safe_agent_sentence(value: &str) -> Option<String> {
-    let sentence = value
+    let first_text_line = value
         .lines()
         .map(str::trim)
         .find(|line| {
@@ -61,6 +61,13 @@ fn display_safe_agent_sentence(value: &str) -> Option<String> {
         })?
         .trim_matches(['`', '"', '\''])
         .trim();
+    if let Some(sentence) = display_safe_processor_summary_sentence(first_text_line) {
+        return Some(sentence);
+    }
+    if looks_like_processor_summary_json(first_text_line) {
+        return None;
+    }
+    let sentence = first_text_line;
     if sentence.is_empty() {
         return None;
     }
@@ -73,6 +80,8 @@ fn display_safe_agent_sentence(value: &str) -> Option<String> {
         "stdout",
         "stderr",
         "diff --git",
+        "/home/",
+        "\\home\\",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
@@ -80,6 +89,93 @@ fn display_safe_agent_sentence(value: &str) -> Option<String> {
         return None;
     }
     Some(clamp_words(sentence, 24))
+}
+
+fn display_safe_processor_summary_sentence(value: &str) -> Option<String> {
+    let json = extract_json_object(value)?;
+    let parsed = serde_json::from_str::<Value>(json).ok()?;
+    let headline = parsed.get("headline")?.as_str()?.trim();
+    if headline.is_empty() || parsed.get("publish").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
+    let deck = parsed
+        .get("deck")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if processor_summary_is_low_signal(headline, deck) {
+        return None;
+    }
+    let mut sentence = headline.trim_end_matches(['.', '!', '?']).to_string();
+    let deck = deck.trim();
+    if !deck.is_empty() && !processor_summary_is_low_signal(deck, "") {
+        sentence.push_str(". ");
+        sentence.push_str(deck.trim_end_matches(['.', '!', '?']));
+    }
+    display_safe_plain_sentence(&sentence)
+}
+
+fn display_safe_plain_sentence(value: &str) -> Option<String> {
+    let sentence = value.trim();
+    if sentence.is_empty() {
+        return None;
+    }
+    let lowered = sentence.to_ascii_lowercase();
+    if [
+        "secret",
+        "token",
+        "password",
+        "api key",
+        "stdout",
+        "stderr",
+        "diff --git",
+        "/home/",
+        "\\home\\",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+    {
+        return None;
+    }
+    Some(clamp_words(sentence, 24))
+}
+
+fn extract_json_object(input: &str) -> Option<&str> {
+    let start = input.find('{')?;
+    let end = input.rfind('}')?;
+    (end > start).then_some(&input[start..=end])
+}
+
+fn looks_like_processor_summary_json(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    trimmed.starts_with('{')
+        && (trimmed.contains("\"headline\"")
+            || trimmed.contains("\"deck\"")
+            || trimmed.contains("\"publish\"")
+            || trimmed.contains("\"memory_digest\"")
+            || trimmed.contains("\"semantic_fingerprint\""))
+}
+
+fn processor_summary_is_low_signal(headline: &str, deck: &str) -> bool {
+    let combined = format!(
+        "{} {}",
+        headline.to_ascii_lowercase(),
+        deck.to_ascii_lowercase()
+    );
+    [
+        "ci status",
+        "command events",
+        "confirms pass state",
+        "file change",
+        "files changed",
+        "matches prior",
+        "raw output",
+        "run state",
+        "settled around",
+        "tests passed",
+        "two-file",
+    ]
+    .iter()
+    .any(|needle| combined.contains(needle))
 }
 
 fn clamp_words(input: &str, max_words: usize) -> String {
@@ -253,6 +349,18 @@ pub mod codex {
         timestamp: Option<&str>,
         payload: &Value,
     ) -> Option<AgentEvent> {
+        if let Some(role) = payload
+            .get("role")
+            .or_else(|| {
+                payload
+                    .get("message")
+                    .and_then(|message| message.get("role"))
+            })
+            .and_then(Value::as_str)
+            && role != "assistant"
+        {
+            return None;
+        }
         let summary = payload
             .get("message")
             .or_else(|| payload.get("content"))
@@ -494,6 +602,21 @@ pub mod codex {
                 .command("apply_patch"),
             ));
         }
+        if let Some(summary) = mcp_tool_summary(name) {
+            return Some(build_event(
+                state,
+                timestamp,
+                TranscriptEvent::new(
+                    EventKind::McpCall,
+                    "codex queried mcp context",
+                    58,
+                    Severity::Info,
+                )
+                .summary(summary)
+                .command(mcp_command_label(name))
+                .tool(mcp_tool_label(name)),
+            ));
+        }
         Some(build_event(
             state,
             timestamp,
@@ -504,7 +627,8 @@ pub mod codex {
                 Severity::Info,
             )
             .summary("tool call started.")
-            .command(name),
+            .command(name)
+            .tool(name),
         ))
     }
 
@@ -514,6 +638,7 @@ pub mod codex {
         title: String,
         summary: Option<String>,
         command: Option<String>,
+        tool: Option<String>,
         files: Vec<String>,
         score_hint: u8,
         severity: Severity,
@@ -531,6 +656,7 @@ pub mod codex {
                 title: title.into(),
                 summary: None,
                 command: None,
+                tool: None,
                 files: Vec::new(),
                 score_hint,
                 severity,
@@ -549,6 +675,11 @@ pub mod codex {
 
         fn command(mut self, command: impl Into<String>) -> Self {
             self.command = Some(command.into());
+            self
+        }
+
+        fn tool(mut self, tool: impl Into<String>) -> Self {
+            self.tool = Some(tool.into());
             self
         }
 
@@ -578,6 +709,7 @@ pub mod codex {
         event.occurred_at = timestamp.and_then(parse_timestamp);
         event.summary = draft.summary;
         event.command = draft.command;
+        event.tool = draft.tool;
         event.files = draft.files;
         event.tags = vec!["codex".to_string(), "transcript".to_string()];
         event.score_hint = Some(draft.score_hint);
@@ -623,6 +755,45 @@ pub mod codex {
             return command_from_arguments(Some(&parsed));
         }
         None
+    }
+
+    fn mcp_tool_summary(name: &str) -> Option<&'static str> {
+        let lowered = name.to_ascii_lowercase();
+        if !(lowered.contains("mcp") || lowered.contains("github")) {
+            return None;
+        }
+        if lowered.contains("pull")
+            || lowered.contains("pr")
+            || lowered.contains("review")
+            || lowered.contains("issue")
+        {
+            return Some("github collaboration context captured through mcp.");
+        }
+        if lowered.contains("workflow")
+            || lowered.contains("check")
+            || lowered.contains("run")
+            || lowered.contains("status")
+        {
+            return Some("github verification context captured through mcp.");
+        }
+        Some("external context captured through mcp.")
+    }
+
+    fn mcp_tool_label(name: &str) -> String {
+        if name.to_ascii_lowercase().contains("github") {
+            "github".to_string()
+        } else {
+            "mcp".to_string()
+        }
+    }
+
+    fn mcp_command_label(name: &str) -> String {
+        let lowered = name.to_ascii_lowercase();
+        if lowered.contains("github") {
+            "mcp github context".to_string()
+        } else {
+            "mcp context".to_string()
+        }
     }
 
     fn command_value_to_string(value: &Value) -> Option<String> {
@@ -1399,6 +1570,68 @@ mod tests {
         assert_eq!(
             events[1].summary.as_deref(),
             Some("Browser feed auth now returns to the CLI callback.")
+        );
+    }
+
+    #[test]
+    fn codex_transcript_ignores_user_and_developer_messages() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:16:50.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"do i need to restart codex sessions after launching agent feed?"}]}}
+{"type":"response_item","timestamp":"2026-04-24T03:16:51.000Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"internal instruction"}]}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:05.000Z","payload":{"type":"task_complete","turn_id":"turn_1","last_agent_message":"Feed watches future transcript writes without restarting sessions.","duration_ms":15000}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::TurnComplete);
+        assert_eq!(
+            events[1].summary.as_deref(),
+            Some("Feed watches future transcript writes without restarting sessions.")
+        );
+    }
+
+    #[test]
+    fn codex_transcript_rejects_low_signal_processor_json_as_agent_copy() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"task_complete","turn_id":"turn_1","last_agent_message":"{\"headline\":\"codex changes two files, matches prior edit story\",\"deck\":\"two changed files repeat the recent file-change summary.\",\"publish\":false,\"memory_digest\":\"repeat\"}","duration_ms":15000}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::TurnComplete);
+        assert!(
+            !events[1]
+                .summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("\"headline\"")
+        );
+        assert_eq!(events[1].summary.as_deref(), Some("turn completed in 15s."));
+    }
+
+    #[test]
+    fn codex_transcript_extracts_mcp_context_as_rollup_signal() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_feed"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_feed","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"custom_tool_call","name":"mcp__codex_apps__github__fetch_pr","arguments":"{}"}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, EventKind::McpCall);
+        assert_eq!(events[1].tool.as_deref(), Some("github"));
+        assert_eq!(events[1].command.as_deref(), Some("mcp github context"));
+        assert_eq!(
+            events[1].summary.as_deref(),
+            Some("github collaboration context captured through mcp.")
         );
     }
 

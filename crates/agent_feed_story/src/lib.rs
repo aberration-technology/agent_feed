@@ -125,7 +125,7 @@ impl StoryWindow {
         self.signals.latest_kind = Some(event.kind);
         self.signals.latest_title = Some(event.title.clone());
         if let Some(summary) = event.summary.as_ref()
-            && (self.signals.latest_summary.is_none() || !summary_is_redundant(summary))
+            && !summary_is_redundant(summary)
         {
             self.signals.latest_summary = Some(summary.clone());
         }
@@ -350,8 +350,14 @@ impl StoryCompiler {
             return None;
         }
 
-        let headline = headline(&window);
-        let deck = deck(&window);
+        let mut headline = headline(&window);
+        let mut deck = deck(&window);
+        if let Some((rewritten_headline, rewritten_deck)) =
+            story_impact_rewrite(&window, &headline, &deck)
+        {
+            headline = rewritten_headline;
+            deck = rewritten_deck;
+        }
         if is_low_quality_story(&window, &headline, &deck) {
             return None;
         }
@@ -586,30 +592,32 @@ fn headline(window: &StoryWindow) -> String {
 
 fn deck(window: &StoryWindow) -> String {
     let mut parts = Vec::new();
+    let mut has_meaningful_turn_summary = false;
     if window.key.family == StoryFamily::Turn
         && let Some(summary) = &window.signals.latest_summary
         && !summary.is_empty()
-        && !summary_is_redundant(summary)
+        && meaningful_summary(summary)
     {
         parts.push(safe_sentence(summary));
+        has_meaningful_turn_summary = true;
     }
     if let Some(deck) = command_burst_deck(window)
         && parts.is_empty()
     {
         parts.push(deck);
     }
-    if window.counters.files_changed > 0 {
+    if window.counters.files_changed > 0 && !has_meaningful_turn_summary {
         parts.push(format!(
             "{} changed files",
             window.counters.files_changed.min(99)
         ));
     }
-    if window.counters.tests_failed > 0 {
+    if window.counters.tests_failed > 0 && !has_meaningful_turn_summary {
         parts.push("tests are red".to_string());
-    } else if window.counters.tests_passed > 0 {
+    } else if window.counters.tests_passed > 0 && !has_meaningful_turn_summary {
         parts.push("tests passed".to_string());
     }
-    if window.counters.tool_failures > 0 {
+    if window.counters.tool_failures > 0 && !has_meaningful_turn_summary {
         parts.push(format!("{} tool failures", window.counters.tool_failures));
     }
     if window.counters.permissions > 0 {
@@ -697,7 +705,7 @@ fn turn_headline(window: &StoryWindow, agent: &str, object: &str) -> String {
 }
 
 fn summary_headline(agent: &str, summary: &str) -> Option<String> {
-    if summary_is_redundant(summary) {
+    if !meaningful_summary(summary) {
         return None;
     }
     let sentence = safe_sentence(summary);
@@ -760,14 +768,39 @@ fn lower_initial(input: &str) -> String {
 }
 
 fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> bool {
-    if window.signals.highest_score >= 90 {
-        return false;
-    }
     let combined = format!(
         "{} {}",
         headline.to_ascii_lowercase(),
         deck.to_ascii_lowercase()
     );
+    if window.key.family == StoryFamily::FileChange
+        && !window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_some_and(meaningful_summary)
+    {
+        return true;
+    }
+    if window.key.family == StoryFamily::Test
+        && window.counters.tests_failed == 0
+        && !window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_some_and(meaningful_summary)
+    {
+        return true;
+    }
+    if window.key.family == StoryFamily::Plan
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_none_or(|summary| !meaningful_summary(summary))
+    {
+        return true;
+    }
     let only_tool_failure = window.key.family == StoryFamily::Incident
         && window.counters.tool_failures > 0
         && window.counters.files_changed == 0
@@ -793,8 +826,23 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
             .signals
             .latest_summary
             .as_deref()
-            .is_none_or(summary_is_redundant);
+            .is_none_or(|summary| !meaningful_summary(summary));
     if turn_only_tool_failure {
+        return true;
+    }
+    let turn_only_mechanics_without_meaningful_summary = window.key.family == StoryFamily::Turn
+        && window.counters.permissions == 0
+        && window.counters.mcp_failures == 0
+        && (window.counters.files_changed > 0
+            || window.counters.tests_failed > 0
+            || window.counters.tests_passed > 0
+            || window.counters.tool_failures > 0)
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_none_or(|summary| !meaningful_summary(summary));
+    if turn_only_mechanics_without_meaningful_summary {
         return true;
     }
     let generic_turn_without_signal = window.key.family == StoryFamily::Turn
@@ -818,12 +866,148 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
             .latest_summary
             .as_deref()
             .is_none_or(|summary| {
-                summary_is_redundant(summary) || !summary_has_work_context(summary)
+                !meaningful_summary(summary) || !summary_has_work_context(summary)
             });
     if command_burst_without_meaningful_summary {
         return true;
     }
+    let generic_turn_terminal_state = window.key.family == StoryFamily::Turn
+        && (combined.contains("turn completed") || combined.contains("turn failed"))
+        && (headline.contains("completed ")
+            || headline.contains("completed local")
+            || headline.contains("completed repos")
+            || deck.contains("turn completed")
+            || deck.contains("turn failed"))
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_none_or(|summary| !meaningful_summary(summary));
+    if generic_turn_terminal_state {
+        return true;
+    }
+    if window.signals.highest_score >= 90 {
+        return false;
+    }
     combined.contains("activity settled") || combined.contains("hit [project] command")
+}
+
+fn story_impact_rewrite(
+    window: &StoryWindow,
+    headline: &str,
+    deck: &str,
+) -> Option<(String, String)> {
+    if window.key.family != StoryFamily::Turn {
+        return None;
+    }
+    let combined = normalized_story_text(&format!(
+        "{} {} {}",
+        headline,
+        deck,
+        window.signals.latest_summary.as_deref().unwrap_or_default()
+    ));
+    let rewrite = if combined.contains("github username")
+        || combined.contains("username route")
+        || (combined.contains("github") && combined.contains("discovery"))
+    {
+        Some((
+            "github profile routes open verified public feed streams",
+            "viewer urls resolve durable github identity before subscribing to visible stories",
+        ))
+    } else if combined.contains("publisher identity")
+        || (combined.contains("verified") && combined.contains("publisher"))
+    {
+        Some((
+            "remote feed headlines show verified publisher identity",
+            "browser viewers can see the github account behind each feed story",
+        ))
+    } else if combined.contains("fabric") && combined.contains("subscription") {
+        Some((
+            "network discovery stays separate from feed subscriptions",
+            "peers can support routing and browser handoff without auto-following feeds",
+        ))
+    } else if combined.contains("sign-in")
+        || combined.contains("sign in")
+        || combined.contains("oauth")
+    {
+        Some((
+            "cli publishing now binds feeds to github sign-in",
+            "native publishers can prove account identity before sending stories to the network",
+        ))
+    } else if combined.contains("headline image") || combined.contains("media layer") {
+        Some((
+            "feed stories support opt-in headline images",
+            "publisher-side image generation stays disabled by default and runs behind guardrails",
+        ))
+    } else if combined.contains("deploy") || combined.contains("deployment") {
+        Some((
+            "feed deployment paths now exercise browser and edge delivery",
+            "static pages, edge APIs, and network canaries can be verified together",
+        ))
+    } else if combined.contains("interactive feed")
+        || combined.contains("automated projection")
+        || combined.contains("timeline")
+    {
+        Some((
+            "feed keeps projection automatic while adding browsable timelines",
+            "interactive controls remain secondary to the hands-free broadcast view",
+        ))
+    } else if combined.contains("org-level")
+        || combined.contains("org level")
+        || combined.contains("organization")
+    {
+        Some((
+            "organization-scoped feeds can gate p2p discovery",
+            "teams can publish shared streams without opening every story to the public network",
+        ))
+    } else if (combined.contains("agent reel") || combined.contains("agent feed"))
+        && (combined.contains("rename") || combined.contains("renamed"))
+    {
+        Some((
+            "agent_feed naming is consistent across crates and publish surfaces",
+            "the workspace, binaries, and public packages now use one product name",
+        ))
+    } else if combined.contains("real codex stream")
+        || combined.contains("settled summarization")
+        || combined.contains("p2p capsule")
+        || combined.contains("story capsule")
+    {
+        Some((
+            "feed turns live agent work into safer public story capsules",
+            "local activity is aggregated into settled, redacted headlines before it reaches the network",
+        ))
+    } else if combined.contains("summarization pass")
+        || combined.contains("story-quality")
+        || combined.contains("story quality")
+        || combined.contains("publish gating")
+    {
+        Some((
+            "feed suppresses duplicate mechanics before publishing",
+            "the story compiler now favors outcome changes over command, file, and test chatter",
+        ))
+    } else if combined.contains("error logging") {
+        Some((
+            "feed surfaces capture and network failures more clearly",
+            "operators get structured logs when local or p2p story delivery misbehaves",
+        ))
+    } else if combined.contains("diloco") {
+        Some((
+            "burn_p2p gets a focused diloco training slice",
+            "the distributed training path moves toward practical multi-peer optimizer coverage",
+        ))
+    } else if combined.contains("actions state is green")
+        || combined.contains("ci, aws deploy")
+        || combined.contains("pages deploy")
+    {
+        Some((
+            "ci and deployment checks are green for the feed release path",
+            "browser pages, aws edge deployment, and repository checks completed together",
+        ))
+    } else {
+        None
+    }?;
+
+    Some((rewrite.0.to_string(), format!("{}.", rewrite.1)))
 }
 
 fn outcome_label(window: &StoryWindow) -> Option<&'static str> {
@@ -876,6 +1060,7 @@ fn command_topic(command: &str) -> Option<&'static str> {
     }
     if lowered.contains("gh run")
         || lowered.contains("github")
+        || lowered.contains("mcp github")
         || lowered.contains("workflow")
         || lowered.contains("ci")
     {
@@ -1008,36 +1193,99 @@ fn safe_sentence(input: &str) -> String {
     clamp_words(input.trim_end_matches(['.', '!', '?']), 20)
 }
 
+fn normalized_story_text(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch.is_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn summary_is_redundant(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
     let trimmed = lowered.trim_start();
+    if lowered.contains("/home/") || lowered.contains("\\home\\") {
+        return true;
+    }
+    if trimmed.starts_with('{')
+        && (trimmed.contains("\"headline\"")
+            || trimmed.contains("\"deck\"")
+            || trimmed.contains("\"publish\"")
+            || trimmed.contains("\"memory_digest\"")
+            || trimmed.contains("\"semantic_fingerprint\""))
+    {
+        return true;
+    }
     if trimmed.starts_with("status ")
         || trimmed.starts_with("exit ")
         || trimmed.starts_with("turn completed in ")
+        || trimmed.starts_with("done")
+        || trimmed.starts_with("i'm ")
+        || trimmed.starts_with("i’m ")
+        || trimmed.starts_with("i'll ")
+        || trimmed.starts_with("i’ll ")
+        || trimmed.starts_with("implemented and pushed")
+        || trimmed.starts_with("model ")
+        || trimmed.starts_with("no,")
+        || trimmed.starts_with("no.")
+        || trimmed.starts_with("not fully")
+        || trimmed.starts_with("implemented and published")
+        || trimmed.starts_with("the code and crates are published")
+        || trimmed.starts_with("the commit is created")
+        || trimmed.starts_with("with that command")
+        || trimmed.starts_with("with the currently")
     {
         return true;
     }
     [
         "agent message recorded",
+        "browser peer/ui seems broken",
         "changed files",
         "checks ci status",
         "ci status",
+        "cli check",
         "command events",
         "command lifecycle captured",
         "confirms pass state",
+        "patch activity captured",
         "raw diff omitted",
+        "raw diff",
         "raw output omitted",
         "raw transcript omitted",
         "raw content omitted",
+        "plan updated",
         "plan update recorded",
         "planning state advanced",
+        "question answered",
+        "dry-run mode",
+        "focused rust tests",
+        "i'm committing",
+        "i’m committing",
+        "implemented and pushed",
+        "local capture is alive",
+        "one more important nuance",
+        "pushing it now",
+        "remote fast-forward",
         "repository state",
         "run state",
         "safe command",
+        "seems broken",
         "settles run state",
         "shifts feed to edits",
         "shell check",
         "shell command failed",
+        "targeted tests",
+        "there are no push-triggered workflows",
+        "this session is network-disabled",
+        "transcript sample",
         "test command failed",
         "test command passed",
         "without raw content",
@@ -1047,33 +1295,54 @@ fn summary_is_redundant(input: &str) -> bool {
     .any(|needle| lowered.contains(needle))
 }
 
+fn meaningful_summary(input: &str) -> bool {
+    !summary_is_redundant(input) && summary_has_work_context(input)
+}
+
 fn summary_has_work_context(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
     [
         "auth",
         "avatar",
+        "aws",
         "browser",
         "broadcast",
+        "callback",
         "capture",
+        "canary",
+        "cli",
+        "coverage",
         "deployment",
         "discovery",
+        "diloco",
         "edge",
+        "error",
+        "feed",
         "github",
         "guardrail",
+        "identity",
         "install",
+        "integration",
+        "logging",
+        "mcp",
+        "model",
         "network",
         "open source",
         "package",
+        "peer",
+        "p2p",
         "privacy",
         "publish",
         "release",
         "route",
         "security",
+        "story",
         "stream",
         "subscription",
         "summarization",
-        "summary",
-        "update",
+        "terraform",
+        "training",
+        "workflow",
         "user",
     ]
     .iter()
@@ -1119,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn file_change_settles_contextual_story() {
+    fn file_change_rolls_up_without_standalone_story() {
         let mut compiler = StoryCompiler::default();
         let mut start = event(EventKind::CommandExec, "codex started a command");
         start.command = Some("cargo test --all".to_string());
@@ -1131,17 +1400,7 @@ mod tests {
         changed.score_hint = Some(82);
         let stories = compiler.ingest(changed);
 
-        assert_eq!(stories.len(), 1);
-        assert!(stories[0].headline.contains("codex changed"));
-        assert!(stories[0].deck.contains("changed files"));
-        assert!(
-            stories[0]
-                .to_bulletin()
-                .eyebrow
-                .contains("codex / agent_feed / file-change")
-        );
-        assert!(!stories[0].deck.contains("raw detail omitted"));
-        assert!(!stories[0].deck.contains("cargo test --all"));
+        assert!(stories.is_empty());
     }
 
     #[test]
@@ -1155,13 +1414,13 @@ mod tests {
         changed.files = vec!["src/lib.rs".to_string(), "src/main.rs".to_string()];
         changed.summary = Some("2 changed files. raw diff omitted.".to_string());
         changed.score_hint = Some(82);
-        assert_eq!(compiler.ingest(changed).len(), 1);
+        assert!(compiler.ingest(changed).is_empty());
 
         let mut pass = event(EventKind::TestPass, "codex tests passed");
         pass.command = Some("cargo test --all".to_string());
         pass.summary = Some("test command passed.".to_string());
         pass.score_hint = Some(76);
-        assert_eq!(compiler.ingest(pass).len(), 1);
+        assert!(compiler.ingest(pass).is_empty());
 
         let mut complete = event(EventKind::TurnComplete, "codex turn completed");
         complete.summary = Some("Implemented the release feed capture path.".to_string());
@@ -1177,9 +1436,103 @@ mod tests {
             turn.deck
                 .contains("Implemented the release feed capture path")
         );
-        assert!(turn.deck.contains("2 changed files"));
-        assert!(turn.deck.contains("tests passed"));
+        assert!(!turn.deck.contains("2 changed files"));
+        assert!(!turn.deck.contains("tests passed"));
         assert!(!turn.deck.contains("cargo test --all"));
+    }
+
+    #[test]
+    fn turn_summary_rewrites_to_public_impact() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("Implemented the p2p publisher identity display path.".to_string());
+        complete.score_hint = Some(90);
+
+        let stories = compiler.ingest(complete);
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(
+            stories[0].headline,
+            "remote feed headlines show verified publisher identity"
+        );
+        assert!(stories[0].deck.contains("github account"));
+    }
+
+    #[test]
+    fn generic_implemented_and_published_status_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("Implemented and published.".to_string());
+        complete.score_hint = Some(84);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn commit_push_narration_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary =
+            Some("Implemented and pushed `fix: improve agent story capture quality`.".to_string());
+        complete.score_hint = Some(90);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn work_in_progress_narration_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some(
+            "I'll check the installed Codex CLI help so the fix uses the actual option names."
+                .to_string(),
+        );
+        complete.score_hint = Some(82);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn generic_plan_update_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut plan = event(EventKind::PlanUpdate, "codex updated the plan");
+        plan.summary = Some("plan updated.".to_string());
+        plan.score_hint = Some(74);
+
+        assert!(compiler.ingest(plan).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn active_verification_status_update_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some(
+            "The focused Rust tests and CLI check are green. I'm now using the actual local transcript pipeline in dry-run mode.".to_string(),
+        );
+        complete.score_hint = Some(90);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn model_only_turn_context_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut start = event(EventKind::TurnStart, "codex turn started");
+        start.summary = Some("model gpt-5.5".to_string());
+        start.score_hint = Some(45);
+        assert!(compiler.ingest(start).is_empty());
+
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("turn completed in 12s.".to_string());
+        complete.score_hint = Some(82);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
     }
 
     #[test]
@@ -1194,7 +1547,7 @@ mod tests {
 
         let mut complete = event(EventKind::TurnComplete, "codex turn completed");
         complete.summary =
-            Some("Verified the repository status after the command failure.".to_string());
+            Some("Improved browser feed error logging after the command failure.".to_string());
         complete.score_hint = Some(82);
         let stories = compiler.ingest(complete);
 
@@ -1202,9 +1555,9 @@ mod tests {
         assert_eq!(stories[0].family, StoryFamily::Turn);
         assert_eq!(
             stories[0].headline,
-            "verified the repository status after the command failure"
+            "feed surfaces capture and network failures more clearly"
         );
-        assert!(stories[0].deck.contains("1 tool failures"));
+        assert!(!stories[0].deck.contains("1 tool failures"));
         assert!(!stories[0].headline.contains("shell command failed"));
     }
 
@@ -1234,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn severe_tool_failure_publishes_breaking_story() {
+    fn severe_generic_tool_failure_does_not_publish() {
         let mut compiler = StoryCompiler::default();
         let mut failed = event(EventKind::ToolFail, "codex command failed");
         failed.summary = Some("exit 1. raw output omitted.".to_string());
@@ -1243,10 +1596,7 @@ mod tests {
 
         let stories = compiler.ingest(failed);
 
-        assert_eq!(stories.len(), 1);
-        assert_eq!(stories[0].family, StoryFamily::Incident);
-        assert!(stories[0].score >= 90);
-        assert_eq!(stories[0].to_bulletin().mode, BulletinMode::Breaking);
+        assert!(stories.is_empty());
     }
 
     #[test]
@@ -1298,12 +1648,64 @@ mod tests {
     }
 
     #[test]
-    fn compiled_story_ticker_is_display_safe() {
+    fn processor_json_summary_does_not_become_story_copy() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some(
+            r#"{"headline":"codex changes two files, matches prior edit story","deck":"two changed files repeat the recent file-change summary.","publish":false,"memory_digest":"repeat"}"#
+                .to_string(),
+        );
+        complete.score_hint = Some(82);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn conversational_answer_summary_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some(
+            "No, `agent-feed serve --p2p --all-workspaces` is not enough to publish.".to_string(),
+        );
+        complete.score_hint = Some(82);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn absolute_path_summary_does_not_publish() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some(
+            "Done. Hero capture written to /home/mosure/repos/agent_feed/docs/image/hero.png."
+                .to_string(),
+        );
+        complete.score_hint = Some(82);
+
+        assert!(compiler.ingest(complete).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn standalone_test_status_without_context_does_not_publish() {
         let mut compiler = StoryCompiler::default();
         let mut pass = event(EventKind::TestPass, "tests passed");
-        pass.summary = Some("cargo test passed after edit".to_string());
-        pass.score_hint = Some(72);
-        let stories = compiler.ingest(pass);
+        pass.summary = Some("test command passed.".to_string());
+        pass.score_hint = Some(76);
+
+        assert!(compiler.ingest(pass).is_empty());
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn compiled_story_ticker_is_display_safe() {
+        let mut compiler = StoryCompiler::default();
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("Improved browser feed discovery for public users.".to_string());
+        complete.score_hint = Some(82);
+        let stories = compiler.ingest(complete);
         let ticker: TickerItem = stories[0].ticker_item();
 
         assert!(ticker.text.contains("codex"));
