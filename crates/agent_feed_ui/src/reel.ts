@@ -1785,12 +1785,23 @@ function followingResolverQuery(route, feed) {
   params.set("network", route.network || "mainnet");
   params.set("story_only", "true");
   params.set("settled_only", "true");
+  copyReelFilterParams(route, params);
   if (feed === "*") {
     params.set("streams", "all");
   } else if (feed) {
     params.set("streams", feed);
   }
   return `?${params.toString()}`;
+}
+
+function copyReelFilterParams(route, params) {
+  const source = new URLSearchParams(route.query || "");
+  for (const key of ["agents", "kinds", "projects", "project", "min_score"]) {
+    const value = source.get(key);
+    if (value) {
+      params.set(key, value);
+    }
+  }
 }
 
 function networkDiscoveryQuery(route) {
@@ -2101,7 +2112,7 @@ function renderGlobalTimeline(route, snapshot) {
     return;
   }
   const feeds = snapshotFeeds(snapshot);
-  const headlines = snapshotHeadlines(snapshot);
+  const headlines = snapshotHeadlines(snapshot).filter((item) => headlineMatchesRoute(item, route));
   logInfo("feed.network.timeline.render", {
     network: route.network,
     feeds: feeds.length,
@@ -2437,6 +2448,10 @@ function followingTargetUrl(target) {
 function timelineActions(feed, route) {
   const actions = document.createElement("div");
   actions.className = "timeline-actions";
+  const project = primaryProjectTag(feed);
+  if (project) {
+    actions.appendChild(projectFilterLink(project, route));
+  }
   const target = followTargetFor(feed, route);
   if (target) {
     actions.appendChild(followButton(target));
@@ -2446,6 +2461,48 @@ function timelineActions(feed, route) {
     actions.appendChild(requestAccessButton(target || route.selection));
   }
   return actions;
+}
+
+function projectFilterLink(project, route) {
+  const link = document.createElement("a");
+  link.className = "feed-action";
+  link.href = projectFilterUrl(project, route);
+  link.textContent = normalizeTag(project) === normalizeTag(routeProjectFilter(route))
+    ? project
+    : `project ${project}`;
+  link.setAttribute("aria-label", `filter timeline to project ${project}`);
+  return link;
+}
+
+function projectFilterUrl(project, route) {
+  const params = new URLSearchParams(route.query || "");
+  params.set("projects", project);
+  params.delete("project");
+  params.set("view", "timeline");
+  for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
+    params.delete(key);
+  }
+  const query = params.toString();
+  return `${routePath(route)}${query ? `?${query}` : ""}`;
+}
+
+function routeProjectFilter(route) {
+  const params = new URLSearchParams(route.query || "");
+  return params.get("projects") || params.get("project") || "";
+}
+
+function routePath(route) {
+  if (!route || route.kind === "global") {
+    return "/";
+  }
+  const login = route.login ? encodeURIComponent(route.login) : "";
+  if (!login) {
+    return "/";
+  }
+  if (route.feed) {
+    return `/${login}/${encodeURIComponent(route.feed)}`;
+  }
+  return `/${login}`;
 }
 
 function followTargetFor(feed, route) {

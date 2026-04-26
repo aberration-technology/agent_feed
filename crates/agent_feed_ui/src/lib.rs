@@ -223,6 +223,7 @@ mod tests {
         assert!(html.contains("function headlineMatchesReelFilters"));
         assert!(html.contains("requestedCsvParams(params, [\"projects\", \"project\"])"));
         assert!(html.contains("function headlineTagTerms"));
+        assert!(html.contains("function copyReelFilterParams"));
         assert!(html.contains("function requestedFeedLabels"));
         assert!(html.contains("function headlineFeedLabels"));
         assert!(html.contains("clean === `${String(login || \"\").replace(/^@/, \"\")}/*`"));
@@ -295,8 +296,20 @@ mod tests {
         assert!(html.contains("window.localStorage.setItem(\"feed.following\""));
         assert!(html.contains("function fetchFollowingTarget"));
         assert!(html.contains("function renderFollowingTimeline"));
+        assert!(html.contains("copyReelFilterParams(route, params);"));
         assert!(html.contains("nothing followed yet"));
         assert!(!html.contains("no subscriptions selected"));
+    }
+
+    #[test]
+    fn timeline_exposes_project_filter_actions() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("function projectFilterLink"));
+        assert!(html.contains("function projectFilterUrl"));
+        assert!(html.contains("params.set(\"projects\", project);"));
+        assert!(html.contains("filter timeline to project ${project}"));
+        assert!(html.contains("actions.appendChild(projectFilterLink(project, route));"));
     }
 
     #[test]

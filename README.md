@@ -150,6 +150,16 @@ https://feed.aberration.technology/mosure/*
 https://feed.aberration.technology/mosure/workstation
 ```
 
+project filters narrow the visible story stream without changing privacy:
+
+```text
+https://feed.aberration.technology/?projects=agent_feed
+https://feed.aberration.technology/mosure/*?projects=burn_p2p
+```
+
+project tags come from the local workspace/repo context when available. they are
+kept as compact feed labels, not paths.
+
 interactive timeline views can follow feeds in the browser. following is a
 local viewer selection; private feed access remains a signed protocol grant.
 fabric peers may help discovery/routing without following any feed.
