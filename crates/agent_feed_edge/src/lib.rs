@@ -1,6 +1,6 @@
 use agent_feed_directory::{
     DirectoryError, DirectoryStore, GithubDiscoveryTicket, GithubProfileView, OrgDiscoveryTicket,
-    OrgRouteFilter, RemoteHeadlineView, RemoteUserRoute, SignedBrowserSeed,
+    OrgRouteFilter, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute, SignedBrowserSeed,
     ensure_current_compatibility, ensure_network_id,
 };
 use agent_feed_identity::{GithubLogin, GithubOrgName, GithubTeamSlug};
@@ -1235,9 +1235,22 @@ async fn network_snapshot(
     if let Err(err) = ensure_network_id(&state.config.network_id, &requested) {
         return edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string());
     }
+    let query = query
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let filter = match RemoteReelFilter::from_query((!query.is_empty()).then_some(query.as_str())) {
+        Ok(filter) => filter,
+        Err(err) => return edge_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
     (
         [(header::CACHE_CONTROL, "no-store")],
-        Json(network_snapshot_value(&state.config, &state.snapshot)),
+        Json(network_snapshot_value_filtered(
+            &state.config,
+            &state.snapshot,
+            Some(&filter),
+        )),
     )
         .into_response()
 }
@@ -1379,6 +1392,7 @@ async fn network_publish_verified(
             deck: capsule.value.deck.clone(),
             lower_third: format!("{} / {}", publisher.display_label(), feed_name),
             chips: capsule.value.chips.clone(),
+            score: capsule.value.score,
             image: capsule.value.image.clone(),
         };
         state.snapshot.push(view);
@@ -1440,6 +1454,7 @@ fn headline_matches_github_route(
     identity_matches
         && public_headline_is_visible(headline)
         && route.stream_filter.permits_label(&headline.feed_label)
+        && headline_matches_reel_filter(headline, &route.reel_filter)
 }
 
 fn feed_matches_github_route(
@@ -1467,6 +1482,62 @@ fn public_headline_is_visible(headline: &RemoteHeadlineView) -> bool {
             headline.deck,
             headline.chips.join(" ")
         ))
+}
+
+fn headline_matches_reel_filter(headline: &RemoteHeadlineView, filter: &RemoteReelFilter) -> bool {
+    if headline.score != 0 && headline.score < filter.min_score {
+        return false;
+    }
+    let terms = headline_filter_terms(headline);
+    filter_values_match(&filter.agent_kinds, &terms)
+        && filter_values_match(&filter.story_kinds, &terms)
+        && filter_values_match(&filter.project_tags, &terms)
+}
+
+fn filter_values_match(requested: &[String], terms: &[String]) -> bool {
+    requested.is_empty()
+        || requested.iter().any(|value| {
+            let requested = normalize_filter_tag(value);
+            !requested.is_empty() && terms.iter().any(|term| term == &requested)
+        })
+}
+
+fn headline_filter_terms(headline: &RemoteHeadlineView) -> Vec<String> {
+    let mut terms = headline
+        .chips
+        .iter()
+        .map(|value| normalize_filter_tag(value))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    for value in headline
+        .lower_third
+        .split(['/', '·', ',', '|'])
+        .chain(std::iter::once(headline.feed_label.as_str()))
+    {
+        let value = normalize_filter_tag(value);
+        if !value.is_empty() {
+            terms.push(value);
+        }
+    }
+    terms
+}
+
+fn normalize_filter_tag(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_was_sep = false;
+    for ch in value.trim().trim_start_matches('@').chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if !last_was_sep && !out.is_empty() {
+            out.push('_');
+            last_was_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
 }
 
 fn remote_copy_has_public_quality_issue(copy: &str) -> bool {
@@ -1550,7 +1621,25 @@ fn remote_copy_has_public_context(normalized: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
+#[cfg(test)]
 fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serde_json::Value {
+    network_snapshot_value_filtered(config, snapshot, None)
+}
+
+fn network_snapshot_value_filtered(
+    config: &EdgeConfig,
+    snapshot: &SnapshotStore,
+    filter: Option<&RemoteReelFilter>,
+) -> serde_json::Value {
+    let headlines = snapshot
+        .headlines()
+        .into_iter()
+        .filter(|headline| {
+            filter
+                .map(|filter| headline_matches_reel_filter(headline, filter))
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
     serde_json::json!({
         "state": "ready",
         "product": "feed",
@@ -1565,7 +1654,7 @@ fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serd
         "story_only": true,
         "raw_events": false,
         "feeds": snapshot.feeds(),
-        "headlines": snapshot.headlines(),
+        "headlines": headlines,
     })
 }
 
@@ -2299,6 +2388,7 @@ mod tests {
             deck: "settled story capsule reached the edge.".to_string(),
             lower_third: "@mosure / workstation".to_string(),
             chips: vec!["verified".to_string(), "codex".to_string()],
+            score: 84,
             image: None,
         };
 
@@ -2329,6 +2419,50 @@ mod tests {
     }
 
     #[test]
+    fn network_snapshot_filters_headlines_by_project_and_score() {
+        let store = SnapshotStore::default();
+        let headline = RemoteHeadlineView {
+            feed_id: "github:123:workstation".to_string(),
+            feed_label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            verified: true,
+            headline: "feed publish path exposes delivery status".to_string(),
+            deck: "operators can see settled stories on the public edge.".to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["agent_reel".to_string(), "codex".to_string()],
+            score: 84,
+            image: None,
+        };
+        let wrong_project = RemoteHeadlineView {
+            chips: vec!["burn_p2p".to_string(), "codex".to_string()],
+            headline: "burn p2p route advertises separate project work".to_string(),
+            ..headline.clone()
+        };
+        let low_score = RemoteHeadlineView {
+            score: 70,
+            headline: "feed headline stays below route threshold".to_string(),
+            ..headline.clone()
+        };
+        store.push(headline);
+        store.push(wrong_project);
+        store.push(low_score);
+        let filter = RemoteReelFilter::from_query(Some("projects=agent-reel&min_score=80"))
+            .expect("filter parses");
+        let snapshot = network_snapshot_value_filtered(&config(), &store, Some(&filter));
+        let headlines = snapshot["headlines"].as_array().expect("headlines");
+
+        assert_eq!(headlines.len(), 1);
+        assert_eq!(
+            headlines[0]["chips"],
+            serde_json::json!(["agent_reel", "codex"])
+        );
+    }
+
+    #[test]
     fn network_snapshot_hides_local_and_bad_public_copy() {
         let store = SnapshotStore::default();
         let base = RemoteHeadlineView {
@@ -2344,6 +2478,7 @@ mod tests {
             deck: "settled story capsule reached the edge.".to_string(),
             lower_third: "@mosure / workstation".to_string(),
             chips: vec!["verified".to_string(), "codex".to_string()],
+            score: 84,
             image: None,
         };
         let mut local = base.clone();
@@ -2578,7 +2713,8 @@ mod tests {
             headline: "codex finished release pass".to_string(),
             deck: "settled story capsule reached the edge.".to_string(),
             lower_third: "@mosure / workstation".to_string(),
-            chips: vec!["verified".to_string()],
+            chips: vec!["agent_reel".to_string(), "verified".to_string()],
+            score: 84,
             image: None,
         };
         let wrong_stream = RemoteHeadlineView {
@@ -2597,6 +2733,38 @@ mod tests {
         ));
         assert!(!headline_matches_github_route(
             &matching, 456, "mosure", &route
+        ));
+
+        let project_route = RemoteUserRoute::parse(
+            "/mosure/workstation",
+            Some("projects=agent-reel&min_score=80"),
+        )
+        .expect("project route parses");
+        let wrong_project = RemoteHeadlineView {
+            chips: vec!["burn_p2p".to_string(), "verified".to_string()],
+            ..matching.clone()
+        };
+        let low_score = RemoteHeadlineView {
+            score: 70,
+            ..matching.clone()
+        };
+        assert!(headline_matches_github_route(
+            &matching,
+            123,
+            "mosure",
+            &project_route
+        ));
+        assert!(!headline_matches_github_route(
+            &wrong_project,
+            123,
+            "mosure",
+            &project_route
+        ));
+        assert!(!headline_matches_github_route(
+            &low_score,
+            123,
+            "mosure",
+            &project_route
         ));
     }
 

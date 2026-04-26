@@ -190,6 +190,8 @@ mod tests {
         assert!(html.contains("feedLink(route.login, \"*\", \"all feeds\""));
         assert!(html.contains("feed.publisher_avatar ||"));
         assert!(html.contains("meta.textContent = feedLabel;"));
+        assert!(html.contains("function timelineMetaText"));
+        assert!(html.contains("function primaryProjectTag"));
         assert!(html.contains("interactive timeline · ${routeStreamLabel(route)}"));
         assert!(!html.contains("feedLink(route.login, \"*\", `${route.login}/*`"));
         assert!(
@@ -218,6 +220,9 @@ mod tests {
 
         assert!(html.contains("function headlineMatchesRoute"));
         assert!(html.contains("const requestedFeeds = requestedFeedLabels(route);"));
+        assert!(html.contains("function headlineMatchesReelFilters"));
+        assert!(html.contains("requestedCsvParams(params, [\"projects\", \"project\"])"));
+        assert!(html.contains("function headlineTagTerms"));
         assert!(html.contains("function requestedFeedLabels"));
         assert!(html.contains("function headlineFeedLabels"));
         assert!(html.contains("clean === `${String(login || \"\").replace(/^@/, \"\")}/*`"));

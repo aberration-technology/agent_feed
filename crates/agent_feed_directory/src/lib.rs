@@ -131,15 +131,7 @@ impl RemoteUserRoute {
             network,
             selection,
             stream_filter,
-            reel_filter: RemoteReelFilter {
-                agent_kinds: params.first("agents").map(split_csv).unwrap_or_default(),
-                story_kinds: params.first("kinds").map(split_csv).unwrap_or_default(),
-                min_score,
-                story_only: true,
-                raw_events: false,
-                require_settled: true,
-                ignored_privacy_params,
-            },
+            reel_filter: RemoteReelFilter::from_params(&params, min_score, ignored_privacy_params),
             layout,
         })
     }
@@ -338,6 +330,7 @@ impl StreamFilter {
 pub struct RemoteReelFilter {
     pub agent_kinds: Vec<String>,
     pub story_kinds: Vec<String>,
+    pub project_tags: Vec<String>,
     pub min_score: u8,
     pub story_only: bool,
     pub raw_events: bool,
@@ -345,11 +338,52 @@ pub struct RemoteReelFilter {
     pub ignored_privacy_params: Vec<String>,
 }
 
+impl RemoteReelFilter {
+    pub fn from_query(query: Option<&str>) -> Result<Self, DirectoryError> {
+        let params = QueryParams::parse(query.unwrap_or_default());
+        let min_score = params
+            .first("min_score")
+            .map(|value| {
+                value
+                    .parse::<u8>()
+                    .map_err(|_| DirectoryError::InvalidMinScore(value.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(75);
+        Ok(Self::from_params(
+            &params,
+            min_score,
+            params.privacy_weakening_keys(),
+        ))
+    }
+
+    fn from_params(
+        params: &QueryParams,
+        min_score: u8,
+        ignored_privacy_params: Vec<String>,
+    ) -> Self {
+        Self {
+            agent_kinds: params.first("agents").map(split_csv).unwrap_or_default(),
+            story_kinds: params.first("kinds").map(split_csv).unwrap_or_default(),
+            project_tags: params
+                .first_any(&["projects", "project"])
+                .map(split_csv)
+                .unwrap_or_default(),
+            min_score,
+            story_only: true,
+            raw_events: false,
+            require_settled: true,
+            ignored_privacy_params,
+        }
+    }
+}
+
 impl Default for RemoteReelFilter {
     fn default() -> Self {
         Self {
             agent_kinds: Vec::new(),
             story_kinds: Vec::new(),
+            project_tags: Vec::new(),
             min_score: 75,
             story_only: true,
             raw_events: false,
@@ -684,6 +718,8 @@ pub struct RemoteHeadlineView {
     pub deck: String,
     pub lower_third: String,
     pub chips: Vec<String>,
+    #[serde(default)]
+    pub score: u8,
     pub image: Option<HeadlineImage>,
 }
 
@@ -735,6 +771,7 @@ impl RemoteHeadlineView {
                 entry.feed_label.as_str()
             ),
             chips: capsule.value.chips.clone(),
+            score: capsule.value.score,
             image: capsule.value.image.clone(),
         })
     }
@@ -1100,15 +1137,11 @@ impl OrgRouteFilter {
             .unwrap_or(75);
         Ok(Self {
             stream_filter,
-            reel_filter: RemoteReelFilter {
-                agent_kinds: params.first("agents").map(split_csv).unwrap_or_default(),
-                story_kinds: params.first("kinds").map(split_csv).unwrap_or_default(),
+            reel_filter: RemoteReelFilter::from_params(
+                &params,
                 min_score,
-                story_only: true,
-                raw_events: false,
-                require_settled: true,
-                ignored_privacy_params: params.privacy_weakening_keys(),
-            },
+                params.privacy_weakening_keys(),
+            ),
         })
     }
 }
@@ -1289,6 +1322,10 @@ impl QueryParams {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value.as_str())
+    }
+
+    fn first_any(&self, keys: &[&str]) -> Option<&str> {
+        keys.iter().find_map(|key| self.first(key))
     }
 
     fn has_flag(&self, key: &str) -> bool {
@@ -1494,10 +1531,14 @@ mod tests {
     fn route_parser_accepts_filters_and_ignores_privacy_weakening_params() {
         let route = RemoteUserRoute::parse(
             "/mosure",
-            Some("streams=workstation,release&agents=codex,claude&kinds=turn.complete,test.fail&min_score=75&redact=off&raw=true"),
+            Some("streams=workstation,release&agents=codex,claude&kinds=turn.complete,test.fail&projects=agent_reel,burn_p2p&min_score=75&redact=off&raw=true"),
         )
         .expect("route parses");
         assert_eq!(route.reel_filter.agent_kinds, vec!["codex", "claude"]);
+        assert_eq!(
+            route.reel_filter.project_tags,
+            vec!["agent_reel", "burn_p2p"]
+        );
         assert_eq!(route.reel_filter.min_score, 75);
         assert!(!route.reel_filter.raw_events);
         assert_eq!(

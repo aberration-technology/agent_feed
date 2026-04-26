@@ -1896,20 +1896,84 @@ function headlineMatchesRoute(item, route) {
   if (!item || !route) {
     return false;
   }
-  if (route.kind === "global") {
-    return true;
-  }
-  const expectedLogin = normalizeRouteLogin(route.login);
-  const publisherLogin = normalizeRouteLogin(publisherLoginFromHeadline(item));
-  if (expectedLogin && publisherLogin && expectedLogin !== publisherLogin) {
-    return false;
+  if (route.kind !== "global") {
+    const expectedLogin = normalizeRouteLogin(route.login);
+    const publisherLogin = normalizeRouteLogin(publisherLoginFromHeadline(item));
+    if (expectedLogin && publisherLogin && expectedLogin !== publisherLogin) {
+      return false;
+    }
   }
   const requestedFeeds = requestedFeedLabels(route);
-  if (!requestedFeeds.length) {
-    return true;
+  if (requestedFeeds.length) {
+    const headlineFeeds = headlineFeedLabels(item);
+    if (!requestedFeeds.some((feed) => headlineFeeds.includes(feed))) {
+      return false;
+    }
   }
-  const headlineFeeds = headlineFeedLabels(item);
-  return requestedFeeds.some((feed) => headlineFeeds.includes(feed));
+  return headlineMatchesReelFilters(item, route);
+}
+
+function headlineMatchesReelFilters(item, route) {
+  const params = new URLSearchParams(route.query || "");
+  const score = headlineScore(item);
+  const minScore = Number(params.get("min_score") || "0") || 0;
+  if (minScore > 0 && score > 0 && score < minScore) {
+    return false;
+  }
+  const terms = headlineTagTerms(item);
+  return (
+    requestedTagsMatch(requestedCsvParams(params, ["agents"]), terms) &&
+    requestedTagsMatch(requestedCsvParams(params, ["kinds"]), terms) &&
+    requestedTagsMatch(requestedCsvParams(params, ["projects", "project"]), terms)
+  );
+}
+
+function requestedCsvParams(params, keys) {
+  for (const key of keys) {
+    const value = params.get(key);
+    if (value) {
+      return value
+        .split(",")
+        .map(normalizeTag)
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function requestedTagsMatch(requested, terms) {
+  return !requested.length || requested.some((value) => terms.includes(value));
+}
+
+function headlineTagTerms(item) {
+  const values = [
+    item.agent,
+    item.agent_kind,
+    item.kind,
+    item.story_kind,
+    item.project,
+    item.project_tag,
+    item.feed_label,
+    item.label,
+    ...(item.chips || []),
+    ...String(item.lower_third || item.lowerThird || "")
+      .split(/[\/·,|]/)
+      .map((value) => value.trim()),
+  ];
+  return [...new Set(values.map(normalizeTag).filter(Boolean))];
+}
+
+function headlineScore(item) {
+  return Number(item.score || item.priority || item.score_hint || item.scoreHint || 0) || 0;
+}
+
+function normalizeTag(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^@/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
 function normalizeRouteLogin(value) {
@@ -1959,6 +2023,66 @@ function headlineFeedLabels(item) {
 
 function normalizeFeedLabel(value) {
   return String(value || "").trim().toLowerCase();
+}
+
+function timelineMetaText(item, fallback = "feed") {
+  const project = primaryProjectTag(item);
+  const feed = item.feed_label || item.label || item.stream_label || "";
+  const when = item.created_at || item.createdAt || item.published_at || item.publishedAt;
+  return uniqueTextParts([project, feed, when ? relativeTime(when) : ""]).join(" · ") || fallback;
+}
+
+function primaryProjectTag(item) {
+  if (item.project || item.project_tag) {
+    return item.project || item.project_tag;
+  }
+  const reserved = new Set([
+    "codex",
+    "claude",
+    "verified",
+    "story_only",
+    "redacted",
+    "score",
+    "turn",
+    "plan",
+    "command",
+    "mcp",
+    "recap",
+    "idle",
+    "incident",
+    "permission",
+    "file_change",
+    "test",
+    "tests",
+    "pass",
+    "fail",
+    "failed",
+    "publish",
+    "edge",
+    "local",
+    "network",
+  ]);
+  const feed = normalizeTag(item.feed_label || item.label || "");
+  return (
+    (item.chips || []).find((chip) => {
+      const value = normalizeTag(chip);
+      return value && value !== feed && !reserved.has(value) && !value.startsWith("score_");
+    }) || ""
+  );
+}
+
+function uniqueTextParts(parts) {
+  const seen = new Set();
+  return parts
+    .map((part) => String(part || "").trim())
+    .filter((part) => {
+      const key = part.toLowerCase();
+      if (!key || seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
 }
 
 function publisherLoginFromHeadline(item) {
@@ -2015,7 +2139,7 @@ function renderGlobalTimeline(route, snapshot) {
       card.appendChild(timelinePublisher(item, { profile: {} }, route));
       const meta = document.createElement("div");
       meta.className = "timeline-meta";
-      meta.textContent = item.feed_label || item.label || "network headline";
+      meta.textContent = timelineMetaText(item, "network headline");
       const title = document.createElement("h2");
       title.textContent = item.headline || item.title || "settled story";
       const copy = document.createElement("p");
@@ -2142,9 +2266,7 @@ function renderTimeline(route, ticket) {
     card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
-    meta.textContent =
-      item.lower_third ||
-      `${item.feed_label || "feed"} · ${relativeTime(item.created_at || item.createdAt || Date.now())}`;
+    meta.textContent = timelineMetaText(item, item.lower_third || "feed");
     const title = document.createElement("h2");
     title.textContent = item.headline || item.title || "settled story";
     const copy = document.createElement("p");
@@ -2256,7 +2378,7 @@ function renderFollowingTimeline(route, targets, results) {
       card.tabIndex = 0;
       const meta = document.createElement("div");
       meta.className = "timeline-meta";
-      meta.textContent = item.lower_third || `${result.target} / following`;
+      meta.textContent = timelineMetaText(item, item.lower_third || `${result.target} / following`);
       const title = document.createElement("h2");
       title.textContent = item.headline || item.title || "settled story";
       const copy = document.createElement("p");
