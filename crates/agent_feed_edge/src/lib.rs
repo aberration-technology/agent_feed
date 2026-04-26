@@ -1130,7 +1130,7 @@ async fn resolve_github(
             let mut response =
                 ResolveGithubResponse::from_ticket_and_headlines(&ticket, &state.config, headlines);
             merge_resolve_feed_views(&mut response.feeds, feeds);
-            Json(response).into_response()
+            ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
         }
         Err(EdgeError::Github(GithubResolveError::NotFound(_))) => {
             edge_error(StatusCode::NOT_FOUND, "github user not found")
@@ -1235,7 +1235,11 @@ async fn network_snapshot(
     if let Err(err) = ensure_network_id(&state.config.network_id, &requested) {
         return edge_error(StatusCode::UPGRADE_REQUIRED, err.to_string());
     }
-    Json(network_snapshot_value(&state.config, &state.snapshot)).into_response()
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(network_snapshot_value(&state.config, &state.snapshot)),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

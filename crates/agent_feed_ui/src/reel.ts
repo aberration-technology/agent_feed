@@ -25,6 +25,13 @@ let bulletins = [];
 let activeIndex = 0;
 let dwellTimer = undefined;
 let controlsTimer = undefined;
+let remoteRefreshTimer = undefined;
+let remoteRefreshInFlight = false;
+let remoteHeadlinesSignature = "";
+let localSnapshotSignature = "";
+
+const LOCAL_SNAPSHOT_REFRESH_MS = 5000;
+const REMOTE_SNAPSHOT_REFRESH_MS = 5000;
 
 const FEED_COMPATIBILITY = window.FEED_COMPATIBILITY || {};
 const FEED_PROTOCOL_VERSION = 1;
@@ -552,6 +559,12 @@ function applySnapshot(snapshot) {
   if (!snapshot || !Array.isArray(snapshot.bulletins)) {
     logWarn("snapshot payload missing bulletins", snapshot);
   }
+  const nextSignature = snapshotSignature(snapshot);
+  if (nextSignature && nextSignature === localSnapshotSignature) {
+    logDebug("feed.snapshot.unchanged", { signature: nextSignature });
+    return;
+  }
+  localSnapshotSignature = nextSignature;
   bulletins = snapshot.bulletins || [];
   if (snapshot.active) {
     const index = bulletins.findIndex((item) => item.id === snapshot.active.id);
@@ -563,6 +576,18 @@ function applySnapshot(snapshot) {
     clearStoryTime();
   }
   updateSourceCount();
+}
+
+function snapshotSignature(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.bulletins)) {
+    return "";
+  }
+  const last = snapshot.bulletins[snapshot.bulletins.length - 1];
+  return [
+    snapshot.bulletins.length,
+    last?.id || "",
+    last?.created_at || last?.createdAt || "",
+  ].join(":");
 }
 
 async function hydrate() {
@@ -1155,22 +1180,70 @@ async function startRemoteRoute(route) {
   setupModeSwitcher(route);
   if (route.feedMode === "following") {
     await startFollowingRoute(route);
+    scheduleRemoteRefresh(route, "initial-following");
     return;
   }
   if (route.kind === "global") {
     await startGlobalDiscoveryRoute(route);
+    scheduleRemoteRefresh(route, "initial-global");
     return;
   }
   await startUserRoute(route);
+  scheduleRemoteRefresh(route, "initial-user");
 }
 
-async function startGlobalDiscoveryRoute(route) {
-  renderRemoteState(route, "resolving", [
-    "joining p2p network",
-    `searching ${route.network}`,
-    "requesting accessible story snapshots",
-    "waiting for settled story capsules",
-  ]);
+function scheduleRemoteRefresh(route, reason = "timer") {
+  window.clearTimeout(remoteRefreshTimer);
+  if (!p2pEnabled()) {
+    return;
+  }
+  remoteRefreshTimer = window.setTimeout(() => {
+    refreshRemoteRoute(route, reason);
+  }, REMOTE_SNAPSHOT_REFRESH_MS);
+  logDebug("feed.remote.refresh.scheduled", {
+    reason,
+    interval_ms: REMOTE_SNAPSHOT_REFRESH_MS,
+    scope: route.kind || "user",
+    selection: route.selection,
+  });
+}
+
+async function refreshRemoteRoute(route, reason = "timer") {
+  if (remoteRefreshInFlight) {
+    scheduleRemoteRefresh(route, "busy");
+    return;
+  }
+  remoteRefreshInFlight = true;
+  try {
+    logInfo("feed.remote.refresh", {
+      reason,
+      scope: route.kind || "user",
+      selection: route.selection,
+      feed_mode: route.feedMode,
+      interactive: route.interactive,
+    });
+    if (route.feedMode === "following") {
+      await startFollowingRoute(route, true);
+    } else if (route.kind === "global") {
+      await startGlobalDiscoveryRoute(route, true);
+    } else {
+      await startUserRoute(route, true);
+    }
+  } finally {
+    remoteRefreshInFlight = false;
+    scheduleRemoteRefresh(route, "interval");
+  }
+}
+
+async function startGlobalDiscoveryRoute(route, refresh = false) {
+  if (!refresh) {
+    renderRemoteState(route, "resolving", [
+      "joining p2p network",
+      `searching ${route.network}`,
+      "requesting accessible story snapshots",
+      "waiting for settled story capsules",
+    ]);
+  }
   const endpoint = `${edgeBaseUrl()}/network/snapshot${networkDiscoveryQuery(route)}`;
   try {
     logInfo("feed.network.discovery.request", {
@@ -1276,13 +1349,15 @@ async function startGlobalDiscoveryRoute(route) {
   }
 }
 
-async function startUserRoute(route) {
-  renderRemoteState(route, "resolving", [
-    "resolving github identity",
-    `finding feeds on ${route.network}`,
-    "dialing p2p peers",
-    "waiting for story capsules",
-  ]);
+async function startUserRoute(route, refresh = false) {
+  if (!refresh) {
+    renderRemoteState(route, "resolving", [
+      "resolving github identity",
+      `finding feeds on ${route.network}`,
+      "dialing p2p peers",
+      "waiting for story capsules",
+    ]);
+  }
   const endpoint = `${edgeBaseUrl()}/resolve/github/${encodeURIComponent(route.login)}${resolverQuery(route)}`;
   try {
     logInfo("feed.resolver.request", {
@@ -1516,23 +1591,26 @@ function networkCompatibilityStatus(route, payload) {
   };
 }
 
-async function startFollowingRoute(route) {
+async function startFollowingRoute(route, refresh = false) {
   const targets = route.followingTargets.map(normalizeFollowTarget).filter(Boolean);
   logInfo("feed.following.selected", {
     network: route.network,
     targets,
     interactive: route.interactive,
+    refresh,
   });
   if (!targets.length) {
     renderFollowingEmpty(route);
     return;
   }
 
-  renderRemoteState(route, "resolving", [
-    `checking ${targets.length} followed ${targets.length === 1 ? "feed" : "feeds"}`,
-    "requesting accessible story snapshots",
-    "showing settled story streams",
-  ]);
+  if (!refresh) {
+    renderRemoteState(route, "resolving", [
+      `checking ${targets.length} followed ${targets.length === 1 ? "feed" : "feeds"}`,
+      "requesting accessible story snapshots",
+      "showing settled story streams",
+    ]);
+  }
   const results = await Promise.all(targets.map((target) => fetchFollowingTarget(route, target)));
   const tickets = results.filter((result) => result.ticket).map((result) => result.ticket);
   const headlines = results
@@ -1662,6 +1740,15 @@ function resolverQuery(route) {
 }
 
 function applyRemoteHeadlines(route, headlines) {
+  const nextSignature = remoteSnapshotSignature(headlines);
+  if (nextSignature && nextSignature === remoteHeadlinesSignature && bulletins.length) {
+    logDebug("feed.network.discovery.headlines.unchanged", {
+      signature: nextSignature,
+      headlines: headlines.length,
+    });
+    return;
+  }
+  remoteHeadlinesSignature = nextSignature;
   bulletins = headlines
     .map((item, index) => remoteHeadlineToBulletin(route, item, index))
     .filter(Boolean)
@@ -1681,6 +1768,16 @@ function applyRemoteHeadlines(route, headlines) {
   logInfo("feed.network.discovery.headlines.render", {
     headlines: bulletins.length,
   });
+}
+
+function remoteSnapshotSignature(headlines) {
+  return (headlines || [])
+    .map((item) => [
+      item.capsule_id || item.id || "",
+      item.created_at || item.createdAt || item.published_at || item.publishedAt || "",
+      item.headline || item.title || "",
+    ].join(":"))
+    .join("|");
 }
 
 function remoteHeadlineToBulletin(route, item, index) {
@@ -2379,5 +2476,5 @@ if (githubAuthCallback) {
 } else {
   hydrate();
   connectSse();
-  window.setInterval(hydrateStatus, 5000);
+  window.setInterval(hydrate, LOCAL_SNAPSHOT_REFRESH_MS);
 }

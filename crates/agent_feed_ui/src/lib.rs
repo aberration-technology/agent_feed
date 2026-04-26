@@ -312,4 +312,19 @@ mod tests {
         assert!(html.contains("hosted feed pages do not link to loopback reels"));
         assert!(html.contains("modeFollowing.textContent = \"following\";"));
     }
+
+    #[test]
+    fn browser_refreshes_local_and_remote_snapshots_without_page_reload() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("const LOCAL_SNAPSHOT_REFRESH_MS = 5000;"));
+        assert!(html.contains("const REMOTE_SNAPSHOT_REFRESH_MS = 5000;"));
+        assert!(html.contains("function scheduleRemoteRefresh"));
+        assert!(html.contains("function refreshRemoteRoute"));
+        assert!(html.contains("await startGlobalDiscoveryRoute(route, true);"));
+        assert!(html.contains("await startUserRoute(route, true);"));
+        assert!(html.contains("await startFollowingRoute(route, true);"));
+        assert!(html.contains("window.setInterval(hydrate, LOCAL_SNAPSHOT_REFRESH_MS);"));
+        assert!(html.contains("feed.network.discovery.headlines.unchanged"));
+    }
 }
