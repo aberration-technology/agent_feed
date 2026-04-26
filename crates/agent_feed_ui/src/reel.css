@@ -97,6 +97,10 @@ body {
   display: none;
 }
 
+body[data-view="timeline"] .mode-switcher {
+  display: none;
+}
+
 body.controls-visible .mode-switcher,
 .mode-switcher:focus-within {
   opacity: 1;
@@ -457,9 +461,20 @@ body.controls-visible .stage-actions,
   padding: 0 var(--pad);
 }
 
+.timeline-toolbar > span {
+  flex: 0 1 auto;
+  min-width: 10ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .timeline-feeds {
   display: flex;
+  flex: 1 1 auto;
+  justify-content: flex-end;
   gap: 10px;
+  max-width: min(760px, 68vw);
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
@@ -678,6 +693,8 @@ body[data-mode="breaking"] .chips span {
   }
 
   .timeline-feeds {
+    justify-content: flex-start;
+    max-width: 100%;
     width: 100%;
   }
 

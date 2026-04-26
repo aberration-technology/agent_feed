@@ -2341,8 +2341,8 @@ function renderGlobalTimeline(route, snapshot) {
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
-  nav.appendChild(rootModeLink(route, "discovery", "all public feeds", true));
-  nav.appendChild(rootModeLink(route, "following", "following", false));
+  nav.appendChild(timelineModeLink(route, "discovery", "all public feeds", true));
+  nav.appendChild(timelineModeLink(route, "following", "following", false));
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
 
@@ -2396,14 +2396,9 @@ function renderGlobalTimeline(route, snapshot) {
   renderTicker(["interactive network discovery", "followed feeds stay explicit"]);
 }
 
-function rootModeLink(route, mode, label, current = false) {
+function timelineModeLink(route, mode, label, current = false) {
   const link = document.createElement("a");
-  const params = new URLSearchParams();
-  params.set("feed_mode", mode);
-  if (route.network && route.network !== "mainnet") {
-    params.set("network", route.network);
-  }
-  link.href = `/?${params.toString()}`;
+  link.href = modeUrl(route, mode);
   link.textContent = label;
   if (current) {
     link.setAttribute("aria-current", "page");
@@ -2465,6 +2460,8 @@ function renderTimeline(route, ticket) {
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
+  nav.appendChild(timelineModeLink(route, "discovery", "discover", route.feedMode !== "following"));
+  nav.appendChild(timelineModeLink(route, "following", "following", route.feedMode === "following"));
   nav.appendChild(
     feedLink(route.login, "*", "all feeds", !route.feed || route.feed === "*"),
   );
@@ -2576,7 +2573,8 @@ function renderFollowingTimeline(route, targets, results) {
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
-  nav.appendChild(rootModeLink(route, "discovery", "discover", false));
+  nav.appendChild(timelineModeLink(route, "discovery", "discover", false));
+  nav.appendChild(timelineModeLink(route, "following", "following", true));
   for (const target of targets) {
     const link = document.createElement("a");
     link.href = followingTargetUrl(target);

@@ -300,7 +300,10 @@ mod tests {
                 "renderPublisher(nextPublisher || (route.kind === \"global\" ? undefined"
             )
         );
-        assert!(html.contains("function rootModeLink"));
+        assert!(html.contains("function timelineModeLink"));
+        assert!(html.contains("body[data-view=\"timeline\"] .mode-switcher"));
+        assert!(html.contains(".timeline-toolbar > span"));
+        assert!(html.contains("nav.appendChild(timelineModeLink(route, \"discovery\""));
         assert!(html.contains("params.set(\"feed_mode\", mode);"));
         assert!(html.contains("per-user discovery is represented by user/* wildcard routes"));
     }
@@ -361,6 +364,7 @@ mod tests {
         );
         assert!(html.contains("hosted feed pages do not link to loopback reels"));
         assert!(html.contains("modeFollowing.textContent = \"following\";"));
+        assert!(html.contains("timelineModeLink(route, \"following\", \"following\""));
     }
 
     #[test]
