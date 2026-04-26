@@ -406,8 +406,21 @@ jobs:
           grep -q '"feed_mode":"discovery"' <<<"$snapshot_payload"
           resolver_payload="$(curl -fsSL --connect-timeout 5 --max-time 20 "${edge_url}/resolve/github/${canary}?feed_mode=discovery")"
           grep -q '"github_user_id"' <<<"$resolver_payload"
-          route_payload="$(curl -fsSL --connect-timeout 5 --max-time 20 "${browser_url}/${canary}?feed_mode=discovery")"
-          grep -q '<title>feed</title>' <<<"$route_payload"
+          route_body="$(mktemp)"
+          route_status="$(
+            curl -sSL \
+              --connect-timeout 5 \
+              --max-time 20 \
+              -o "$route_body" \
+              -w '%{http_code}' \
+              "${browser_url}/${canary}?feed_mode=discovery" || true
+          )"
+          if [[ "$route_status" != "200" && "$route_status" != "404" ]]; then
+            echo "browser deep-link shell returned unexpected status ${route_status}" >&2
+            cat "$route_body" >&2
+            exit 1
+          fi
+          grep -q '<title>feed</title>' "$route_body"
 
       - name: dispatch pages publish
         if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}

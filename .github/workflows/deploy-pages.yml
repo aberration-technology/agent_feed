@@ -140,10 +140,19 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in $(seq 1 12); do
-            if curl -fsSL --connect-timeout 5 --max-time 20 "${{ needs.build.outputs.canary_url }}" | grep -E '<title>feed</title>|class="brand">feed<'; then
+            body="$(mktemp)"
+            http_status="$(
+              curl -sSL \
+                --connect-timeout 5 \
+                --max-time 20 \
+                -o "$body" \
+                -w '%{http_code}' \
+                "${{ needs.build.outputs.canary_url }}" || true
+            )"
+            if [[ "$http_status" == "200" || "$http_status" == "404" ]] && grep -E '<title>feed</title>|class="brand">feed<' "$body"; then
               exit 0
             fi
-            echo "deep-link shell not ready yet; retry ${attempt}/12"
+            echo "deep-link shell not ready yet; status ${http_status}; retry ${attempt}/12"
             sleep 10
           done
           echo "deep-link shell canary failed for ${{ needs.build.outputs.canary_url }}" >&2
