@@ -30,7 +30,11 @@ let remoteRefreshTimer = undefined;
 let remoteRefreshInFlight = false;
 let remoteHeadlinesSignature = "";
 let localSnapshotSignature = "";
+let activeStartedAt = 0;
+let activeDwellMs = 14000;
 
+const MAX_STAGE_BULLETINS = 12;
+const MIN_QUEUED_ADVANCE_MS = 2500;
 const LOCAL_SNAPSHOT_REFRESH_MS = 5000;
 const REMOTE_SNAPSHOT_REFRESH_MS = 5000;
 
@@ -191,9 +195,7 @@ function restartStageProgress(dwellMs = 14000) {
   if (!stageProgress) {
     return;
   }
-  const duration = Number.isFinite(Number(dwellMs))
-    ? Math.max(Number(dwellMs), 1000)
-    : 14000;
+  const duration = normalizeDwellMs(dwellMs);
   stageProgress.hidden = false;
   stageProgress.style.setProperty("--dwell", `${duration}ms`);
   stageProgress.classList.remove("is-running");
@@ -202,6 +204,8 @@ function restartStageProgress(dwellMs = 14000) {
 }
 
 function stopStageProgress() {
+  window.clearTimeout(dwellTimer);
+  dwellTimer = undefined;
   if (stageProgress) {
     stageProgress.classList.remove("is-running");
     stageProgress.style.removeProperty("--dwell");
@@ -258,12 +262,13 @@ function renderBulletin(bulletin) {
     logWarn("render skipped empty bulletin");
     return;
   }
+  const dwellMs = bulletinDwellMs(bulletin);
 
   logInfo("feed.bulletin.render", {
     bulletin_id: bulletin.id,
     mode: bulletin.mode,
     priority: bulletin.priority,
-    dwell_ms: bulletin.dwell_ms || bulletin.dwellMs,
+    dwell_ms: dwellMs,
     publisher: bulletin.publisher?.github_login || bulletin.feed_publisher?.github_login,
   });
   showStage();
@@ -281,8 +286,10 @@ function renderBulletin(bulletin) {
     renderChips(bulletin.chips || []);
     renderTicker(bulletin.ticker || []);
     stage?.classList.remove("is-changing");
+    activeStartedAt = Date.now();
+    activeDwellMs = dwellMs;
     if (bulletins.length > 1) {
-      restartStageProgress(bulletin.dwell_ms || bulletin.dwellMs || 14000);
+      restartStageProgress(dwellMs);
     } else {
       stopStageProgress();
     }
@@ -573,19 +580,215 @@ function renderTicker(items) {
   ticker.appendChild(item);
 }
 
+function normalizeDwellMs(dwellMs) {
+  return Number.isFinite(Number(dwellMs))
+    ? Math.max(Number(dwellMs), 1000)
+    : 14000;
+}
+
+function bulletinDwellMs(bulletin) {
+  return normalizeDwellMs(bulletin?.dwell_ms || bulletin?.dwellMs || 14000);
+}
+
+function bulletinId(bulletin) {
+  return String(bulletin?.id || bulletin?.capsule_id || bulletin?.capsuleId || "");
+}
+
+function activeBulletin() {
+  return bulletins[activeIndex];
+}
+
+function queueIds() {
+  return new Set(bulletins.map(bulletinId).filter(Boolean));
+}
+
+function uniqueBulletins(items) {
+  const seen = new Set();
+  const output = [];
+  for (const item of items || []) {
+    const id = bulletinId(item);
+    if (!item || !id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    output.push(item);
+  }
+  return output;
+}
+
+function trimBulletinQueue(items, preserveId = "") {
+  const next = uniqueBulletins(items);
+  if (next.length <= MAX_STAGE_BULLETINS) {
+    return next;
+  }
+  const tail = next.slice(-MAX_STAGE_BULLETINS);
+  if (!preserveId || tail.some((item) => bulletinId(item) === preserveId)) {
+    return tail;
+  }
+  const preserved = next.find((item) => bulletinId(item) === preserveId);
+  if (!preserved) {
+    return tail;
+  }
+  const tailWithoutPreserved = next
+    .filter((item) => bulletinId(item) !== preserveId)
+    .slice(-(MAX_STAGE_BULLETINS - 1));
+  return [preserved, ...tailWithoutPreserved];
+}
+
+function shouldInterruptBulletin(bulletin) {
+  const priority = Number(bulletin?.priority || bulletin?.score || 0) || 0;
+  const mode = String(bulletin?.mode || bulletin?.visual || "").toLowerCase();
+  return priority >= 95 || (priority >= 90 && ["breaking", "incident"].includes(mode));
+}
+
+function latestInterruptBulletin(items, previousIds) {
+  for (let index = (items || []).length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    const id = bulletinId(item);
+    if (id && !previousIds.has(id) && shouldInterruptBulletin(item)) {
+      return item;
+    }
+  }
+  return undefined;
+}
+
+function queuedAdvanceDelay() {
+  if (!activeStartedAt) {
+    return activeDwellMs;
+  }
+  const elapsed = Date.now() - activeStartedAt;
+  const remaining = Math.max(activeDwellMs - elapsed, MIN_QUEUED_ADVANCE_MS);
+  return Math.min(Math.max(remaining, MIN_QUEUED_ADVANCE_MS), activeDwellMs);
+}
+
+function ensureQueuedAdvance(source) {
+  if (bulletins.length <= 1 || dwellTimer) {
+    return;
+  }
+  const delay = queuedAdvanceDelay();
+  restartStageProgress(delay);
+  scheduleNext(delay);
+  logDebug("feed.bulletin.queue.advance_scheduled", {
+    source,
+    delay_ms: delay,
+    active_id: bulletinId(activeBulletin()),
+    queued: bulletins.length,
+  });
+}
+
+function showQueuedBulletin(bulletin, source, interrupted = false) {
+  const id = bulletinId(bulletin);
+  const index = bulletins.findIndex((item) => bulletinId(item) === id);
+  activeIndex = index >= 0 ? index : Math.max(bulletins.length - 1, 0);
+  renderBulletin(bulletins[activeIndex]);
+  scheduleNext(bulletinDwellMs(bulletins[activeIndex]));
+  logInfo(interrupted ? "feed.bulletin.interrupt" : "feed.bulletin.show", {
+    source,
+    bulletin_id: bulletinId(bulletins[activeIndex]),
+    queued: bulletins.length,
+  });
+}
+
+function applyBulletinQueueUpdate(nextBulletins, source) {
+  const previousActiveId = bulletinId(activeBulletin());
+  const previousIds = queueIds();
+  const incoming = uniqueBulletins(nextBulletins);
+  const interrupt = latestInterruptBulletin(incoming, previousIds);
+
+  bulletins = trimBulletinQueue(incoming, previousActiveId);
+  if (interrupt && !bulletins.some((item) => bulletinId(item) === bulletinId(interrupt))) {
+    bulletins = trimBulletinQueue([...bulletins, interrupt], previousActiveId);
+  }
+  if (!bulletins.length) {
+    activeIndex = 0;
+    stopStageProgress();
+    return { active: undefined, rendered: false, preserved: false, interrupted: false };
+  }
+
+  const preservedIndex = previousActiveId
+    ? bulletins.findIndex((item) => bulletinId(item) === previousActiveId)
+    : -1;
+  const preserved = preservedIndex >= 0;
+  activeIndex = preserved ? preservedIndex : bulletins.length - 1;
+
+  if (interrupt) {
+    showQueuedBulletin(interrupt, source, true);
+    return { active: activeBulletin(), rendered: true, preserved, interrupted: true };
+  }
+  if (!preserved) {
+    showQueuedBulletin(activeBulletin(), source, false);
+    return { active: activeBulletin(), rendered: true, preserved: false, interrupted: false };
+  }
+
+  ensureQueuedAdvance(source);
+  logInfo("feed.bulletin.queued", {
+    source,
+    preserve_active: preserved,
+    active_id: previousActiveId,
+    queued: bulletins.length,
+    new_items: incoming.filter((item) => !previousIds.has(bulletinId(item))).length,
+  });
+  return { active: activeBulletin(), rendered: false, preserved: true, interrupted: false };
+}
+
+function queueIncomingBulletin(bulletin, source) {
+  if (!bulletin || !bulletinId(bulletin)) {
+    logWarn("incoming bulletin missing id", bulletin);
+    return;
+  }
+  const previousActiveId = bulletinId(activeBulletin());
+  const previousIds = queueIds();
+  const existingIndex = bulletins.findIndex((item) => bulletinId(item) === bulletinId(bulletin));
+  if (existingIndex >= 0) {
+    bulletins[existingIndex] = bulletin;
+  } else {
+    bulletins.push(bulletin);
+  }
+  bulletins = trimBulletinQueue(bulletins, previousActiveId);
+  const preservedIndex = previousActiveId
+    ? bulletins.findIndex((item) => bulletinId(item) === previousActiveId)
+    : -1;
+  if (preservedIndex >= 0) {
+    activeIndex = preservedIndex;
+  }
+
+  const isNew = !previousIds.has(bulletinId(bulletin));
+  const shouldRender =
+    !previousActiveId ||
+    bulletins.length === 1 ||
+    (isNew && shouldInterruptBulletin(bulletin));
+  if (shouldRender) {
+    showQueuedBulletin(bulletin, source, isNew && shouldInterruptBulletin(bulletin));
+  } else {
+    ensureQueuedAdvance(source);
+    logInfo("feed.bulletin.queued", {
+      source,
+      active_id: previousActiveId,
+      queued_id: bulletinId(bulletin),
+      queued: bulletins.length,
+    });
+  }
+}
+
 function scheduleNext(dwellMs) {
   window.clearTimeout(dwellTimer);
+  dwellTimer = undefined;
+  if (bulletins.length <= 1) {
+    stopStageProgress();
+    return;
+  }
+  const duration = normalizeDwellMs(dwellMs);
   dwellTimer = window.setTimeout(() => {
+    dwellTimer = undefined;
     if (bulletins.length <= 1) {
       stopStageProgress();
-      scheduleNext(dwellMs);
       return;
     }
     activeIndex = (activeIndex + 1) % bulletins.length;
     const next = bulletins[activeIndex];
     renderBulletin(next);
-    scheduleNext(next.dwell_ms || 14000);
-  }, dwellMs || 14000);
+    scheduleNext(bulletinDwellMs(next));
+  }, duration);
 }
 
 function applySnapshot(snapshot) {
@@ -598,12 +801,14 @@ function applySnapshot(snapshot) {
     return;
   }
   localSnapshotSignature = nextSignature;
-  bulletins = snapshot.bulletins || [];
-  if (snapshot.active) {
-    const index = bulletins.findIndex((item) => item.id === snapshot.active.id);
-    activeIndex = index >= 0 ? index : bulletins.length - 1;
-    renderBulletin(snapshot.active);
-    scheduleNext(snapshot.active.dwell_ms || 14000);
+  const result = applyBulletinQueueUpdate(snapshot.bulletins || [], "local-snapshot");
+  if (result.active) {
+    logInfo("feed.snapshot.queue.applied", {
+      bulletins: bulletins.length,
+      rendered: result.rendered,
+      preserved: result.preserved,
+      interrupted: result.interrupted,
+    });
   } else {
     stopStageProgress();
     clearStoryTime();
@@ -1840,10 +2045,10 @@ function applyRemoteHeadlines(route, headlines) {
     return;
   }
   remoteHeadlinesSignature = nextSignature;
-  bulletins = headlines
+  const nextBulletins = headlines
     .map((item, index) => remoteHeadlineToBulletin(route, item, index))
-    .filter(Boolean)
-    .slice(-12);
+    .filter(Boolean);
+  const result = applyBulletinQueueUpdate(nextBulletins, "remote-snapshot");
   if (!bulletins.length) {
     renderRemoteState(route, "waiting", [
       "network directory connected",
@@ -1851,13 +2056,12 @@ function applyRemoteHeadlines(route, headlines) {
     ]);
     return;
   }
-  activeIndex = bulletins.length - 1;
-  const active = bulletins[activeIndex];
-  renderBulletin(active);
-  scheduleNext(active.dwell_ms || 14000);
   updateSourceCount();
   logInfo("feed.network.discovery.headlines.render", {
     headlines: bulletins.length,
+    rendered: result.rendered,
+    preserved: result.preserved,
+    interrupted: result.interrupted,
   });
 }
 
@@ -2701,11 +2905,7 @@ function connectSse() {
         dwell_ms: bulletin.dwell_ms,
         publisher: bulletin.publisher?.github_login || bulletin.feed_publisher?.github_login,
       });
-      bulletins.push(bulletin);
-      bulletins = bulletins.slice(-12);
-      activeIndex = bulletins.length - 1;
-      renderBulletin(bulletin);
-      scheduleNext(bulletin.dwell_ms || 14000);
+      queueIncomingBulletin(bulletin, "sse");
       updateSourceCount();
     } catch (error) {
       logError("sse bulletin parse/render failed", error);

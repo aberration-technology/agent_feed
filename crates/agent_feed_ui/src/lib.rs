@@ -172,7 +172,10 @@ mod tests {
         let remote_state = html
             .split("function renderRemoteState")
             .nth(1)
-            .expect("remote state renderer is embedded");
+            .expect("remote state renderer is embedded")
+            .split("function routeEyebrow")
+            .next()
+            .expect("remote state renderer has a following function");
 
         assert!(remote_state.contains("stopStageProgress();"));
         assert!(!remote_state.contains("restartStageProgress"));
@@ -368,6 +371,26 @@ mod tests {
         assert!(html.contains("await startFollowingRoute(route, true);"));
         assert!(html.contains("window.setInterval(hydrate, LOCAL_SNAPSHOT_REFRESH_MS);"));
         assert!(html.contains("feed.network.discovery.headlines.unchanged"));
+    }
+
+    #[test]
+    fn browser_queues_new_stories_instead_of_immediate_switching() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("const MAX_STAGE_BULLETINS = 12;"));
+        assert!(html.contains("const MIN_QUEUED_ADVANCE_MS = 2500;"));
+        assert!(html.contains("function applyBulletinQueueUpdate"));
+        assert!(html.contains("function queueIncomingBulletin"));
+        assert!(html.contains("function shouldInterruptBulletin"));
+        assert!(html.contains(
+            "priority >= 95 || (priority >= 90 && [\"breaking\", \"incident\"].includes(mode))"
+        ));
+        assert!(html.contains("feed.bulletin.queued"));
+        assert!(html.contains("feed.bulletin.queue.advance_scheduled"));
+        assert!(html.contains("queueIncomingBulletin(bulletin, \"sse\");"));
+        assert!(
+            !html.contains("activeIndex = bulletins.length - 1;\n      renderBulletin(bulletin);")
+        );
     }
 
     #[test]
