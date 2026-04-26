@@ -11,6 +11,7 @@ const publisher = document.querySelector("#publisher");
 const publisherAvatar = document.querySelector("#publisher-avatar");
 const publisherLabel = document.querySelector("#publisher-label");
 const authAction = document.querySelector("#auth-action");
+const stageActions = document.querySelector("#stage-actions");
 const headlineImage = document.querySelector("#headline-image");
 const headlineImageImg = document.querySelector("#headline-image-img");
 const stageProgress = document.querySelector("#stage-progress");
@@ -149,6 +150,34 @@ function clearAuthAction() {
   setAuthAction("");
 }
 
+function clearStageActions() {
+  if (!stageActions) {
+    return;
+  }
+  stageActions.replaceChildren();
+  stageActions.hidden = true;
+}
+
+function renderStageActions(bulletin) {
+  if (!stageActions) {
+    return;
+  }
+  stageActions.replaceChildren();
+  const target = followTargetForBulletin(bulletin);
+  if (!target || !p2pEnabled()) {
+    stageActions.hidden = true;
+    return;
+  }
+  stageActions.appendChild(followButton(target));
+  const following = document.createElement("a");
+  following.className = "feed-action";
+  following.href = followingTargetUrl(target);
+  following.textContent = "open following";
+  following.setAttribute("aria-label", `open followed feed ${target}`);
+  stageActions.appendChild(following);
+  stageActions.hidden = false;
+}
+
 function showStage() {
   if (stage) {
     stage.hidden = false;
@@ -248,6 +277,7 @@ function renderBulletin(bulletin) {
     renderHeadlineImage(bulletin.image || bulletin.headline_image);
     renderStoryTime(bulletin);
     clearAuthAction();
+    renderStageActions(bulletin);
     renderChips(bulletin.chips || []);
     renderTicker(bulletin.ticker || []);
     stage?.classList.remove("is-changing");
@@ -397,6 +427,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   renderHeadlineImage(undefined);
   clearStoryTime();
   clearAuthAction();
+  clearStageActions();
   renderChips([
     route.feedMode === "following"
       ? "following"
@@ -490,6 +521,7 @@ function renderP2pDisabled(route) {
   renderHeadlineImage(undefined);
   clearStoryTime();
   clearAuthAction();
+  clearStageActions();
   renderChips(["p2p off", "privacy on"]);
   renderTicker(["start with --p2p or use the hosted p2p browser shell"]);
   stopStageProgress();
@@ -533,10 +565,11 @@ function renderTicker(items) {
     return;
   }
   ticker.replaceChildren();
+  if (!items.length) {
+    return;
+  }
   const item = document.createElement("span");
-  item.textContent = items.length
-    ? items.map((entry) => entry.text || entry).join(" · ")
-    : "activity is reduced before display";
+  item.textContent = items.map((entry) => entry.text || entry).join(" · ");
   ticker.appendChild(item);
 }
 
@@ -1084,6 +1117,7 @@ function handleGithubAuthCallback(callback) {
   setText(headline, "github sign-in");
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
+  clearStageActions();
   renderChips(["github", "verified", "browser", "session"]);
   stopStageProgress();
   const expectedState =
@@ -1150,6 +1184,7 @@ function startNetworkView() {
     });
     renderHeadlineImage(undefined);
     setAuthAction(browserSignInUrl(`${window.location.origin}/network`), "refresh github sign-in");
+    clearStageActions();
     renderChips(["github", "signed-in", "browser", "story-only"]);
   } else {
     setText(headline, "github sign-in");
@@ -1157,6 +1192,7 @@ function startNetworkView() {
     renderPublisher(undefined);
     renderHeadlineImage(undefined);
     setAuthAction(browserSignInUrl(`${window.location.origin}/network`));
+    clearStageActions();
     renderChips(["github", "browser", "private feeds", "redacted"]);
   }
   renderTicker(["auth stays on the edge", "projection remains story-only"]);
@@ -2122,6 +2158,7 @@ function renderFollowingEmpty(route) {
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   clearAuthAction();
+  clearStageActions();
   renderChips(["following", "local selection", route.network, "redacted"]);
   renderTicker(["discovery finds feeds", "following is your explicit list"]);
   stopStageProgress();
@@ -2257,14 +2294,44 @@ function followTargetFor(feed, route) {
   return normalizeFollowTarget(`${login}/${label || "*"}`);
 }
 
-function followButton(target) {
+function followTargetForBulletin(bulletin) {
+  const login = publisherLoginFromHeadline(bulletin);
+  if (!login) {
+    return "";
+  }
+  const label = bulletinFeedLabel(bulletin);
+  return normalizeFollowTarget(`${login}/${label || "*"}`);
+}
+
+function bulletinFeedLabel(bulletin) {
+  const direct =
+    bulletin?.feed_label ||
+    bulletin?.feedLabel ||
+    bulletin?.label ||
+    bulletin?.stream_label ||
+    bulletin?.streamLabel ||
+    "";
+  if (direct) {
+    return direct;
+  }
+  const sourceKey = String(bulletin?.source_key || bulletin?.sourceKey || "");
+  if (sourceKey.includes("/")) {
+    return sourceKey.split("/").pop() || "*";
+  }
+  return remoteRoute?.feed || "*";
+}
+
+function followButton(target, labels = {}) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "feed-action";
   const applyState = () => {
     const active = isFollowingTarget(target);
-    button.textContent = active ? "following" : "follow";
+    button.textContent = active
+      ? labels.active || "following"
+      : labels.inactive || "follow";
     button.setAttribute("aria-pressed", active ? "true" : "false");
+    button.setAttribute("aria-label", `${active ? "unfollow" : "follow"} ${target}`);
   };
   applyState();
   button.addEventListener("click", () => {

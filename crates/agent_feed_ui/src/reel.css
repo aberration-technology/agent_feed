@@ -329,6 +329,30 @@ h1 {
   outline: none;
 }
 
+.stage-actions {
+  position: absolute;
+  left: var(--pad);
+  bottom: clamp(56px, 8vh, 104px);
+  z-index: 4;
+  display: inline-flex;
+  max-width: min(460px, calc(100% - var(--pad) * 2));
+  flex-wrap: wrap;
+  gap: 8px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 180ms ease;
+}
+
+.stage-actions[hidden] {
+  display: none;
+}
+
+body.controls-visible .stage-actions,
+.stage-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -536,6 +560,8 @@ h1 {
 
 .feed-action {
   appearance: none;
+  display: inline-flex;
+  align-items: center;
   border: 1px solid var(--line);
   border-radius: 0;
   background: transparent;
@@ -545,6 +571,7 @@ h1 {
   font-family: var(--mono);
   font-size: var(--label);
   padding: 8px 10px;
+  text-decoration: none;
 }
 
 .feed-action:hover,

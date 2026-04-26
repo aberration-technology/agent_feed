@@ -295,6 +295,20 @@ mod tests {
     }
 
     #[test]
+    fn discovery_stage_has_follow_flow_without_default_ticker_copy() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("id=\"stage-actions\" hidden"));
+        assert!(html.contains("function renderStageActions"));
+        assert!(html.contains("function followTargetForBulletin"));
+        assert!(html.contains("stageActions.appendChild(followButton(target));"));
+        assert!(html.contains("following.textContent = \"open following\";"));
+        assert!(html.contains("body.controls-visible .stage-actions"));
+        assert!(html.contains("button.setAttribute(\"aria-label\", `${active ? \"unfollow\" : \"follow\"} ${target}`);"));
+        assert!(!html.contains("activity is reduced before display"));
+    }
+
+    #[test]
     fn mode_switcher_preserves_user_scope_without_loopback_link() {
         let html = render_index_with_config(Some("remote"), &config(true));
 
