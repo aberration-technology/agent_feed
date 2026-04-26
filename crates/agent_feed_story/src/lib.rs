@@ -446,18 +446,17 @@ impl StoryCompiler {
             deck = rewritten_deck;
         }
         let project = window.key.project_hash.clone();
-        let mut chips = vec![
-            window.key.agent.clone(),
-            story_family_label(window.key.family).to_string(),
-            format!("score {score}"),
-            "redacted".to_string(),
-        ];
+        let mut chips = Vec::new();
         if let Some(project) = &project {
-            chips.insert(1, project.clone());
+            chips.push(project.clone());
         }
+        chips.push(window.key.agent.clone());
+        chips.push(story_family_label(window.key.family).to_string());
         if window.counters.files_changed > 0 {
-            chips.insert(2, format!("{} files", window.counters.files_changed));
+            chips.push(format!("{} files", window.counters.files_changed));
         }
+        chips.push(format!("score {score}"));
+        chips.push("redacted".to_string());
         chips.truncate(5);
 
         let lower_third = lower_third(&window, score);
@@ -838,12 +837,14 @@ fn deck(window: &StoryWindow) -> String {
 }
 
 fn lower_third(window: &StoryWindow, score: u8) -> String {
-    let mut parts = vec![window.key.agent.clone()];
     if let Some(project) = &window.key.project_hash {
-        parts.push(project.clone());
-    } else {
-        parts.push("local".to_string());
+        let mut parts = vec![project.clone(), window.key.agent.clone()];
+        parts.push(story_family_label(window.key.family).to_string());
+        parts.push(format!("score {score}"));
+        parts.push("redacted".to_string());
+        return parts.join(" · ");
     }
+    let mut parts = vec![window.key.agent.clone(), "local".to_string()];
     parts.push(story_family_label(window.key.family).to_string());
     parts.push(format!("score {score}"));
     parts.push("redacted".to_string());
@@ -1631,6 +1632,9 @@ mod tests {
         assert!(!turn.deck.contains("2 changed files"));
         assert!(!turn.deck.contains("tests passed"));
         assert!(!turn.deck.contains("cargo test --all"));
+        assert_eq!(turn.chips[0], "agent_feed");
+        assert_eq!(turn.chips[1], "codex");
+        assert!(turn.lower_third.starts_with("agent_feed · codex"));
     }
 
     #[test]

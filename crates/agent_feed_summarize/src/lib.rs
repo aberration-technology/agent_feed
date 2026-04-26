@@ -96,6 +96,8 @@ impl GuardrailPattern {
 pub struct SummaryGuardrails {
     pub name: String,
     pub version: u32,
+    #[serde(default = "default_allow_project_tags")]
+    pub allow_project_tags: bool,
     pub allow_project_names: bool,
     pub allow_local_paths: bool,
     pub allow_command_text: bool,
@@ -115,6 +117,7 @@ impl SummaryGuardrails {
         Self {
             name: "p2p-strict".to_string(),
             version: 1,
+            allow_project_tags: true,
             allow_project_names: false,
             allow_local_paths: false,
             allow_command_text: false,
@@ -167,6 +170,10 @@ impl SummaryGuardrails {
         }
         Ok((output, violations))
     }
+}
+
+fn default_allow_project_tags() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1221,7 +1228,11 @@ fn request_for_external_processor(
     for story in &mut redacted.stories {
         story.key.project_hash = None;
         if !config.guardrails.allow_project_names {
-            story.project = None;
+            story.project = if config.guardrails.allow_project_tags {
+                story.project.as_deref().and_then(public_project_tag)
+            } else {
+                None
+            };
         }
         story.headline = clean_and_clamp(
             &story.headline,
@@ -1241,13 +1252,20 @@ fn request_for_external_processor(
             &config.guardrails,
         )?
         .0;
+        let project_tags =
+            project_tags_for_stories(std::slice::from_ref(story), &config.guardrails);
         story.chips = story
             .chips
             .iter()
             .take(config.budget.max_chips)
             .map(|chip| {
-                clean_and_clamp(chip, config.budget.max_chip_chars, &config.guardrails)
-                    .map(|(chip, _)| chip)
+                clean_chip(
+                    chip,
+                    config.budget.max_chip_chars,
+                    &config.guardrails,
+                    &project_tags,
+                )
+                .map(|(chip, _)| chip)
             })
             .collect::<Result<Vec<_>, _>>()?;
     }
@@ -1369,15 +1387,11 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
             deck: story.deck.clone(),
             lower_third: Some(strict_lower_third(
                 story.agent.as_str(),
+                story.project.as_deref(),
                 story.family,
                 story.score,
             )),
-            chips: story
-                .chips
-                .iter()
-                .filter(|chip| !chip.contains('_') && !chip.contains('/'))
-                .cloned()
-                .collect(),
+            chips: story.chips.clone(),
             publish: None,
             publish_reason: None,
             memory_digest: None,
@@ -1391,15 +1405,11 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
             deck: story.deck.clone(),
             lower_third: Some(strict_lower_third(
                 story.agent.as_str(),
+                story.project.as_deref(),
                 story.family,
                 story.score,
             )),
-            chips: story
-                .chips
-                .iter()
-                .filter(|chip| !chip.contains('_') && !chip.contains('/'))
-                .cloned()
-                .collect(),
+            chips: story.chips.clone(),
             publish: None,
             publish_reason: None,
             memory_digest: None,
@@ -1529,6 +1539,7 @@ fn build_summary(
         deck = "settled story activity reached the feed.".to_string();
     }
 
+    let project_tags = project_tags_for_stories(&request.stories, guardrails);
     let (mut lower_third, lower_violations) = clean_and_clamp(
         processor_output
             .lower_third
@@ -1541,13 +1552,22 @@ fn build_summary(
     if lower_third.is_empty() {
         lower_third = "feed · redacted".to_string();
     }
+    lower_third = remove_project_placeholder_segments(&lower_third);
+    if let Some(project) = project_tags.first() {
+        lower_third = prepend_project_to_lower_third(&lower_third, project);
+        lower_third = clamp_chars(&lower_third, budget.max_lower_third_chars);
+    }
 
-    let mut chips = Vec::new();
+    let mut chips = project_chips(&project_tags, budget.max_chips);
     for chip in processor_output.chips.into_iter().take(budget.max_chips) {
-        let (chip, chip_violations) = clean_and_clamp(&chip, budget.max_chip_chars, guardrails)?;
+        let (chip, chip_violations) =
+            clean_chip(&chip, budget.max_chip_chars, guardrails, &project_tags)?;
         violations.extend(chip_violations);
         if !chip.is_empty() && !chips.iter().any(|existing| existing == &chip) {
             chips.push(chip);
+        }
+        if chips.len() >= budget.max_chips {
+            break;
         }
     }
     if chips.is_empty() {
@@ -1656,6 +1676,121 @@ fn clean_and_clamp(
     let (cleaned, guardrail_violations) = guardrails.clean_text(&input)?;
     violations.extend(guardrail_violations);
     Ok((clamp_chars(&cleaned, max_chars), violations))
+}
+
+fn clean_chip(
+    value: &str,
+    max_chars: usize,
+    guardrails: &SummaryGuardrails,
+    project_tags: &[String],
+) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
+    if guardrails.allow_project_tags
+        && project_tags
+            .iter()
+            .any(|project| project.eq_ignore_ascii_case(value.trim()))
+    {
+        return Ok((clamp_chars(value.trim(), max_chars), Vec::new()));
+    }
+    clean_and_clamp(value, max_chars, guardrails)
+        .map(|(chip, violations)| (remove_project_placeholder_segments(&chip), violations))
+}
+
+fn project_tags_for_stories(
+    stories: &[CompiledStory],
+    guardrails: &SummaryGuardrails,
+) -> Vec<String> {
+    if !guardrails.allow_project_tags {
+        return Vec::new();
+    }
+    stories
+        .iter()
+        .filter_map(|story| story.project.as_deref().and_then(public_project_tag))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn project_chips(project_tags: &[String], max_chips: usize) -> Vec<String> {
+    if max_chips == 0 || project_tags.is_empty() {
+        return Vec::new();
+    }
+    if project_tags.len() <= 3 {
+        return project_tags.iter().take(max_chips).cloned().collect();
+    }
+    let mut chips = project_tags
+        .iter()
+        .take(max_chips.saturating_sub(1).min(2))
+        .cloned()
+        .collect::<Vec<_>>();
+    if chips.len() < max_chips {
+        chips.push(format!("{} projects", project_tags.len()));
+    }
+    chips
+}
+
+fn prepend_project_to_lower_third(lower_third: &str, project: &str) -> String {
+    let lower = lower_third.trim();
+    if lower
+        .split('·')
+        .map(str::trim)
+        .any(|part| part.eq_ignore_ascii_case(project))
+    {
+        lower.to_string()
+    } else if lower.is_empty() {
+        project.to_string()
+    } else {
+        format!("{project} · {lower}")
+    }
+}
+
+fn remove_project_placeholder_segments(value: &str) -> String {
+    let cleaned = value
+        .split('·')
+        .map(str::trim)
+        .filter(|part| !part.eq_ignore_ascii_case("[project]"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if cleaned.is_empty() && value.trim().eq_ignore_ascii_case("[project]") {
+        String::new()
+    } else {
+        cleaned
+    }
+}
+
+fn public_project_tag(project: &str) -> Option<String> {
+    let project = project.trim().trim_matches(['.', ',', ';', ':']);
+    if project.len() < 2 || project.len() > 40 {
+        return None;
+    }
+    if project.contains('/') || project.contains('\\') || project.ends_with(".rs") {
+        return None;
+    }
+    if !project
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    let normalized = project.to_ascii_lowercase();
+    if [
+        "secret",
+        "secrets",
+        "private",
+        "token",
+        "tokens",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "key",
+        "keys",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+    {
+        return None;
+    }
+    Some(project.to_string())
 }
 
 fn fit_capsule_budget(
@@ -2305,8 +2440,13 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         .iter()
         .map(|story| {
             format!(
-                "- agent={} family={:?} score={} headline={} deck={}",
-                story.agent, story.family, story.score, story.headline, story.deck
+                "- project={} agent={} family={:?} score={} headline={} deck={}",
+                story.project.as_deref().unwrap_or("none"),
+                story.agent,
+                story.family,
+                story.score,
+                story.headline,
+                story.deck
             )
         })
         .collect::<Vec<_>>()
@@ -2328,7 +2468,7 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         format!("recent_published:\n{recent}")
     };
     let prompt = format!(
-        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries, or when the facts only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries, or when the facts only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
         request.feed_id, request.mode, recent, stories
     );
     clamp_chars(&prompt, max_prompt_chars)
@@ -2599,8 +2739,20 @@ fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
-fn strict_lower_third(agent: &str, family: StoryFamily, score: u8) -> String {
-    format!("{agent} · {:?} · score {score} · redacted", family)
+fn strict_lower_third(
+    agent: &str,
+    project: Option<&str>,
+    family: StoryFamily,
+    score: u8,
+) -> String {
+    if let Some(project) = project.and_then(public_project_tag) {
+        format!(
+            "{project} · {agent} · {:?} · score {score} · redacted",
+            family
+        )
+    } else {
+        format!("{agent} · {:?} · score {score} · redacted", family)
+    }
 }
 
 fn mask_project_like_terms(input: &str) -> String {
@@ -2693,6 +2845,21 @@ mod tests {
         story.family = StoryFamily::Test;
         story.headline = "codex verified tests".to_string();
         story.deck = "tests passed after the update.".to_string();
+        story
+    }
+
+    fn public_project_story(project: &str, score: u8) -> CompiledStory {
+        let mut story = verified_story(score);
+        story.key.project_hash = Some(project.to_string());
+        story.project = Some(project.to_string());
+        story.lower_third = format!("codex · {project} · test · score {score} · redacted");
+        story.chips = vec![
+            "codex".to_string(),
+            project.to_string(),
+            "test".to_string(),
+            format!("score {score}"),
+            "redacted".to_string(),
+        ];
         story
     }
 
@@ -3152,6 +3319,23 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
     }
 
     #[test]
+    fn external_processor_request_carries_safe_project_tags() {
+        let config = SummaryConfig::p2p_default();
+        let request = SummaryRequest::new(
+            "local:workstation",
+            FeedSummaryMode::FeedRollup,
+            vec![public_project_story("burn_p2p", 88)],
+        );
+
+        let redacted = request_for_external_processor(&request, &config).expect("request redacts");
+        assert_eq!(redacted.stories[0].project.as_deref(), Some("burn_p2p"));
+
+        let prompt = processor_prompt(&redacted);
+        assert!(prompt.contains("project=burn_p2p"));
+        assert!(prompt.contains("Keep provided project labels in chips"));
+    }
+
+    #[test]
     fn external_processor_request_redacts_context_and_recent_history() {
         let config = SummaryConfig::p2p_default();
         let mut request = SummaryRequest::new(
@@ -3196,6 +3380,23 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(!prompt.contains("/home/mosure"));
         assert!(!prompt.contains("cargo test"));
         assert!(!prompt.contains("alice@example.com"));
+    }
+
+    #[test]
+    fn deterministic_summary_preserves_safe_project_tags() {
+        let config = SummaryConfig::p2p_default();
+        let stories = vec![public_project_story("burn_dragon", 88)];
+
+        let summaries =
+            summarize_feed("github:35904762:workstation", &stories, &config).expect("summary");
+
+        assert_eq!(summaries[0].chips[0], "burn_dragon");
+        assert!(summaries[0].chips.iter().any(|chip| chip == "codex"));
+        assert!(summaries[0].lower_third.starts_with("burn_dragon ·"));
+        assert!(!summaries[0].lower_third.contains("[project]"));
+        assert!(!summaries[0].chips.iter().any(|chip| chip == "[project]"));
+        assert!(!summaries[0].headline.contains("burn_dragon"));
+        assert!(!summaries[0].deck.contains("burn_dragon"));
     }
 
     struct EndpointLikeProcessor;
