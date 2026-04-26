@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
+const CAPTURE_STATUS_HEARTBEAT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-feed", version)]
@@ -3582,6 +3583,81 @@ fn post_capture_health(server: &str, agent: &str, adapter: &str, path: &Path) {
     }
 }
 
+struct CaptureWatchPost<'a> {
+    server: &'a str,
+    agent: &'a str,
+    adapter: &'a str,
+    path: &'a Path,
+    state: &'a str,
+    stats: ImportStats,
+    offset: u64,
+    file_len: u64,
+    poll_ms: u64,
+    workspace: Option<&'a WorkspaceFilter>,
+}
+
+fn post_capture_watch_status(update: CaptureWatchPost<'_>) {
+    let body = match serde_json::to_string(&json!({
+        "agent": update.agent,
+        "adapter": update.adapter,
+        "label": capture_watch_label(update.path),
+        "state": update.state,
+        "workspace": capture_status_workspace(update.workspace),
+        "offset": update.offset,
+        "file_len": update.file_len,
+        "imported_events": update.stats.imported,
+        "filtered_events": update.stats.filtered,
+        "poll_ms": update.poll_ms,
+    })) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                agent = %update.agent,
+                adapter = %update.adapter,
+                path = %update.path.display(),
+                error = %err,
+                "capture watcher status encode failed"
+            );
+            return;
+        }
+    };
+    if let Err(err) = post_json(update.server, "/capture/status", &body) {
+        warn!(
+            agent = %update.agent,
+            adapter = %update.adapter,
+            path = %update.path.display(),
+            state = %update.state,
+            error = %err,
+            "capture watcher status post failed"
+        );
+    }
+}
+
+fn capture_watch_label(path: &Path) -> String {
+    let label = path
+        .file_name()
+        .or_else(|| path.file_stem())
+        .and_then(|value| value.to_str())
+        .unwrap_or("session")
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '-' | '_' | '.'))
+        .take(96)
+        .collect::<String>();
+    if label.is_empty() {
+        "session".to_string()
+    } else {
+        label
+    }
+}
+
+fn capture_status_workspace(workspace: Option<&WorkspaceFilter>) -> Option<&'static str> {
+    Some(if workspace.is_some() {
+        "workspace"
+    } else {
+        "all"
+    })
+}
+
 fn print_watch_appended(label: &str, path: &Path, stats: ImportStats) {
     if stats.filtered == 0 {
         println!(
@@ -3944,11 +4020,24 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                 );
                 print_watch_started("codex transcript", &path, stats);
                 post_capture_health(config.server, "codex", "codex.transcript", &path);
+                post_capture_watch_status(CaptureWatchPost {
+                    server: config.server,
+                    agent: "codex",
+                    adapter: "codex.transcript",
+                    path: &path,
+                    state: "watching",
+                    stats,
+                    offset,
+                    file_len: offset,
+                    poll_ms: config.poll_ms,
+                    workspace: config.workspace,
+                });
                 watchers.push(CodexWatcher {
                     path,
                     offset,
                     state,
                     pending: String::new(),
+                    last_status_at: Instant::now(),
                 });
             }
 
@@ -4005,11 +4094,24 @@ fn watch_codex_sessions(
         );
         print_watch_started("codex transcript", path, stats);
         post_capture_health(server, "codex", "codex.transcript", path);
+        post_capture_watch_status(CaptureWatchPost {
+            server,
+            agent: "codex",
+            adapter: "codex.transcript",
+            path,
+            state: "watching",
+            stats,
+            offset,
+            file_len: offset,
+            poll_ms,
+            workspace,
+        });
         watchers.push(CodexWatcher {
             path: path.clone(),
             offset,
             state,
             pending: String::new(),
+            last_status_at: Instant::now(),
         });
     }
 
@@ -4037,8 +4139,36 @@ fn poll_codex_watchers(
             );
             watcher.offset = 0;
             watcher.pending.clear();
+            post_capture_watch_status(CaptureWatchPost {
+                server,
+                agent: "codex",
+                adapter: "codex.transcript",
+                path: &watcher.path,
+                state: "truncated",
+                stats: ImportStats::default(),
+                offset: watcher.offset,
+                file_len: len,
+                poll_ms,
+                workspace,
+            });
+            watcher.last_status_at = Instant::now();
         }
         if len <= watcher.offset {
+            if watcher.last_status_at.elapsed() >= CAPTURE_STATUS_HEARTBEAT {
+                post_capture_watch_status(CaptureWatchPost {
+                    server,
+                    agent: "codex",
+                    adapter: "codex.transcript",
+                    path: &watcher.path,
+                    state: "watching",
+                    stats: ImportStats::default(),
+                    offset: watcher.offset,
+                    file_len: len,
+                    poll_ms,
+                    workspace,
+                });
+                watcher.last_status_at = Instant::now();
+            }
             continue;
         }
         let mut file = File::open(&watcher.path)?;
@@ -4067,6 +4197,19 @@ fn poll_codex_watchers(
             );
             print_watch_appended("codex transcript", &watcher.path, stats);
         }
+        post_capture_watch_status(CaptureWatchPost {
+            server,
+            agent: "codex",
+            adapter: "codex.transcript",
+            path: &watcher.path,
+            state: "appended",
+            stats,
+            offset: watcher.offset,
+            file_len: len,
+            poll_ms,
+            workspace,
+        });
+        watcher.last_status_at = Instant::now();
     }
     Ok(())
 }
@@ -4220,11 +4363,24 @@ fn watch_claude_active_sessions(
                 );
                 print_watch_started("claude stream", &path, stats);
                 post_capture_health(server, "claude", "claude.stream-json", &path);
+                post_capture_watch_status(CaptureWatchPost {
+                    server,
+                    agent: "claude",
+                    adapter: "claude.stream-json",
+                    path: &path,
+                    state: "watching",
+                    stats,
+                    offset,
+                    file_len: offset,
+                    poll_ms,
+                    workspace,
+                });
                 watchers.push(ClaudeWatcher {
                     path,
                     offset,
                     state,
                     pending: String::new(),
+                    last_status_at: Instant::now(),
                 });
             }
 
@@ -4275,11 +4431,24 @@ fn watch_claude_sessions(
         );
         print_watch_started("claude stream", path, stats);
         post_capture_health(server, "claude", "claude.stream-json", path);
+        post_capture_watch_status(CaptureWatchPost {
+            server,
+            agent: "claude",
+            adapter: "claude.stream-json",
+            path,
+            state: "watching",
+            stats,
+            offset,
+            file_len: offset,
+            poll_ms,
+            workspace,
+        });
         watchers.push(ClaudeWatcher {
             path: path.clone(),
             offset,
             state,
             pending: String::new(),
+            last_status_at: Instant::now(),
         });
     }
 
@@ -4307,8 +4476,36 @@ fn poll_claude_watchers(
             );
             watcher.offset = 0;
             watcher.pending.clear();
+            post_capture_watch_status(CaptureWatchPost {
+                server,
+                agent: "claude",
+                adapter: "claude.stream-json",
+                path: &watcher.path,
+                state: "truncated",
+                stats: ImportStats::default(),
+                offset: watcher.offset,
+                file_len: len,
+                poll_ms,
+                workspace,
+            });
+            watcher.last_status_at = Instant::now();
         }
         if len <= watcher.offset {
+            if watcher.last_status_at.elapsed() >= CAPTURE_STATUS_HEARTBEAT {
+                post_capture_watch_status(CaptureWatchPost {
+                    server,
+                    agent: "claude",
+                    adapter: "claude.stream-json",
+                    path: &watcher.path,
+                    state: "watching",
+                    stats: ImportStats::default(),
+                    offset: watcher.offset,
+                    file_len: len,
+                    poll_ms,
+                    workspace,
+                });
+                watcher.last_status_at = Instant::now();
+            }
             continue;
         }
         let mut file = File::open(&watcher.path)?;
@@ -4337,6 +4534,19 @@ fn poll_claude_watchers(
             );
             print_watch_appended("claude stream", &watcher.path, stats);
         }
+        post_capture_watch_status(CaptureWatchPost {
+            server,
+            agent: "claude",
+            adapter: "claude.stream-json",
+            path: &watcher.path,
+            state: "appended",
+            stats,
+            offset: watcher.offset,
+            file_len: len,
+            poll_ms,
+            workspace,
+        });
+        watcher.last_status_at = Instant::now();
     }
     Ok(())
 }
@@ -4485,6 +4695,7 @@ struct CodexWatcher {
     offset: u64,
     state: TranscriptState,
     pending: String,
+    last_status_at: Instant,
 }
 
 #[derive(Debug)]
@@ -4493,6 +4704,7 @@ struct ClaudeWatcher {
     offset: u64,
     state: ClaudeState,
     pending: String,
+    last_status_at: Instant,
 }
 
 fn active_codex_session_paths(

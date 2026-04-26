@@ -341,4 +341,19 @@ mod tests {
         assert!(html.contains("window.setInterval(hydrate, LOCAL_SNAPSHOT_REFRESH_MS);"));
         assert!(html.contains("feed.network.discovery.headlines.unchanged"));
     }
+
+    #[test]
+    fn local_status_renders_capture_watchers_without_fake_story() {
+        let html = render_index_with_config(Some("stage"), &config(false));
+
+        assert!(html.contains("capture_watchers: status.capture_watchers?.length || 0"));
+        assert!(html.contains("function renderCaptureWatchStatus"));
+        assert!(html.contains("function latestCaptureWatcher"));
+        assert!(html.contains("watching agent sessions"));
+        assert!(html.contains("agent activity received"));
+        assert!(html.contains("feed.capture.watch.render"));
+        assert!(html.contains("renderChips([\"watching\", \"story-gated\", \"redacted\"]);"));
+        assert!(!html.contains("0 captures"));
+        assert!(!html.contains("raw events unavailable"));
+    }
 }

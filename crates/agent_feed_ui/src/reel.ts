@@ -649,6 +649,7 @@ async function hydrateStatus() {
     const status = await response.json();
     logInfo("feed.status.applied", {
       captured_sources: status.captured_sources?.length || 0,
+      capture_watchers: status.capture_watchers?.length || 0,
       stored_events: status.stored_events,
       stored_bulletins: status.stored_bulletins,
       last_event_kind: status.last_event_kind,
@@ -657,22 +658,65 @@ async function hydrateStatus() {
       return;
     }
     const captures = status.captured_sources || [];
-    if (captures.length) {
+    const watchers = status.capture_watchers || [];
+    if (watchers.length) {
+      renderCaptureWatchStatus(status, watchers, captures);
+    } else if (captures.length) {
       setText(liveState, "capture");
-      setText(sourceCount, `${captures.length} ${captures.length === 1 ? "capture" : "captures"}`);
+      setText(sourceCount, `${captures.length} src`);
       setText(eyebrow, "local feed / capture live");
       setText(headline, "waiting for settled story");
       const last = status.last_event_kind ? `last event ${status.last_event_kind}` : "future transcript events are being watched";
       setText(deck, `${last}. headlines publish after completion, test, file-change, or incident signals.`);
       clearStoryTime();
-      renderChips(["capture live", "future-only", "redacted"]);
+      renderChips(["watching", "story-gated", "redacted"]);
       renderTicker(captures.map((capture) => `${capture.agent} ${capture.adapter}`));
     } else {
-      setText(sourceCount, "0 captures");
+      setText(sourceCount, "0 src");
     }
   } catch (error) {
     logError("status hydration failed", error);
   }
+}
+
+function renderCaptureWatchStatus(status, watchers, captures = []) {
+  const active = watchers.filter((watcher) => watcher.state !== "waiting");
+  const latest = latestCaptureWatcher(watchers);
+  const sourceTotal = Math.max(active.length, watchers.length, captures.length);
+  const imported = latest ? Number(latest.imported_events || latest.importedEvents || 0) : 0;
+  const filtered = latest ? Number(latest.filtered_events || latest.filteredEvents || 0) : 0;
+  const actor = latest ? `${latest.agent || "agent"} ${latest.adapter || "capture"}` : "agent capture";
+  setText(liveState, "watch");
+  setText(sourceCount, `${sourceTotal} src`);
+  setText(eyebrow, "local feed / capture live");
+  if (imported > 0) {
+    setText(headline, "agent activity received");
+    const filteredLine = filtered > 0 ? ` ${filtered} events were outside the workspace filter.` : "";
+    setText(deck, `${actor} imported ${imported} event${imported === 1 ? "" : "s"}.${filteredLine} waiting for a settled story.`);
+  } else {
+    setText(headline, "watching agent sessions");
+    setText(deck, `${watchers.length} transcript watcher${watchers.length === 1 ? "" : "s"} active. headlines publish after completion, tests, edits, or incidents.`);
+  }
+  clearStoryTime();
+  renderChips(["watching", "story-gated", "redacted"]);
+  renderTicker(watchers.slice(0, 4).map((watcher) => `${watcher.agent || "agent"} ${watcher.adapter || "capture"}`));
+  logInfo("feed.capture.watch.render", {
+    watchers: watchers.length,
+    latest_agent: latest?.agent,
+    latest_adapter: latest?.adapter,
+    latest_state: latest?.state,
+    latest_imported_events: imported,
+  });
+}
+
+function latestCaptureWatcher(watchers) {
+  return watchers
+    .slice()
+    .sort((left, right) => {
+      const leftTime = Date.parse(left.updated_at || left.updatedAt || "") || 0;
+      const rightTime = Date.parse(right.updated_at || right.updatedAt || "") || 0;
+      return rightTime - leftTime;
+    })[0];
 }
 
 function parseRemoteRoute(location) {

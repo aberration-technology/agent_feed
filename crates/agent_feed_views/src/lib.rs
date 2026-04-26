@@ -1,5 +1,5 @@
 use agent_feed_core::{AgentEvent, Bulletin};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug, Serialize)]
@@ -22,6 +22,7 @@ pub struct StatusView {
     pub stored_events: usize,
     pub stored_bulletins: usize,
     pub captured_sources: Vec<CapturedSourceView>,
+    pub capture_watchers: Vec<CaptureWatchView>,
     pub last_event_kind: Option<String>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_event_at: Option<OffsetDateTime>,
@@ -39,6 +40,36 @@ pub struct CapturedSourceView {
     pub last_event_kind: String,
     #[serde(with = "time::serde::rfc3339")]
     pub last_event_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CaptureWatchUpdate {
+    pub agent: String,
+    pub adapter: String,
+    pub label: String,
+    pub state: String,
+    pub workspace: Option<String>,
+    pub offset: u64,
+    pub file_len: u64,
+    pub imported_events: usize,
+    pub filtered_events: usize,
+    pub poll_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptureWatchView {
+    pub agent: String,
+    pub adapter: String,
+    pub label: String,
+    pub state: String,
+    pub workspace: Option<String>,
+    pub offset: u64,
+    pub file_len: u64,
+    pub imported_events: usize,
+    pub filtered_events: usize,
+    pub poll_ms: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Serialize)]

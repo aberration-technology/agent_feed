@@ -10,8 +10,8 @@ use agent_feed_store::InMemoryStore;
 use agent_feed_story::StoryCompiler;
 use agent_feed_ui::UiConfig;
 use agent_feed_views::{
-    AdaptersView, AgentsView, BulletinsView, EventsView, HealthView, IngestView, SessionsView,
-    SseBulletin, StatusView,
+    AdaptersView, AgentsView, BulletinsView, CaptureWatchUpdate, CaptureWatchView, EventsView,
+    HealthView, IngestView, SessionsView, SseBulletin, StatusView,
 };
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -68,6 +68,7 @@ struct AppState {
     tx: broadcast::Sender<Bulletin>,
     redactor: Redactor,
     story: Mutex<StoryCompiler>,
+    capture_watchers: Mutex<BTreeMap<(String, String, String), CaptureWatchView>>,
     metrics: Metrics,
 }
 
@@ -114,6 +115,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         tx,
         redactor: Redactor::default(),
         story: Mutex::new(StoryCompiler::default()),
+        capture_watchers: Mutex::new(BTreeMap::new()),
         metrics: Metrics::default(),
     });
     spawn_story_flush_loop(state.clone());
@@ -134,6 +136,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         .route("/api/adapters", get(adapters))
         .route("/api/health", get(health))
         .route("/api/status", get(status))
+        .route("/capture/status", post(capture_status))
         .route("/ingest/codex/jsonl", post(ingest_codex))
         .route("/ingest/codex/hook", post(ingest_codex))
         .route("/ingest/claude/stream-json", post(ingest_claude))
@@ -423,6 +426,13 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
             },
         )
         .collect();
+    let capture_watchers = state
+        .capture_watchers
+        .lock()
+        .map_err(|_| AppError::StatePoisoned)?
+        .values()
+        .cloned()
+        .collect();
     Ok(Json(StatusView {
         status: "ok",
         bind: state.bind.to_string(),
@@ -433,10 +443,72 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
         stored_events: events.len(),
         stored_bulletins: snapshot.bulletins.len(),
         captured_sources,
+        capture_watchers,
         last_event_kind: last_event.map(|event| event.kind.as_str().to_string()),
         last_event_at: last_event.map(|event| event.occurred_at.unwrap_or(event.received_at)),
         last_bulletin_at: snapshot.active.map(|bulletin| bulletin.created_at),
     }))
+}
+
+async fn capture_status(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<CaptureWatchUpdate>,
+) -> Result<Json<CaptureWatchView>, AppError> {
+    let agent = safe_status_token(&update.agent, "agent");
+    let adapter = safe_status_token(&update.adapter, "adapter");
+    let label = safe_status_token(&update.label, "watcher");
+    let view = CaptureWatchView {
+        agent: agent.clone(),
+        adapter: adapter.clone(),
+        label: label.clone(),
+        state: safe_status_token(&update.state, "watching"),
+        workspace: update
+            .workspace
+            .as_deref()
+            .map(|workspace| safe_status_token(workspace, "workspace")),
+        offset: update.offset,
+        file_len: update.file_len,
+        imported_events: update.imported_events,
+        filtered_events: update.filtered_events,
+        poll_ms: update.poll_ms,
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+    state
+        .capture_watchers
+        .lock()
+        .map_err(|_| AppError::StatePoisoned)?
+        .insert((agent, adapter, label), view.clone());
+    tracing::debug!(
+        agent = %view.agent,
+        adapter = %view.adapter,
+        label = %view.label,
+        state = %view.state,
+        offset = view.offset,
+        file_len = view.file_len,
+        imported_events = view.imported_events,
+        filtered_events = view.filtered_events,
+        "capture watcher status updated"
+    );
+    Ok(Json(view))
+}
+
+fn safe_status_token(value: &str, fallback: &str) -> String {
+    let segment = value
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(fallback);
+    let safe = segment
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '-' | '_' | '.' | ':' | '@'))
+        .take(96)
+        .collect::<String>();
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
 }
 
 #[derive(Debug)]
@@ -718,6 +790,7 @@ mod tests {
             tx,
             redactor: Redactor::default(),
             story: Mutex::new(StoryCompiler::default()),
+            capture_watchers: Mutex::new(BTreeMap::new()),
             metrics: Metrics::default(),
         })
     }
@@ -852,6 +925,42 @@ mod tests {
         assert_eq!(view.captured_sources[0].agent, "codex");
         assert_eq!(view.captured_sources[0].sessions, 1);
         assert_eq!(view.last_event_kind.as_deref(), Some("adapter.health"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_capture_watcher_without_path_leak() {
+        let state = test_state();
+        let Json(watch) = capture_status(
+            State(state.clone()),
+            Json(CaptureWatchUpdate {
+                agent: "codex".to_string(),
+                adapter: "codex.transcript".to_string(),
+                label: "/home/mosure/.codex/sessions/private.jsonl".to_string(),
+                state: "watching".to_string(),
+                workspace: Some("/home/mosure/repos/agent_feed".to_string()),
+                offset: 123,
+                file_len: 456,
+                imported_events: 0,
+                filtered_events: 0,
+                poll_ms: 1000,
+            }),
+        )
+        .await
+        .expect("capture status accepted");
+        assert_eq!(watch.label, "private.jsonl");
+        assert_eq!(watch.workspace.as_deref(), Some("agent_feed"));
+
+        let Json(view) = status(State(state)).await.expect("status renders");
+
+        assert_eq!(view.capture_watchers.len(), 1);
+        assert_eq!(view.capture_watchers[0].agent, "codex");
+        assert_eq!(view.capture_watchers[0].adapter, "codex.transcript");
+        assert_eq!(view.capture_watchers[0].label, "private.jsonl");
+        assert_eq!(view.capture_watchers[0].state, "watching");
+        assert_eq!(view.capture_watchers[0].offset, 123);
+        let body = serde_json::to_string(&view).expect("status serializes");
+        assert!(!body.contains("/home/mosure"));
+        assert!(!body.contains(".codex/sessions"));
     }
 
     #[tokio::test]
