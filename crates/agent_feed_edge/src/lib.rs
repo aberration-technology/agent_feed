@@ -2024,10 +2024,12 @@ impl GithubResolver for CurlGithubResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_feed_core::{PrivacyClass, Severity};
     use agent_feed_directory::{FeedDirectoryEntry, GithubPrincipal, RemoteUserRoute};
     use agent_feed_identity::{GithubOrgName, GithubTeamSlug, GithubUserId};
     use agent_feed_identity_github::{GithubProfile, StaticGithubAccessResolver};
-    use agent_feed_p2p_proto::FeedVisibility;
+    use agent_feed_p2p_proto::{FeedVisibility, Signed, StoryCapsule};
+    use agent_feed_story::{CompiledStory, StoryFamily, StoryKey};
 
     fn profile() -> GithubProfile {
         GithubProfile {
@@ -2470,6 +2472,95 @@ mod tests {
             snapshot["feeds"][0]["publisher_login"],
             serde_json::json!("mosure")
         );
+    }
+
+    #[tokio::test]
+    async fn publish_edge_canary_accepts_capsule_and_snapshot_exposes_headline() {
+        let state = Arc::new(HttpState {
+            config: config(),
+            snapshot: SnapshotStore::default(),
+        });
+        let feed_id = "github:123:workstation";
+        let publisher = PublisherIdentity::github(
+            123,
+            "mosure",
+            Some("mosure".to_string()),
+            Some("/avatar/github/123".to_string()),
+        );
+        let story = CompiledStory {
+            key: StoryKey {
+                feed_id: Some(feed_id.to_string()),
+                agent: "codex".to_string(),
+                project_hash: Some("feed".to_string()),
+                session_id: Some("canary-session".to_string()),
+                turn_id: Some("canary-turn".to_string()),
+                family: StoryFamily::Turn,
+            },
+            created_at: OffsetDateTime::now_utc(),
+            family: StoryFamily::Turn,
+            agent: "codex".to_string(),
+            project: Some("feed".to_string()),
+            headline: "feed publish path exposes delivery status".to_string(),
+            deck: "operators can confirm local stories reached the public edge snapshot without a page refresh.".to_string(),
+            lower_third: "codex · feed · score 91 · redacted".to_string(),
+            chips: vec![
+                "codex".to_string(),
+                "publish".to_string(),
+                "edge".to_string(),
+            ],
+            severity: Severity::Notice,
+            score: 91,
+            context_score: 92,
+            privacy: PrivacyClass::Redacted,
+            evidence_event_ids: vec!["evt_canary_publish".to_string()],
+        };
+        let capsule = StoryCapsule::from_story(feed_id, 1, "local:codex", &story)
+            .expect("story becomes capsule")
+            .with_publisher(publisher.clone())
+            .expect("publisher attaches");
+        let signed = Signed::sign_capsule_with_secret(capsule, "github:123", "test-session-token")
+            .expect("capsule signs with session secret");
+        let request = NetworkPublishRequest {
+            network_id: Some("agent-feed-mainnet".to_string()),
+            compatibility: Some(ProtocolCompatibility::current()),
+            feed_name: Some("workstation".to_string()),
+            feed_id: Some(feed_id.to_string()),
+            publisher: Some(publisher),
+            capsules: vec![signed],
+        };
+
+        let response = network_publish_verified(
+            state.clone(),
+            VerifiedBearer {
+                session: VerifiedSession {
+                    github_user_id: 123,
+                },
+                token: "test-session-token".to_string(),
+            },
+            request,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = network_snapshot_value(&state.config, &state.snapshot);
+        let feeds = snapshot["feeds"].as_array().expect("feeds");
+        let headlines = snapshot["headlines"].as_array().expect("headlines");
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(headlines.len(), 1);
+        assert_eq!(feeds[0]["feed_id"], serde_json::json!(feed_id));
+        assert_eq!(headlines[0]["feed_id"], serde_json::json!(feed_id));
+        assert_eq!(headlines[0]["publisher_login"], serde_json::json!("mosure"));
+        assert_eq!(
+            headlines[0]["publisher_github_user_id"],
+            serde_json::json!(123)
+        );
+        let headline = headlines[0]["headline"].as_str().expect("headline");
+        let deck = headlines[0]["deck"].as_str().expect("deck");
+        assert!(headline.contains("publish") || deck.contains("publish"));
+        let display = serde_json::to_string(&snapshot).expect("snapshot serializes");
+        assert!(!display.contains("raw prompt"));
+        assert!(!display.contains("command output"));
+        assert!(!display.contains("test-session-token"));
     }
 
     #[test]

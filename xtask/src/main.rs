@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         Some("check") => check(args.collect()),
         Some("build-browser-site") => build_browser_site(args.collect()),
         Some("ui") => reserved_lane("ui"),
-        Some("e2e") => reserved_lane("e2e"),
+        Some("e2e") => e2e(args.collect()),
         Some("stress") => reserved_lane("stress"),
         Some(command) => {
             eprintln!("unknown xtask command: {command}");
@@ -64,6 +64,50 @@ fn check(extra: Vec<String>) -> Result<()> {
 fn reserved_lane(name: &str) -> Result<()> {
     println!("xtask {name} is not wired in this checkout");
     Ok(())
+}
+
+fn e2e(args: Vec<String>) -> Result<()> {
+    let lane = args.first().map(String::as_str).unwrap_or("smoke");
+    if args.len() > 1 {
+        return Err(XtaskError::InvalidArgs(format!(
+            "xtask e2e {lane} does not accept extra arguments"
+        )));
+    }
+    match lane {
+        "smoke" => {
+            e2e_publish_edge()?;
+            e2e_browser_refresh()
+        }
+        "publish-edge" | "p2p-publish" => e2e_publish_edge(),
+        "browser-refresh" => e2e_browser_refresh(),
+        other => Err(XtaskError::InvalidArgs(format!(
+            "unknown e2e lane: {other}; use smoke, publish-edge, or browser-refresh"
+        ))),
+    }
+}
+
+fn e2e_publish_edge() -> Result<()> {
+    run(
+        cargo(),
+        &[
+            "test",
+            "-p",
+            "agent_feed_edge",
+            "publish_edge_canary_accepts_capsule_and_snapshot_exposes_headline",
+        ],
+    )
+}
+
+fn e2e_browser_refresh() -> Result<()> {
+    run(
+        cargo(),
+        &[
+            "test",
+            "-p",
+            "agent_feed_ui",
+            "browser_refreshes_local_and_remote_snapshots_without_page_reload",
+        ],
+    )
 }
 
 fn build_browser_site(args: Vec<String>) -> Result<()> {

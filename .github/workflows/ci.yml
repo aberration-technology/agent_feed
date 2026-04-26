@@ -57,6 +57,9 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      - name: e2e smoke
+        run: cargo run -p xtask -- e2e smoke
+
   package:
     name: package and install
     runs-on: ubuntu-latest

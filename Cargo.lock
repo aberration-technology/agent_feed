@@ -136,6 +136,7 @@ dependencies = [
  "agent_feed_p2p_proto",
  "agent_feed_security",
  "agent_feed_social",
+ "agent_feed_story",
  "axum",
  "hmac",
  "regex",
