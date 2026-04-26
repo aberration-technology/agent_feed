@@ -321,6 +321,7 @@ mod tests {
         assert!(html.contains("inactive: wildcard ? \"follow all\" : \"follow feed\""));
         assert!(html.contains("button.dataset.kind = \"follow\";"));
         assert!(html.contains("const follow = toolbarFollowButton(route);"));
+        assert!(html.contains("feed.following.target.directory_fallback"));
         assert!(html.contains("copyReelFilterParams(route, params);"));
         assert!(html.contains("nothing followed yet"));
         assert!(!html.contains("no subscriptions selected"));
@@ -370,6 +371,9 @@ mod tests {
         assert!(html.contains("return `${login}/*`;"));
         assert!(html.contains("link.dataset.kind = \"mode\";"));
         assert!(html.contains("link.dataset.kind = \"feed\";"));
+        assert!(html.contains("function fetchDirectoryTicketForUser"));
+        assert!(html.contains("feed.resolver.directory_fallback"));
+        assert!(html.contains("/network/snapshot${directoryFallbackQuery(route)}"));
         assert!(html.contains(".timeline-feeds a[data-kind=\"mode\"]"));
         assert!(html.contains(".timeline-feeds .feed-action[data-kind=\"follow\"]"));
     }

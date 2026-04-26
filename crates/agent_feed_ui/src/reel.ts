@@ -1657,9 +1657,18 @@ async function startUserRoute(route, refresh = false) {
       status: response.status,
       ok: response.ok,
     });
+    let ticket;
     if (response.status === 404) {
-      renderRemoteState(route, "not-found", ["github user not found"]);
-      return;
+      ticket = await fetchDirectoryTicketForUser(route);
+      if (!ticket) {
+        renderRemoteState(route, "not-found", ["github user not found"]);
+        return;
+      }
+      logWarn("feed.resolver.directory_fallback", {
+        login: route.login,
+        feeds: ticketFeeds(ticket).length,
+        headlines: snapshotHeadlines(ticket).length,
+      });
     }
     if (response.status === 401 || response.status === 403) {
       renderAuthRequired(route);
@@ -1679,10 +1688,12 @@ async function startUserRoute(route, refresh = false) {
       logWarn("feed.user.upgrade_required", { login: route.login, message });
       return;
     }
-    if (!response.ok) {
+    if (!response.ok && !ticket) {
       throw new Error(`resolver failed: ${response.status}`);
     }
-    const ticket = await response.json();
+    if (!ticket) {
+      ticket = await response.json();
+    }
     const ticketStatus = compatibilityStatus(ticket.compatibility || ticket.browser_seed?.compatibility);
     if (!ticketStatus.compatible) {
       renderRemoteState(route, "version-mismatch", [
@@ -1927,6 +1938,13 @@ async function startFollowingRoute(route, refresh = false) {
 async function fetchFollowingTarget(route, target) {
   const clean = normalizeFollowTarget(target);
   const [login, feed = "*"] = clean.split("/");
+  const targetRoute = {
+    ...route,
+    kind: "user",
+    login,
+    feed,
+    selection: feed === "*" ? `${login}/*` : `${login}/${feed}`,
+  };
   const endpoint = `${edgeBaseUrl()}/resolve/github/${encodeURIComponent(login)}${followingResolverQuery(route, feed)}`;
   try {
     logInfo("feed.following.target.request", { target: clean, endpoint });
@@ -1940,6 +1958,24 @@ async function fetchFollowingTarget(route, target) {
       ok: response.ok,
     });
     if (!response.ok) {
+      if (response.status === 404) {
+        const fallbackTicket = await fetchDirectoryTicketForUser(targetRoute);
+        if (fallbackTicket) {
+          logWarn("feed.following.target.directory_fallback", {
+            target: clean,
+            feeds: ticketFeeds(fallbackTicket).length,
+          });
+          return {
+            target: clean,
+            ticket: fallbackTicket,
+            headlines: snapshotHeadlines(fallbackTicket)
+              .filter((item) => compatibilityStatus(item.compatibility || fallbackTicket.compatibility).compatible)
+              .filter((item) => headlineMatchesRoute(item, targetRoute))
+              .map((item) => enrichHeadlineFromTicket(item, fallbackTicket)),
+            error: undefined,
+          };
+        }
+      }
       if (response.status === 426) {
         const message = await responseErrorMessage(response, "update your peer to the latest version");
         return { target: clean, ticket: undefined, headlines: [], error: message };
@@ -1961,13 +1997,6 @@ async function fetchFollowingTarget(route, target) {
       });
       return { target: clean, ticket, headlines: [], error: networkStatus.message };
     }
-    const targetRoute = {
-      ...route,
-      kind: "user",
-      login,
-      feed,
-      selection: feed === "*" ? `${login}/*` : `${login}/${feed}`,
-    };
     return {
       target: clean,
       ticket,
@@ -1981,6 +2010,109 @@ async function fetchFollowingTarget(route, target) {
     logError("following target resolution failed", error);
     return { target: clean, ticket: undefined, headlines: [], error: String(error) };
   }
+}
+
+async function fetchDirectoryTicketForUser(route) {
+  const endpoint = `${edgeBaseUrl()}/network/snapshot${directoryFallbackQuery(route)}`;
+  const expectedLogin = normalizeRouteLogin(route.login);
+  try {
+    logInfo("feed.directory.user_fallback.request", {
+      login: route.login,
+      endpoint,
+    });
+    const response = await fetch(endpoint, {
+      cache: "no-store",
+      headers: githubAuthHeaders(),
+    });
+    logInfo("feed.directory.user_fallback.response", {
+      login: route.login,
+      status: response.status,
+      ok: response.ok,
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+    const snapshot = await response.json();
+    const feeds = snapshotFeeds(snapshot).filter(
+      (feed) => normalizeRouteLogin(publisherLoginForProfile(feed, { profile: {} })) === expectedLogin,
+    );
+    const fallbackRoute = {
+      ...route,
+      kind: "user",
+      login: route.login,
+      feed: route.feed || "*",
+      selection: route.selection || `${route.login}/${route.feed || "*"}`,
+    };
+    const baseProfileTicket = directoryProfileTicket(route, feeds, [], snapshot);
+    const headlines = snapshotHeadlines(snapshot)
+      .filter((item) => headlineMatchesRoute(item, fallbackRoute))
+      .map((item) => enrichHeadlineFromTicket(item, baseProfileTicket));
+    if (!feeds.length && !headlines.length) {
+      return undefined;
+    }
+    const profileTicket = directoryProfileTicket(route, feeds, headlines, snapshot);
+    return {
+      ...snapshot,
+      requested_login: route.login,
+      resolved_github_id: profileTicket.resolved_github_id,
+      github_user_id: profileTicket.github_user_id,
+      profile: profileTicket.profile,
+      feeds,
+      candidate_feeds: feeds,
+      headlines,
+    };
+  } catch (error) {
+    logError("directory user fallback failed", error);
+    return undefined;
+  }
+}
+
+function directoryFallbackQuery(route) {
+  const params = new URLSearchParams();
+  params.set("network", route.network || "mainnet");
+  params.set("feed_mode", "discovery");
+  params.set("story_only", "true");
+  params.set("settled_only", "true");
+  copyReelFilterParams(route, params);
+  return `?${params.toString()}`;
+}
+
+function directoryProfileTicket(route, feeds, headlines, snapshot) {
+  const source = feeds[0] || headlines[0] || {};
+  const githubId =
+    source.publisher_github_user_id ||
+    source.github_user_id ||
+    source.publisher?.github_user_id ||
+    source.owner?.github_user_id ||
+    "";
+  const login =
+    publisherLoginForProfile(source, { profile: {} }) ||
+    publisherLoginFromHeadline(source) ||
+    route.login;
+  const avatar =
+    source.publisher_avatar ||
+    source.avatar ||
+    source.publisher?.avatar ||
+    source.owner?.avatar?.url ||
+    source.owner?.avatar_url ||
+    "";
+  const displayName =
+    source.publisher_display_name ||
+    source.display_name ||
+    source.publisher?.display_name ||
+    source.owner?.display_name ||
+    login;
+  return {
+    compatibility: snapshot.compatibility,
+    browser_seed: snapshot.browser_seed,
+    github_user_id: githubId,
+    resolved_github_id: githubId,
+    profile: {
+      login,
+      name: displayName,
+      avatar,
+    },
+  };
 }
 
 function followingResolverQuery(route, feed) {
