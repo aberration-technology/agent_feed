@@ -141,7 +141,7 @@ jobs:
             --output json | tee "$artifact_dir/diagnostics-invocation.json" || true
 
       - name: upload inspect artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: feed-p2p-inspect
           path: ${{ runner.temp }}/feed-inspect
