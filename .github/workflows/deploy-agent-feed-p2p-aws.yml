@@ -33,6 +33,9 @@ concurrency:
   group: deploy-feed-p2p-aws-${{ github.event.inputs.environment }}-${{ github.event.inputs.terraform_workspace }}
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
