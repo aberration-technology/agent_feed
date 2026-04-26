@@ -11,8 +11,8 @@ use agent_feed_story::{StoryCompiler, StoryCompilerDiagnostics, StoryDecisionAct
 use agent_feed_ui::UiConfig;
 use agent_feed_views::{
     AdaptersView, AgentsView, BulletinsView, CaptureWatchUpdate, CaptureWatchView, EventsView,
-    HealthView, IngestView, SessionsView, SseBulletin, StatusView, StoryDecisionView,
-    StoryStatusView,
+    HealthView, IngestView, PublishStatusUpdate, PublishStatusView, SessionsView, SseBulletin,
+    StatusView, StoryDecisionView, StoryStatusView,
 };
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -70,6 +70,7 @@ struct AppState {
     redactor: Redactor,
     story: Mutex<StoryCompiler>,
     capture_watchers: Mutex<BTreeMap<(String, String, String), CaptureWatchView>>,
+    publish_status: Mutex<Option<PublishStatusView>>,
     metrics: Metrics,
 }
 
@@ -117,6 +118,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         redactor: Redactor::default(),
         story: Mutex::new(StoryCompiler::default()),
         capture_watchers: Mutex::new(BTreeMap::new()),
+        publish_status: Mutex::new(None),
         metrics: Metrics::default(),
     });
     spawn_story_flush_loop(state.clone());
@@ -138,6 +140,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         .route("/api/health", get(health))
         .route("/api/status", get(status))
         .route("/capture/status", post(capture_status))
+        .route("/publish/status", post(publish_status))
         .route("/ingest/codex/jsonl", post(ingest_codex))
         .route("/ingest/codex/hook", post(ingest_codex))
         .route("/ingest/claude/stream-json", post(ingest_claude))
@@ -441,6 +444,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
             .map_err(|_| AppError::StatePoisoned)?
             .diagnostics(),
     );
+    let publish = state
+        .publish_status
+        .lock()
+        .map_err(|_| AppError::StatePoisoned)?
+        .clone();
     Ok(Json(StatusView {
         status: "ok".to_string(),
         bind: state.bind.to_string(),
@@ -451,6 +459,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
         stored_events: events.len(),
         stored_bulletins: snapshot.bulletins.len(),
         story,
+        publish,
         captured_sources,
         capture_watchers,
         last_event_kind: last_event.map(|event| event.kind.as_str().to_string()),
@@ -545,6 +554,51 @@ async fn capture_status(
     Ok(Json(view))
 }
 
+async fn publish_status(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<PublishStatusUpdate>,
+) -> Result<Json<PublishStatusView>, AppError> {
+    let view = PublishStatusView {
+        feed: safe_status_token(&update.feed, "feed"),
+        state: safe_status_token(&update.state, "unknown"),
+        edge: safe_status_text(&update.edge, 180),
+        network_id: safe_status_token(&update.network_id, "network"),
+        publisher: update
+            .publisher
+            .as_deref()
+            .map(|publisher| safe_status_token(publisher, "publisher")),
+        pending_stories: update.pending_stories,
+        last_batch_stories: update.last_batch_stories,
+        last_batch_capsules: update.last_batch_capsules,
+        last_edge_accepted: update.last_edge_accepted,
+        last_edge_feeds: update.last_edge_feeds,
+        last_edge_headlines: update.last_edge_headlines,
+        detail: update
+            .detail
+            .as_deref()
+            .map(|detail| safe_status_text(detail, 220)),
+        last_error: update
+            .last_error
+            .as_deref()
+            .map(|error| safe_status_text(error, 240)),
+        updated_at: time::OffsetDateTime::now_utc(),
+    };
+    state
+        .publish_status
+        .lock()
+        .map_err(|_| AppError::StatePoisoned)?
+        .replace(view.clone());
+    tracing::debug!(
+        feed = %view.feed,
+        state = %view.state,
+        pending_stories = view.pending_stories,
+        last_batch_capsules = view.last_batch_capsules,
+        last_edge_accepted = view.last_edge_accepted,
+        "publish status updated"
+    );
+    Ok(Json(view))
+}
+
 fn safe_status_token(value: &str, fallback: &str) -> String {
     let segment = value
         .trim()
@@ -559,6 +613,22 @@ fn safe_status_token(value: &str, fallback: &str) -> String {
         .collect::<String>();
     if safe.is_empty() {
         fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+fn safe_status_text(value: &str, max_chars: usize) -> String {
+    let safe = value
+        .chars()
+        .filter(|ch| !ch.is_control() || ch.is_whitespace())
+        .take(max_chars)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if safe.is_empty() {
+        "unknown".to_string()
     } else {
         safe
     }
@@ -844,6 +914,7 @@ mod tests {
             redactor: Redactor::default(),
             story: Mutex::new(StoryCompiler::default()),
             capture_watchers: Mutex::new(BTreeMap::new()),
+            publish_status: Mutex::new(None),
             metrics: Metrics::default(),
         })
     }
@@ -1022,6 +1093,44 @@ mod tests {
         let body = serde_json::to_string(&view).expect("status serializes");
         assert!(!body.contains("/home/mosure"));
         assert!(!body.contains(".codex/sessions"));
+    }
+
+    #[tokio::test]
+    async fn status_reports_publish_ack_without_secret_details() {
+        let state = test_state();
+        let Json(publish) = publish_status(
+            State(state.clone()),
+            Json(PublishStatusUpdate {
+                feed: "workstation".to_string(),
+                state: "published".to_string(),
+                edge: "https://api.feed.aberration.technology".to_string(),
+                network_id: "agent-feed-mainnet".to_string(),
+                publisher: Some("@mosure".to_string()),
+                pending_stories: 0,
+                last_batch_stories: 1,
+                last_batch_capsules: 1,
+                last_edge_accepted: 1,
+                last_edge_feeds: 1,
+                last_edge_headlines: 2,
+                detail: Some("edge accepted story capsule batch".to_string()),
+                last_error: None,
+            }),
+        )
+        .await
+        .expect("publish status accepted");
+
+        assert_eq!(publish.feed, "workstation");
+        assert_eq!(publish.state, "published");
+        assert_eq!(publish.last_edge_accepted, 1);
+
+        let Json(view) = status(State(state)).await.expect("status renders");
+        let publish = view.publish.expect("publish status is included");
+        assert_eq!(publish.feed, "workstation");
+        assert_eq!(publish.publisher.as_deref(), Some("@mosure"));
+        assert_eq!(publish.last_edge_headlines, 2);
+        let body = serde_json::to_string(&publish).expect("publish status serializes");
+        assert!(!body.contains("Bearer"));
+        assert!(!body.contains("token"));
     }
 
     #[tokio::test]

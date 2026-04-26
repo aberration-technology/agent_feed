@@ -23,6 +23,8 @@ pub struct StatusView {
     pub stored_bulletins: usize,
     #[serde(default)]
     pub story: StoryStatusView,
+    #[serde(default)]
+    pub publish: Option<PublishStatusView>,
     pub captured_sources: Vec<CapturedSourceView>,
     pub capture_watchers: Vec<CaptureWatchView>,
     pub last_event_kind: Option<String>,
@@ -53,6 +55,42 @@ pub struct StoryDecisionView {
     pub family: String,
     pub score: u8,
     pub context_score: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PublishStatusUpdate {
+    pub feed: String,
+    pub state: String,
+    pub edge: String,
+    pub network_id: String,
+    pub publisher: Option<String>,
+    pub pending_stories: usize,
+    pub last_batch_stories: usize,
+    pub last_batch_capsules: usize,
+    pub last_edge_accepted: usize,
+    pub last_edge_feeds: usize,
+    pub last_edge_headlines: usize,
+    pub detail: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PublishStatusView {
+    pub feed: String,
+    pub state: String,
+    pub edge: String,
+    pub network_id: String,
+    pub publisher: Option<String>,
+    pub pending_stories: usize,
+    pub last_batch_stories: usize,
+    pub last_batch_capsules: usize,
+    pub last_edge_accepted: usize,
+    pub last_edge_feeds: usize,
+    pub last_edge_headlines: usize,
+    pub detail: Option<String>,
+    pub last_error: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

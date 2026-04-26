@@ -24,9 +24,9 @@ use agent_feed_summarize::{
     RecentSummary, SummaryConfig, SummaryError, SummaryProcessorConfig, summarize_feed,
     summarize_feed_with_recent,
 };
-use agent_feed_views::StatusView;
+use agent_feed_views::{PublishStatusUpdate, StatusView};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
@@ -716,6 +716,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 let (sender, receiver) = mpsc::channel();
                 spawn_serve_publisher(ServePublishConfig {
                     receiver,
+                    server: bind.to_string(),
                     edge: edge.clone(),
                     network_id: network_id.clone(),
                     feed: feed.clone(),
@@ -1698,6 +1699,7 @@ struct ServeAgentCapture {
 
 struct ServePublishConfig {
     receiver: mpsc::Receiver<AgentEvent>,
+    server: String,
     edge: String,
     network_id: String,
     feed: String,
@@ -1706,6 +1708,33 @@ struct ServePublishConfig {
     summary_config: SummaryConfig,
     publish_interval: Duration,
     edge_fallback: EdgeFallbackMode,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct EdgePublishAck {
+    #[serde(default)]
+    accepted: usize,
+    #[serde(default)]
+    feeds: usize,
+    #[serde(default)]
+    headlines: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PublishBatchResult {
+    capsules: usize,
+    edge_ack: Option<EdgePublishAck>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PublishStatusPost<'a> {
+    state: &'a str,
+    pending_stories: usize,
+    last_batch_stories: usize,
+    last_batch_capsules: usize,
+    edge_ack: Option<&'a EdgePublishAck>,
+    detail: Option<&'a str>,
+    last_error: Option<&'a str>,
 }
 
 fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
@@ -1839,6 +1868,14 @@ fn run_serve_publisher(config: ServePublishConfig) {
         "p2p publish: signed in as @{}; publishing future settled stories to `{}` via edge snapshot fallback",
         config.session.login, config.feed
     );
+    post_serve_publish_status(
+        &config,
+        PublishStatusPost {
+            state: "starting",
+            detail: Some("publisher thread started"),
+            ..PublishStatusPost::default()
+        },
+    );
 
     let mut compiler = StoryCompiler::default();
     let mut pending = Vec::<CompiledStory>::new();
@@ -1864,6 +1901,15 @@ fn run_serve_publisher(config: ServePublishConfig) {
                         "p2p publisher queued settled stories"
                     );
                     pending.extend(stories);
+                    post_serve_publish_status(
+                        &config,
+                        PublishStatusPost {
+                            state: "queued",
+                            pending_stories: pending.len(),
+                            detail: Some("settled stories queued for publish"),
+                            ..PublishStatusPost::default()
+                        },
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -1875,15 +1921,35 @@ fn run_serve_publisher(config: ServePublishConfig) {
 
         if last_presence.elapsed() >= Duration::from_secs(60) {
             match publish_feed_presence(&config) {
-                Ok(()) => {
+                Ok(ack) => {
                     last_presence = Instant::now();
                     info!(feed_name = %config.feed, "p2p feed presence registered");
+                    post_serve_publish_status(
+                        &config,
+                        PublishStatusPost {
+                            state: "present",
+                            pending_stories: pending.len(),
+                            edge_ack: Some(&ack),
+                            detail: Some("feed presence registered at edge"),
+                            ..PublishStatusPost::default()
+                        },
+                    );
                 }
                 Err(err) => {
                     warn!(
                         feed_name = %config.feed,
                         error = %err,
                         "p2p feed presence registration failed"
+                    );
+                    let error = err.to_string();
+                    post_serve_publish_status(
+                        &config,
+                        PublishStatusPost {
+                            state: "degraded",
+                            pending_stories: pending.len(),
+                            last_error: Some(&error),
+                            ..PublishStatusPost::default()
+                        },
                     );
                 }
             }
@@ -1898,6 +1964,15 @@ fn run_serve_publisher(config: ServePublishConfig) {
                     "p2p publisher flushed settled story windows"
                 );
                 pending.extend(flushed);
+                post_serve_publish_status(
+                    &config,
+                    PublishStatusPost {
+                        state: "queued",
+                        pending_stories: pending.len(),
+                        detail: Some("story compiler flushed settled windows"),
+                        ..PublishStatusPost::default()
+                    },
+                );
             }
         }
 
@@ -1910,18 +1985,49 @@ fn run_serve_publisher(config: ServePublishConfig) {
         }
 
         let stories = std::mem::take(&mut pending);
+        post_serve_publish_status(
+            &config,
+            PublishStatusPost {
+                state: "publishing",
+                last_batch_stories: stories.len(),
+                detail: Some("sending summarized capsules to edge"),
+                ..PublishStatusPost::default()
+            },
+        );
         match publish_story_batch(&config, &stories, &mut recent, &mut next_seq) {
-            Ok(published) => {
+            Ok(result) => {
                 last_publish = Instant::now();
-                if published > 0 {
+                if result.capsules > 0 {
                     println!(
-                        "p2p publish: sent {published} capsule(s) from {} settled story/stories",
+                        "p2p publish: sent {} capsule(s) from {} settled story/stories",
+                        result.capsules,
                         stories.len()
+                    );
+                    post_serve_publish_status(
+                        &config,
+                        PublishStatusPost {
+                            state: "published",
+                            last_batch_stories: stories.len(),
+                            last_batch_capsules: result.capsules,
+                            edge_ack: result.edge_ack.as_ref(),
+                            detail: Some("edge accepted story capsule batch"),
+                            ..PublishStatusPost::default()
+                        },
                     );
                 } else {
                     println!(
                         "p2p publish: skipped {} settled story/stories; no meaningful headline change",
                         stories.len()
+                    );
+                    post_serve_publish_status(
+                        &config,
+                        PublishStatusPost {
+                            state: "skipped",
+                            last_batch_stories: stories.len(),
+                            edge_ack: result.edge_ack.as_ref(),
+                            detail: Some("no meaningful headline change"),
+                            ..PublishStatusPost::default()
+                        },
                     );
                 }
             }
@@ -1934,13 +2040,23 @@ fn run_serve_publisher(config: ServePublishConfig) {
                 );
                 eprintln!("agent-feed: p2p publish failed: {err}");
                 pending.extend(stories);
+                let error = err.to_string();
+                post_serve_publish_status(
+                    &config,
+                    PublishStatusPost {
+                        state: "error",
+                        pending_stories: pending.len(),
+                        last_error: Some(&error),
+                        ..PublishStatusPost::default()
+                    },
+                );
                 std::thread::sleep(Duration::from_secs(5));
             }
         }
     }
 }
 
-fn publish_feed_presence(config: &ServePublishConfig) -> Result<(), CliError> {
+fn publish_feed_presence(config: &ServePublishConfig) -> Result<EdgePublishAck, CliError> {
     let feed_id = publish_feed_id(config);
     let body = serde_json::to_string(&json!({
         "network_id": config.network_id,
@@ -1952,12 +2068,13 @@ fn publish_feed_presence(config: &ServePublishConfig) -> Result<(), CliError> {
     }))?;
     let response =
         post_edge_json_with_bearer(&config.edge, "/network/publish", &body, &config.session)?;
+    let ack = parse_edge_publish_ack(&response)?;
     debug!(
         feed_name = %config.feed,
         response = %response.trim(),
         "p2p feed presence sent to edge"
     );
-    Ok(())
+    Ok(ack)
 }
 
 fn publish_story_batch(
@@ -1965,7 +2082,7 @@ fn publish_story_batch(
     stories: &[CompiledStory],
     recent: &mut VecDeque<RecentSummary>,
     next_seq: &mut u64,
-) -> Result<usize, CliError> {
+) -> Result<PublishBatchResult, CliError> {
     let feed_id = publish_feed_id(config);
     let recent_summaries = recent.iter().cloned().collect::<Vec<_>>();
     let summaries =
@@ -1993,7 +2110,10 @@ fn publish_story_batch(
             summaries = summaries.len(),
             "p2p publish skipped empty capsule batch"
         );
-        return Ok(0);
+        return Ok(PublishBatchResult {
+            capsules: 0,
+            edge_ack: None,
+        });
     }
 
     let body = serde_json::to_string(&json!({
@@ -2006,6 +2126,7 @@ fn publish_story_batch(
     }))?;
     let response =
         post_edge_json_with_bearer(&config.edge, "/network/publish", &body, &config.session)?;
+    let ack = parse_edge_publish_ack(&response)?;
     info!(
         feed_name = %config.feed,
         capsules = capsules.len(),
@@ -2013,7 +2134,41 @@ fn publish_story_batch(
         response = %response.trim(),
         "p2p publish sent to edge"
     );
-    Ok(capsules.len())
+    Ok(PublishBatchResult {
+        capsules: capsules.len(),
+        edge_ack: Some(ack),
+    })
+}
+
+fn parse_edge_publish_ack(response: &str) -> Result<EdgePublishAck, CliError> {
+    serde_json::from_str(response.trim()).map_err(CliError::from)
+}
+
+fn post_serve_publish_status(config: &ServePublishConfig, status: PublishStatusPost<'_>) {
+    let body = match serde_json::to_string(&PublishStatusUpdate {
+        feed: config.feed.clone(),
+        state: status.state.to_string(),
+        edge: config.edge.clone(),
+        network_id: config.network_id.clone(),
+        publisher: Some(format!("@{}", config.session.login)),
+        pending_stories: status.pending_stories,
+        last_batch_stories: status.last_batch_stories,
+        last_batch_capsules: status.last_batch_capsules,
+        last_edge_accepted: status.edge_ack.map_or(0, |ack| ack.accepted),
+        last_edge_feeds: status.edge_ack.map_or(0, |ack| ack.feeds),
+        last_edge_headlines: status.edge_ack.map_or(0, |ack| ack.headlines),
+        detail: status.detail.map(str::to_string),
+        last_error: status.last_error.map(str::to_string),
+    }) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(error = %err, "publish status serialization failed");
+            return;
+        }
+    };
+    if let Err(err) = post_json(&config.server, "/publish/status", &body) {
+        debug!(error = %err, "publish status post failed");
+    }
 }
 
 fn local_feed_id(feed: &str) -> String {
@@ -2702,6 +2857,7 @@ mod tests {
             stored_events: 0,
             stored_bulletins: 0,
             story: agent_feed_views::StoryStatusView::default(),
+            publish: None,
             captured_sources: Vec::new(),
             capture_watchers: vec![agent_feed_views::CaptureWatchView {
                 agent: "codex".to_string(),
@@ -2760,6 +2916,7 @@ mod tests {
                     context_score: 82,
                 }),
             },
+            publish: None,
             captured_sources: vec![agent_feed_views::CapturedSourceView {
                 source: "codex".to_string(),
                 agent: "codex".to_string(),
@@ -2781,6 +2938,49 @@ mod tests {
         assert!(output.contains("last gate: codex rejected"));
         assert!(output.contains("summary was too generic or mechanical to publish"));
         assert!(output.contains("latest story gate is `rejected`"));
+    }
+
+    #[test]
+    fn local_status_explains_publish_state() {
+        let now = time::OffsetDateTime::now_utc();
+        let status = StatusView {
+            status: "ok".to_string(),
+            bind: LOOPBACK_ADDR.to_string(),
+            p2p_enabled: true,
+            ingested_events: 4,
+            emitted_bulletins: 1,
+            dropped_events: 0,
+            stored_events: 4,
+            stored_bulletins: 1,
+            story: agent_feed_views::StoryStatusView::default(),
+            publish: Some(agent_feed_views::PublishStatusView {
+                feed: "workstation".to_string(),
+                state: "published".to_string(),
+                edge: "https://api.feed.aberration.technology".to_string(),
+                network_id: "agent-feed-mainnet".to_string(),
+                publisher: Some("@mosure".to_string()),
+                pending_stories: 0,
+                last_batch_stories: 1,
+                last_batch_capsules: 1,
+                last_edge_accepted: 1,
+                last_edge_feeds: 1,
+                last_edge_headlines: 2,
+                detail: Some("edge accepted story capsule batch".to_string()),
+                last_error: None,
+                updated_at: now,
+            }),
+            captured_sources: Vec::new(),
+            capture_watchers: Vec::new(),
+            last_event_kind: Some("turn.complete".to_string()),
+            last_event_at: Some(now),
+            last_bulletin_at: Some(now),
+        };
+
+        let output = format_local_status(&status);
+
+        assert!(output.contains("publish: published · feed workstation"));
+        assert!(output.contains("edge: 1 accepted · 1 feeds · 2 headlines"));
+        assert!(output.contains("publish detail: edge accepted story capsule batch"));
     }
 
     #[test]
@@ -5153,6 +5353,30 @@ fn format_local_status(status: &StatusView) -> String {
     if status.last_bulletin_at.is_some() {
         let _ = writeln!(output, "last story: published");
     }
+    if let Some(publish) = &status.publish {
+        let _ = writeln!(
+            output,
+            "publish: {} · feed {} · pending {} · last batch {} capsule{}",
+            publish.state,
+            publish.feed,
+            publish.pending_stories,
+            publish.last_batch_capsules,
+            plural(publish.last_batch_capsules)
+        );
+        if publish.last_edge_feeds > 0 || publish.last_edge_headlines > 0 {
+            let _ = writeln!(
+                output,
+                "edge: {} accepted · {} feeds · {} headlines",
+                publish.last_edge_accepted, publish.last_edge_feeds, publish.last_edge_headlines
+            );
+        }
+        if let Some(detail) = &publish.detail {
+            let _ = writeln!(output, "publish detail: {detail}");
+        }
+        if let Some(error) = &publish.last_error {
+            let _ = writeln!(output, "publish error: {error}");
+        }
+    }
 
     if !status.capture_watchers.is_empty() {
         output.push_str("\nwatchers:\n");
@@ -5212,6 +5436,19 @@ fn status_next_step(status: &StatusView) -> String {
             "next: events are arriving. waiting for the story compiler to see completion, test, edit, or incident context worth publishing.".to_string()
         }
     } else if status.stored_bulletins > 0 {
+        if let Some(publish) = &status.publish
+            && matches!(publish.state.as_str(), "error" | "degraded")
+        {
+            return format!(
+                "next: local stories are available, but publish is `{}`: {}.",
+                publish.state,
+                publish
+                    .last_error
+                    .as_deref()
+                    .or(publish.detail.as_deref())
+                    .unwrap_or("check p2p publish logs")
+            );
+        }
         "next: local stories are available. keep the browser open; it refreshes automatically."
             .to_string()
     } else {
