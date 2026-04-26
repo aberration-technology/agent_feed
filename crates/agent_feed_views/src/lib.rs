@@ -21,6 +21,8 @@ pub struct StatusView {
     pub dropped_events: u64,
     pub stored_events: usize,
     pub stored_bulletins: usize,
+    #[serde(default)]
+    pub story: StoryStatusView,
     pub captured_sources: Vec<CapturedSourceView>,
     pub capture_watchers: Vec<CaptureWatchView>,
     pub last_event_kind: Option<String>,
@@ -28,6 +30,29 @@ pub struct StatusView {
     pub last_event_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_bulletin_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StoryStatusView {
+    pub open_windows: usize,
+    pub retained_windows: usize,
+    pub settled_windows: usize,
+    pub published_stories: usize,
+    pub rejected_stories: usize,
+    pub deduped_stories: usize,
+    pub last_decision: Option<StoryDecisionView>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct StoryDecisionView {
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    pub action: String,
+    pub reason: String,
+    pub agent: String,
+    pub family: String,
+    pub score: u8,
+    pub context_score: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

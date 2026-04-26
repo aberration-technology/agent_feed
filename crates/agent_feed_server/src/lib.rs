@@ -7,11 +7,12 @@ use agent_feed_security::{
     SecurityConfig, SecurityError, requires_display_token, token_matches, validate_bind,
 };
 use agent_feed_store::InMemoryStore;
-use agent_feed_story::StoryCompiler;
+use agent_feed_story::{StoryCompiler, StoryCompilerDiagnostics, StoryDecisionAction, StoryFamily};
 use agent_feed_ui::UiConfig;
 use agent_feed_views::{
     AdaptersView, AgentsView, BulletinsView, CaptureWatchUpdate, CaptureWatchView, EventsView,
-    HealthView, IngestView, SessionsView, SseBulletin, StatusView,
+    HealthView, IngestView, SessionsView, SseBulletin, StatusView, StoryDecisionView,
+    StoryStatusView,
 };
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -433,6 +434,13 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
         .values()
         .cloned()
         .collect();
+    let story = story_status_view(
+        state
+            .story
+            .lock()
+            .map_err(|_| AppError::StatePoisoned)?
+            .diagnostics(),
+    );
     Ok(Json(StatusView {
         status: "ok".to_string(),
         bind: state.bind.to_string(),
@@ -442,12 +450,57 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
         dropped_events: metrics.dropped_events,
         stored_events: events.len(),
         stored_bulletins: snapshot.bulletins.len(),
+        story,
         captured_sources,
         capture_watchers,
         last_event_kind: last_event.map(|event| event.kind.as_str().to_string()),
         last_event_at: last_event.map(|event| event.occurred_at.unwrap_or(event.received_at)),
         last_bulletin_at: snapshot.active.map(|bulletin| bulletin.created_at),
     }))
+}
+
+fn story_status_view(diagnostics: StoryCompilerDiagnostics) -> StoryStatusView {
+    StoryStatusView {
+        open_windows: diagnostics.open_windows,
+        retained_windows: diagnostics.retained_windows,
+        settled_windows: diagnostics.settled_windows,
+        published_stories: diagnostics.published_stories,
+        rejected_stories: diagnostics.rejected_stories,
+        deduped_stories: diagnostics.deduped_stories,
+        last_decision: diagnostics.last_decision.map(|decision| StoryDecisionView {
+            at: decision.at,
+            action: story_decision_action_label(decision.action).to_string(),
+            reason: decision.reason,
+            agent: decision.agent,
+            family: story_family_status_label(decision.family).to_string(),
+            score: decision.score,
+            context_score: decision.context_score,
+        }),
+    }
+}
+
+fn story_decision_action_label(action: StoryDecisionAction) -> &'static str {
+    match action {
+        StoryDecisionAction::Waiting => "waiting",
+        StoryDecisionAction::Retained => "retained",
+        StoryDecisionAction::Rejected => "rejected",
+        StoryDecisionAction::Deduped => "deduped",
+        StoryDecisionAction::Published => "published",
+    }
+}
+
+fn story_family_status_label(family: StoryFamily) -> &'static str {
+    match family {
+        StoryFamily::Turn => "turn",
+        StoryFamily::Plan => "plan",
+        StoryFamily::Test => "test",
+        StoryFamily::Permission => "permission",
+        StoryFamily::Command => "command",
+        StoryFamily::FileChange => "file-change",
+        StoryFamily::Mcp => "mcp",
+        StoryFamily::Incident => "incident",
+        StoryFamily::IdleRecap => "recap",
+    }
 }
 
 async fn capture_status(
@@ -925,6 +978,14 @@ mod tests {
         assert_eq!(view.captured_sources[0].agent, "codex");
         assert_eq!(view.captured_sources[0].sessions, 1);
         assert_eq!(view.last_event_kind.as_deref(), Some("adapter.health"));
+        assert_eq!(view.story.open_windows, 1);
+        assert_eq!(
+            view.story
+                .last_decision
+                .as_ref()
+                .map(|decision| decision.action.as_str()),
+            Some("waiting")
+        );
     }
 
     #[tokio::test]

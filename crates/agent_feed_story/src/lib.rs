@@ -63,6 +63,39 @@ pub enum StoryWindowState {
     Settled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryDecisionAction {
+    Waiting,
+    Retained,
+    Rejected,
+    Deduped,
+    Published,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StoryDecision {
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+    pub action: StoryDecisionAction,
+    pub reason: String,
+    pub agent: String,
+    pub family: StoryFamily,
+    pub score: u8,
+    pub context_score: u8,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StoryCompilerDiagnostics {
+    pub open_windows: usize,
+    pub retained_windows: usize,
+    pub settled_windows: usize,
+    pub published_stories: usize,
+    pub rejected_stories: usize,
+    pub deduped_stories: usize,
+    pub last_decision: Option<StoryDecision>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StoryCounters {
     pub events: usize,
@@ -245,6 +278,7 @@ pub struct StoryCompiler {
     config: StoryCompilerConfig,
     windows: BTreeMap<StoryKey, StoryWindow>,
     recent_fingerprints: VecDeque<String>,
+    diagnostics: StoryCompilerDiagnostics,
 }
 
 impl Default for StoryCompiler {
@@ -260,7 +294,15 @@ impl StoryCompiler {
             config,
             windows: BTreeMap::new(),
             recent_fingerprints: VecDeque::new(),
+            diagnostics: StoryCompilerDiagnostics::default(),
         }
+    }
+
+    #[must_use]
+    pub fn diagnostics(&self) -> StoryCompilerDiagnostics {
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.open_windows = self.windows.len();
+        diagnostics
     }
 
     #[must_use]
@@ -271,6 +313,12 @@ impl StoryCompiler {
         }
 
         if is_never_publish_event(&event) {
+            self.record_event_decision(
+                &event,
+                primary_key.family,
+                StoryDecisionAction::Waiting,
+                "waiting for a completion, test, edit, or incident signal",
+            );
             self.touch_window_with_key(primary_key, event);
             return Vec::new();
         }
@@ -283,15 +331,37 @@ impl StoryCompiler {
         window.observe(&event);
 
         if !should_settle(&event, &window) {
+            self.record_window_decision(
+                &window,
+                StoryDecisionAction::Waiting,
+                "window is still gathering context",
+            );
             self.windows.insert(primary_key, window);
             return Vec::new();
         }
 
         window.state = StoryWindowState::Settled;
-        self.compile_window(window)
-            .into_iter()
-            .filter(|story| self.accept_story(story))
-            .collect()
+        self.diagnostics.settled_windows += 1;
+        if let Some(rejection) = self.compile_rejection(&window) {
+            self.record_window_rejection(&window, rejection);
+            return Vec::new();
+        }
+        let Some(story) = self.compile_window(window) else {
+            return Vec::new();
+        };
+        if self.accept_story(&story) {
+            self.diagnostics.published_stories += 1;
+            self.record_story_decision(&story, StoryDecisionAction::Published, "story emitted");
+            vec![story]
+        } else {
+            self.diagnostics.deduped_stories += 1;
+            self.record_story_decision(
+                &story,
+                StoryDecisionAction::Deduped,
+                "similar story was already published recently",
+            );
+            Vec::new()
+        }
     }
 
     #[must_use]
@@ -299,18 +369,36 @@ impl StoryCompiler {
         let windows = std::mem::take(&mut self.windows);
         let mut stories = Vec::new();
         for (key, mut window) in windows {
-            if story_score(&window) < self.config.min_score {
-                if should_retain_open_window(&window) {
+            if let Some(rejection) = self.compile_rejection(&window) {
+                if rejection.score < self.config.min_score && should_retain_open_window(&window) {
+                    self.diagnostics.retained_windows += 1;
+                    self.record_window_decision(
+                        &window,
+                        StoryDecisionAction::Retained,
+                        "waiting for stronger story signal before publishing",
+                    );
                     self.windows.insert(key, window);
+                } else {
+                    self.record_window_rejection(&window, rejection);
                 }
                 continue;
             }
             window.state = StoryWindowState::Settled;
+            self.diagnostics.settled_windows += 1;
             let Some(story) = self.compile_window(window) else {
                 continue;
             };
             if self.accept_story(&story) {
+                self.diagnostics.published_stories += 1;
+                self.record_story_decision(&story, StoryDecisionAction::Published, "story emitted");
                 stories.push(story);
+            } else {
+                self.diagnostics.deduped_stories += 1;
+                self.record_story_decision(
+                    &story,
+                    StoryDecisionAction::Deduped,
+                    "similar story was already published recently",
+                );
             }
         }
         stories
@@ -344,12 +432,11 @@ impl StoryCompiler {
     }
 
     fn compile_window(&self, window: StoryWindow) -> Option<CompiledStory> {
-        let score = story_score(&window);
-        let context_score = context_score(&window);
-        if score < self.config.min_score || context_score < self.config.min_context_score {
+        if self.compile_rejection(&window).is_some() {
             return None;
         }
-
+        let score = story_score(&window);
+        let context_score = context_score(&window);
         let mut headline = headline(&window);
         let mut deck = deck(&window);
         if let Some((rewritten_headline, rewritten_deck)) =
@@ -357,9 +444,6 @@ impl StoryCompiler {
         {
             headline = rewritten_headline;
             deck = rewritten_deck;
-        }
-        if is_low_quality_story(&window, &headline, &deck) {
-            return None;
         }
         let project = window.key.project_hash.clone();
         let mut chips = vec![
@@ -400,6 +484,42 @@ impl StoryCompiler {
         })
     }
 
+    fn compile_rejection(&self, window: &StoryWindow) -> Option<StoryCompileRejection> {
+        let score = story_score(window);
+        let context_score = context_score(window);
+        if score < self.config.min_score {
+            return Some(StoryCompileRejection {
+                reason: "score below publish threshold",
+                score,
+                context_score,
+            });
+        }
+        if context_score < self.config.min_context_score {
+            return Some(StoryCompileRejection {
+                reason: "context below publish threshold",
+                score,
+                context_score,
+            });
+        }
+
+        let mut headline = headline(window);
+        let mut deck = deck(window);
+        if let Some((rewritten_headline, rewritten_deck)) =
+            story_impact_rewrite(window, &headline, &deck)
+        {
+            headline = rewritten_headline;
+            deck = rewritten_deck;
+        }
+        if is_low_quality_story(window, &headline, &deck) {
+            return Some(StoryCompileRejection {
+                reason: "summary was too generic or mechanical to publish",
+                score,
+                context_score,
+            });
+        }
+        None
+    }
+
     fn accept_story(&mut self, story: &CompiledStory) -> bool {
         let fingerprint = format!(
             "{}:{}:{}:{}:{:?}",
@@ -422,6 +542,78 @@ impl StoryCompiler {
         }
         true
     }
+
+    fn record_event_decision(
+        &mut self,
+        event: &AgentEvent,
+        family: StoryFamily,
+        action: StoryDecisionAction,
+        reason: &'static str,
+    ) {
+        self.diagnostics.last_decision = Some(StoryDecision {
+            at: event.occurred_at.unwrap_or(event.received_at),
+            action,
+            reason: reason.to_string(),
+            agent: event.agent.clone(),
+            family,
+            score: score_event(event),
+            context_score: 0,
+        });
+    }
+
+    fn record_window_decision(
+        &mut self,
+        window: &StoryWindow,
+        action: StoryDecisionAction,
+        reason: &'static str,
+    ) {
+        self.diagnostics.last_decision = Some(StoryDecision {
+            at: window.last_event_at,
+            action,
+            reason: reason.to_string(),
+            agent: window.key.agent.clone(),
+            family: window.key.family,
+            score: story_score(window),
+            context_score: context_score(window),
+        });
+    }
+
+    fn record_window_rejection(&mut self, window: &StoryWindow, rejection: StoryCompileRejection) {
+        self.diagnostics.rejected_stories += 1;
+        self.diagnostics.last_decision = Some(StoryDecision {
+            at: window.last_event_at,
+            action: StoryDecisionAction::Rejected,
+            reason: rejection.reason.to_string(),
+            agent: window.key.agent.clone(),
+            family: window.key.family,
+            score: rejection.score,
+            context_score: rejection.context_score,
+        });
+    }
+
+    fn record_story_decision(
+        &mut self,
+        story: &CompiledStory,
+        action: StoryDecisionAction,
+        reason: &'static str,
+    ) {
+        self.diagnostics.last_decision = Some(StoryDecision {
+            at: story.created_at,
+            action,
+            reason: reason.to_string(),
+            agent: story.agent.clone(),
+            family: story.family,
+            score: story.score,
+            context_score: story.context_score,
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StoryCompileRejection {
+    reason: &'static str,
+    score: u8,
+    context_score: u8,
 }
 
 #[must_use]
@@ -1610,6 +1802,53 @@ mod tests {
 
         assert!(compiler.ingest(failed).is_empty());
         assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_explain_rejected_story_gate() {
+        let mut compiler = StoryCompiler::default();
+        let mut failed = event(EventKind::ToolFail, "codex command failed");
+        failed.summary = Some("exit 1. raw output omitted.".to_string());
+        failed.command = Some("sh -c cargo test".to_string());
+        failed.score_hint = Some(84);
+        failed.severity = Severity::Warning;
+
+        assert!(compiler.ingest(failed).is_empty());
+        let diagnostics = compiler.diagnostics();
+
+        assert_eq!(diagnostics.rejected_stories, 1);
+        let decision = diagnostics
+            .last_decision
+            .expect("story gate decision is recorded");
+        assert_eq!(decision.action, StoryDecisionAction::Rejected);
+        assert_eq!(decision.family, StoryFamily::Incident);
+        assert_eq!(
+            decision.reason,
+            "summary was too generic or mechanical to publish"
+        );
+        assert!(decision.score >= 80);
+    }
+
+    #[test]
+    fn diagnostics_explain_waiting_story_gate() {
+        let mut compiler = StoryCompiler::default();
+        let mut command = event(EventKind::CommandExec, "codex command started");
+        command.command = Some("cargo test --all".to_string());
+        command.score_hint = Some(42);
+
+        assert!(compiler.ingest(command).is_empty());
+        let diagnostics = compiler.diagnostics();
+
+        assert_eq!(diagnostics.open_windows, 2);
+        let decision = diagnostics
+            .last_decision
+            .expect("waiting gate decision is recorded");
+        assert_eq!(decision.action, StoryDecisionAction::Waiting);
+        assert_eq!(decision.family, StoryFamily::Command);
+        assert_eq!(
+            decision.reason,
+            "waiting for a completion, test, edit, or incident signal"
+        );
     }
 
     #[test]

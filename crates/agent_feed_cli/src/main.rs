@@ -2701,6 +2701,7 @@ mod tests {
             dropped_events: 0,
             stored_events: 0,
             stored_bulletins: 0,
+            story: agent_feed_views::StoryStatusView::default(),
             captured_sources: Vec::new(),
             capture_watchers: vec![agent_feed_views::CaptureWatchView {
                 agent: "codex".to_string(),
@@ -2728,6 +2729,58 @@ mod tests {
         assert!(output.contains("codex codex.transcript watching"));
         assert!(output.contains("transcript watchers are live"));
         assert!(!output.contains("private.jsonl"));
+    }
+
+    #[test]
+    fn local_status_explains_story_gate_state() {
+        let now = time::OffsetDateTime::now_utc();
+        let status = StatusView {
+            status: "ok".to_string(),
+            bind: LOOPBACK_ADDR.to_string(),
+            p2p_enabled: true,
+            ingested_events: 3,
+            emitted_bulletins: 0,
+            dropped_events: 0,
+            stored_events: 3,
+            stored_bulletins: 0,
+            story: agent_feed_views::StoryStatusView {
+                open_windows: 1,
+                retained_windows: 0,
+                settled_windows: 1,
+                published_stories: 0,
+                rejected_stories: 1,
+                deduped_stories: 0,
+                last_decision: Some(agent_feed_views::StoryDecisionView {
+                    at: now,
+                    action: "rejected".to_string(),
+                    reason: "summary was too generic or mechanical to publish".to_string(),
+                    agent: "codex".to_string(),
+                    family: "incident".to_string(),
+                    score: 84,
+                    context_score: 82,
+                }),
+            },
+            captured_sources: vec![agent_feed_views::CapturedSourceView {
+                source: "codex".to_string(),
+                agent: "codex".to_string(),
+                adapter: "codex.transcript".to_string(),
+                events: 3,
+                sessions: 1,
+                last_event_kind: "tool.fail".to_string(),
+                last_event_at: now,
+            }],
+            capture_watchers: Vec::new(),
+            last_event_kind: Some("tool.fail".to_string()),
+            last_event_at: Some(now),
+            last_bulletin_at: None,
+        };
+
+        let output = format_local_status(&status);
+
+        assert!(output.contains("story gate: 1 open"));
+        assert!(output.contains("last gate: codex rejected"));
+        assert!(output.contains("summary was too generic or mechanical to publish"));
+        assert!(output.contains("latest story gate is `rejected`"));
     }
 
     #[test]
@@ -5073,6 +5126,27 @@ fn format_local_status(status: &StatusView) -> String {
         "stories: {} emitted · {} stored",
         status.emitted_bulletins, status.stored_bulletins
     );
+    if story_status_is_active(&status.story) {
+        let _ = writeln!(
+            output,
+            "story gate: {} open · {} published · {} rejected · {} deduped",
+            status.story.open_windows,
+            status.story.published_stories,
+            status.story.rejected_stories,
+            status.story.deduped_stories
+        );
+        if let Some(decision) = &status.story.last_decision {
+            let _ = writeln!(
+                output,
+                "last gate: {} {} · score {}/context {} · {}",
+                decision.agent,
+                decision.action,
+                decision.score,
+                decision.context_score,
+                decision.reason
+            );
+        }
+    }
     if let Some(kind) = &status.last_event_kind {
         let _ = writeln!(output, "last event: {kind}");
     }
@@ -5118,23 +5192,41 @@ fn format_local_status(status: &StatusView) -> String {
     }
 
     output.push('\n');
-    output.push_str(status_next_step(status));
+    output.push_str(&status_next_step(status));
     output.push('\n');
     output
 }
 
-fn status_next_step(status: &StatusView) -> &'static str {
+fn status_next_step(status: &StatusView) -> String {
     if status.capture_watchers.is_empty() && status.captured_sources.is_empty() {
-        "next: no capture watchers reported. start `agent-feed serve` without --no-agent-capture, or attach `agent-feed codex active --watch`."
+        "next: no capture watchers reported. start `agent-feed serve` without --no-agent-capture, or attach `agent-feed codex active --watch`.".to_string()
     } else if !status.capture_watchers.is_empty() && status.stored_events == 0 {
-        "next: transcript watchers are live. continue or restart an agent session after feed is running so future writes can settle into stories."
+        "next: transcript watchers are live. continue or restart an agent session after feed is running so future writes can settle into stories.".to_string()
     } else if status.stored_events > 0 && status.stored_bulletins == 0 {
-        "next: events are arriving. waiting for the story compiler to see completion, test, edit, or incident context worth publishing."
+        if let Some(decision) = &status.story.last_decision {
+            format!(
+                "next: events are arriving, but the latest story gate is `{}`: {}.",
+                decision.action, decision.reason
+            )
+        } else {
+            "next: events are arriving. waiting for the story compiler to see completion, test, edit, or incident context worth publishing.".to_string()
+        }
     } else if status.stored_bulletins > 0 {
         "next: local stories are available. keep the browser open; it refreshes automatically."
+            .to_string()
     } else {
-        "next: feed is live."
+        "next: feed is live.".to_string()
     }
+}
+
+fn story_status_is_active(story: &agent_feed_views::StoryStatusView) -> bool {
+    story.open_windows > 0
+        || story.retained_windows > 0
+        || story.settled_windows > 0
+        || story.published_stories > 0
+        || story.rejected_stories > 0
+        || story.deduped_stories > 0
+        || story.last_decision.is_some()
 }
 
 fn plural(count: usize) -> &'static str {
