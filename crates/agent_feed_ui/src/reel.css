@@ -14,6 +14,7 @@
   --mono: ui-monospace, monospace;
   --pad: clamp(28px, 4vw, 72px);
   --headline: clamp(56px, 7.5vw, 128px);
+  --headline-leading: 1.04;
   --deck: clamp(24px, 2.7vw, 44px);
   --label: clamp(11px, 1vw, 15px);
 }
@@ -264,8 +265,9 @@ h1 {
   font-size: var(--headline);
   font-weight: 620;
   letter-spacing: 0;
-  line-height: 0.94;
+  line-height: var(--headline-leading);
   overflow-wrap: anywhere;
+  text-wrap: balance;
 }
 
 .deck {
@@ -510,8 +512,9 @@ body.controls-visible .stage-actions,
   font-size: var(--headline);
   font-weight: 620;
   letter-spacing: 0;
-  line-height: 0.94;
+  line-height: var(--headline-leading);
   overflow-wrap: anywhere;
+  text-wrap: balance;
 }
 
 .timeline-meta {

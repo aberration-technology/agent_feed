@@ -157,6 +157,16 @@ mod tests {
     }
 
     #[test]
+    fn headline_typography_keeps_safe_line_spacing() {
+        let html = render_index_with_config(Some("stage"), &config(false));
+
+        assert!(html.contains("--headline-leading: 1.04;"));
+        assert!(html.contains("line-height: var(--headline-leading);"));
+        assert!(html.contains("text-wrap: balance;"));
+        assert!(!html.contains("line-height: 0.94;"));
+    }
+
+    #[test]
     fn remote_states_stop_dwell_progress() {
         let html = render_index_with_config(Some("remote"), &config(true));
         let remote_state = html
