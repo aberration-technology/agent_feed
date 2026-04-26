@@ -87,8 +87,9 @@ jobs:
           pid="$!"
           trap 'kill "$pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
-            if curl -fsSL --connect-timeout 2 --max-time 5 http://127.0.0.1:7780/api/health | grep -q ok; then
-              curl -fsSL --connect-timeout 2 --max-time 5 http://127.0.0.1:7780/reel | grep -q '<title>feed</title>'
+            if curl -fsSL --connect-timeout 2 --max-time 5 http://127.0.0.1:7780/api/health -o /tmp/agent-feed-health.json && grep -q ok /tmp/agent-feed-health.json; then
+              curl -fsSL --connect-timeout 2 --max-time 5 http://127.0.0.1:7780/reel -o /tmp/agent-feed-reel.html
+              grep -q '<title>feed</title>' /tmp/agent-feed-reel.html
               exit 0
             fi
             echo "waiting for agent-feed serve; attempt ${attempt}/30"
