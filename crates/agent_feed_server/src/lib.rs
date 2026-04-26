@@ -376,7 +376,7 @@ async fn adapters(State(state): State<Arc<AppState>>) -> Result<Json<AdaptersVie
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthView> {
     let metrics = state.metrics.snapshot();
     Json(HealthView {
-        status: "ok",
+        status: "ok".to_string(),
         bind: state.bind.to_string(),
         ingested_events: metrics.ingested_events,
         emitted_bulletins: metrics.emitted_bulletins,
@@ -434,7 +434,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
         .cloned()
         .collect();
     Ok(Json(StatusView {
-        status: "ok",
+        status: "ok".to_string(),
         bind: state.bind.to_string(),
         p2p_enabled: state.p2p_enabled,
         ingested_events: metrics.ingested_events,

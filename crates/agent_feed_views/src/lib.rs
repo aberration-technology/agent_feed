@@ -2,18 +2,18 @@ use agent_feed_core::{AgentEvent, Bulletin};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HealthView {
-    pub status: &'static str,
+    pub status: String,
     pub bind: String,
     pub ingested_events: u64,
     pub emitted_bulletins: u64,
     pub dropped_events: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StatusView {
-    pub status: &'static str,
+    pub status: String,
     pub bind: String,
     pub p2p_enabled: bool,
     pub ingested_events: u64,
@@ -30,7 +30,7 @@ pub struct StatusView {
     pub last_bulletin_at: Option<OffsetDateTime>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CapturedSourceView {
     pub source: String,
     pub agent: String,
@@ -56,7 +56,7 @@ pub struct CaptureWatchUpdate {
     pub poll_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CaptureWatchView {
     pub agent: String,
     pub adapter: String,

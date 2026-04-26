@@ -50,6 +50,13 @@ want to replay selected existing transcript history.
 `agent-feed init --auto` is optional setup for hooks, shims, and future
 sessions. `agent-feed open` only opens the display URL in a browser.
 
+to check whether the daemon is alive, watching transcripts, and waiting for a
+settled story:
+
+```sh
+agent-feed status
+```
+
 to attach active local sessions manually:
 
 ```sh

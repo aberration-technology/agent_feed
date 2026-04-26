@@ -28,7 +28,9 @@ agent_feed_security = { workspace = true }
 agent_feed_server = { workspace = true }
 agent_feed_story = { workspace = true }
 agent_feed_summarize = { workspace = true }
+agent_feed_views = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["serde"] }

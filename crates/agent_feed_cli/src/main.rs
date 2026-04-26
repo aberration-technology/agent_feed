@@ -24,9 +24,12 @@ use agent_feed_summarize::{
     RecentSummary, SummaryConfig, SummaryError, SummaryProcessorConfig, summarize_feed,
     summarize_feed_with_recent,
 };
+use agent_feed_views::StatusView;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -198,6 +201,12 @@ enum Commands {
     Open {
         #[arg(default_value = DEFAULT_URL)]
         url: String,
+    },
+    Status {
+        #[arg(long, default_value = LOOPBACK_ADDR)]
+        server: String,
+        #[arg(long)]
+        json: bool,
     },
     Ingest {
         #[arg(long, default_value = "generic")]
@@ -788,6 +797,15 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             info!(%url, "opening feed url");
             open_url(&url)?;
             println!("{url}");
+        }
+        Commands::Status { server, json } => {
+            info!(%server, json, "local feed status requested");
+            let status = get_json::<StatusView>(&server, "/api/status")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                print!("{}", format_local_status(&status));
+            }
         }
         Commands::Ingest { source, server } => {
             let mut input = String::new();
@@ -1527,18 +1545,21 @@ fn init_tracing(filter: &str, format: LogFormat) {
     match format {
         LogFormat::Compact => tracing_subscriber::fmt()
             .compact()
+            .with_writer(std::io::stderr)
             .with_ansi(ansi)
             .with_target(true)
             .with_env_filter(log_filter(filter))
             .init(),
         LogFormat::Pretty => tracing_subscriber::fmt()
             .pretty()
+            .with_writer(std::io::stderr)
             .with_ansi(ansi)
             .with_target(true)
             .with_env_filter(log_filter(filter))
             .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
+            .with_writer(std::io::stderr)
             .flatten_event(true)
             .with_ansi(false)
             .with_current_span(false)
@@ -1565,6 +1586,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Init { .. } => "init",
         Commands::Serve { .. } => "serve",
         Commands::Open { .. } => "open",
+        Commands::Status { .. } => "status",
         Commands::Ingest { .. } => "ingest",
         Commands::Hook { .. } => "hook",
         Commands::Auth { command } => match command {
@@ -2653,6 +2675,59 @@ mod tests {
         assert_eq!(publish_interval_secs, 5);
         assert_eq!(summarizer, "deterministic");
         assert_eq!(edge_fallback, CliEdgeFallback::Auto);
+    }
+
+    #[test]
+    fn status_command_defaults_to_loopback_and_supports_json() {
+        let cli = Cli::try_parse_from(["agent-feed", "status", "--json"]).expect("status parses");
+
+        let Commands::Status { server, json } = cli.command else {
+            panic!("expected status command");
+        };
+
+        assert_eq!(server, LOOPBACK_ADDR);
+        assert!(json);
+    }
+
+    #[test]
+    fn local_status_explains_capture_watcher_state() {
+        let now = time::OffsetDateTime::now_utc();
+        let status = StatusView {
+            status: "ok".to_string(),
+            bind: LOOPBACK_ADDR.to_string(),
+            p2p_enabled: true,
+            ingested_events: 0,
+            emitted_bulletins: 0,
+            dropped_events: 0,
+            stored_events: 0,
+            stored_bulletins: 0,
+            captured_sources: Vec::new(),
+            capture_watchers: vec![agent_feed_views::CaptureWatchView {
+                agent: "codex".to_string(),
+                adapter: "codex.transcript".to_string(),
+                label: "private.jsonl".to_string(),
+                state: "watching".to_string(),
+                workspace: Some("all".to_string()),
+                offset: 42,
+                file_len: 42,
+                imported_events: 0,
+                filtered_events: 0,
+                poll_ms: 1000,
+                updated_at: now,
+            }],
+            last_event_kind: None,
+            last_event_at: None,
+            last_bulletin_at: None,
+        };
+
+        let output = format_local_status(&status);
+
+        assert!(output.contains("feed status: ok"));
+        assert!(output.contains("p2p: enabled"));
+        assert!(output.contains("capture: 1 watcher"));
+        assert!(output.contains("codex codex.transcript watching"));
+        assert!(output.contains("transcript watchers are live"));
+        assert!(!output.contains("private.jsonl"));
     }
 
     #[test]
@@ -4966,6 +5041,146 @@ fn parse_agent_list(value: &str) -> HashSet<&str> {
         .map(str::trim)
         .filter(|agent| matches!(*agent, "codex" | "claude"))
         .collect()
+}
+
+fn format_local_status(status: &StatusView) -> String {
+    let mut output = String::new();
+    let watchers = status.capture_watchers.len();
+    let sources = status.captured_sources.len();
+    let _ = writeln!(output, "feed status: {}", status.status);
+    let _ = writeln!(output, "server: {}", status.bind);
+    let _ = writeln!(
+        output,
+        "p2p: {}",
+        if status.p2p_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = writeln!(
+        output,
+        "capture: {watchers} watcher{} · {sources} src",
+        plural(watchers)
+    );
+    let _ = writeln!(
+        output,
+        "events: {} ingested · {} stored · {} dropped",
+        status.ingested_events, status.stored_events, status.dropped_events
+    );
+    let _ = writeln!(
+        output,
+        "stories: {} emitted · {} stored",
+        status.emitted_bulletins, status.stored_bulletins
+    );
+    if let Some(kind) = &status.last_event_kind {
+        let _ = writeln!(output, "last event: {kind}");
+    }
+    if status.last_bulletin_at.is_some() {
+        let _ = writeln!(output, "last story: published");
+    }
+
+    if !status.capture_watchers.is_empty() {
+        output.push_str("\nwatchers:\n");
+        for watcher in status.capture_watchers.iter().take(8) {
+            let _ = writeln!(
+                output,
+                "  {} {} {} · offset {} · {} imported · {} filtered",
+                watcher.agent,
+                watcher.adapter,
+                watcher.state,
+                watcher.offset,
+                watcher.imported_events,
+                watcher.filtered_events
+            );
+        }
+        if status.capture_watchers.len() > 8 {
+            let _ = writeln!(output, "  ... {} more", status.capture_watchers.len() - 8);
+        }
+    }
+
+    if !status.captured_sources.is_empty() {
+        output.push_str("\nsources:\n");
+        for source in status.captured_sources.iter().take(8) {
+            let _ = writeln!(
+                output,
+                "  {} {} · {} events · {} sessions · last {}",
+                source.agent,
+                source.adapter,
+                source.events,
+                source.sessions,
+                source.last_event_kind
+            );
+        }
+        if status.captured_sources.len() > 8 {
+            let _ = writeln!(output, "  ... {} more", status.captured_sources.len() - 8);
+        }
+    }
+
+    output.push('\n');
+    output.push_str(status_next_step(status));
+    output.push('\n');
+    output
+}
+
+fn status_next_step(status: &StatusView) -> &'static str {
+    if status.capture_watchers.is_empty() && status.captured_sources.is_empty() {
+        "next: no capture watchers reported. start `agent-feed serve` without --no-agent-capture, or attach `agent-feed codex active --watch`."
+    } else if !status.capture_watchers.is_empty() && status.stored_events == 0 {
+        "next: transcript watchers are live. continue or restart an agent session after feed is running so future writes can settle into stories."
+    } else if status.stored_events > 0 && status.stored_bulletins == 0 {
+        "next: events are arriving. waiting for the story compiler to see completion, test, edit, or incident context worth publishing."
+    } else if status.stored_bulletins > 0 {
+        "next: local stories are available. keep the browser open; it refreshes automatically."
+    } else {
+        "next: feed is live."
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn get_json<T>(server: &str, path: &str) -> Result<T, CliError>
+where
+    T: DeserializeOwned,
+{
+    let response = get_http(server, path)?;
+    let body = http_response_body(&response)?;
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+fn get_http(server: &str, path: &str) -> Result<String, CliError> {
+    let addr = server
+        .parse()
+        .map_err(|err| CliError::Http(format!("invalid server address: {err}")))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(700))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {server}\r\nAccept: application/json\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
+        return Ok(response);
+    }
+
+    let status_line = response.lines().next().unwrap_or("http request failed");
+    let body = http_response_body(&response).unwrap_or("").trim();
+    if body.is_empty() {
+        Err(CliError::Http(status_line.to_string()))
+    } else {
+        Err(CliError::Http(format!("{status_line}: {body}")))
+    }
+}
+
+fn http_response_body(response: &str) -> Result<&str, CliError> {
+    response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .ok_or_else(|| CliError::Http("http response did not include a body".to_string()))
 }
 
 fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {
