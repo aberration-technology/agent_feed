@@ -1133,6 +1133,11 @@ async fn resolve_github(
             ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response()
         }
         Err(EdgeError::Github(GithubResolveError::NotFound(_))) => {
+            if let Some(response) =
+                resolve_github_from_snapshot(&state.config, &state.snapshot, &route)
+            {
+                return ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response();
+            }
             edge_error(StatusCode::NOT_FOUND, "github user not found")
         }
         Err(EdgeError::Github(GithubResolveError::RateLimited)) => edge_error(
@@ -1625,6 +1630,88 @@ fn remote_copy_has_public_context(normalized: &str) -> bool {
 #[cfg(test)]
 fn network_snapshot_value(config: &EdgeConfig, snapshot: &SnapshotStore) -> serde_json::Value {
     network_snapshot_value_filtered(config, snapshot, None)
+}
+
+fn resolve_github_from_snapshot(
+    config: &EdgeConfig,
+    snapshot: &SnapshotStore,
+    route: &RemoteUserRoute,
+) -> Option<ResolveGithubResponse> {
+    let login = route.login.as_str();
+    let feeds = snapshot.feeds();
+    let headlines = snapshot.headlines();
+    let github_user_id = feeds
+        .iter()
+        .find(|feed| feed.publisher_login.eq_ignore_ascii_case(login))
+        .and_then(|feed| feed.publisher_github_user_id)
+        .or_else(|| {
+            headlines
+                .iter()
+                .find(|headline| headline.publisher_login.eq_ignore_ascii_case(login))
+                .and_then(|headline| headline.publisher_github_user_id)
+        })?;
+    let display_name = feeds
+        .iter()
+        .find(|feed| {
+            feed.publisher_github_user_id == Some(github_user_id)
+                || feed.publisher_login.eq_ignore_ascii_case(login)
+        })
+        .and_then(|feed| feed.publisher_display_name.clone())
+        .or_else(|| {
+            headlines
+                .iter()
+                .find(|headline| {
+                    headline.publisher_github_user_id == Some(github_user_id)
+                        || headline.publisher_login.eq_ignore_ascii_case(login)
+                })
+                .and_then(|headline| headline.publisher_display_name.clone())
+        });
+    let current_login = feeds
+        .iter()
+        .find(|feed| feed.publisher_github_user_id == Some(github_user_id))
+        .map(|feed| feed.publisher_login.clone())
+        .or_else(|| {
+            headlines
+                .iter()
+                .find(|headline| headline.publisher_github_user_id == Some(github_user_id))
+                .map(|headline| headline.publisher_login.clone())
+        })
+        .unwrap_or_else(|| route.login.to_string());
+    let matching_feeds = feeds
+        .into_iter()
+        .filter(|feed| feed_matches_github_route(feed, github_user_id, &current_login, route))
+        .collect::<Vec<_>>();
+    let matching_headlines = headlines
+        .into_iter()
+        .filter(|headline| {
+            headline_matches_github_route(headline, github_user_id, &current_login, route)
+        })
+        .collect::<Vec<_>>();
+    if matching_feeds.is_empty() && matching_headlines.is_empty() {
+        return None;
+    }
+    let mut response = ResolveGithubResponse {
+        state: "resolved".to_string(),
+        network_id: route.network.network_id(),
+        compatibility: ProtocolCompatibility::current(),
+        requested_login: route.login.to_string(),
+        github_user_id,
+        profile: GithubProfileView {
+            login: current_login,
+            name: display_name,
+            avatar: Some(config.github_avatar_url(github_user_id)),
+        },
+        feeds: matching_feeds,
+        headlines: matching_headlines,
+        browser_seed_url: "/browser-seed".to_string(),
+        expires_at: OffsetDateTime::now_utc() + Duration::minutes(15),
+        signature: agent_feed_p2p_proto::Signature::unsigned().digest,
+    };
+    merge_resolve_feed_views(
+        &mut response.feeds,
+        feed_views_from_headlines(response.headlines.clone()),
+    );
+    Some(response)
 }
 
 fn network_snapshot_value_filtered(
@@ -2564,6 +2651,34 @@ mod tests {
             snapshot["feeds"][0]["publisher_login"],
             serde_json::json!("mosure")
         );
+    }
+
+    #[test]
+    fn github_resolver_can_fall_back_to_snapshot_identity() {
+        let store = SnapshotStore::default();
+        store.upsert_feed(ResolveFeedView {
+            feed_id: "github:123:workstation".to_string(),
+            label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mitchell mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            publisher_verified: true,
+            last_seen_at: OffsetDateTime::now_utc(),
+        });
+        let route =
+            RemoteUserRoute::parse("/mosure", Some("streams=workstation")).expect("route parses");
+
+        let response =
+            resolve_github_from_snapshot(&config(), &store, &route).expect("snapshot resolves");
+
+        assert_eq!(response.state, "resolved");
+        assert_eq!(response.github_user_id, 123);
+        assert_eq!(response.profile.login, "mosure");
+        assert_eq!(response.feeds.len(), 1);
+        assert_eq!(response.feeds[0].label, "workstation");
     }
 
     #[tokio::test]
