@@ -1383,6 +1383,7 @@ async fn network_publish_verified(
             feed_id: capsule.value.feed_id.clone(),
             feed_label: feed_name.to_string(),
             compatibility: capsule.value.compatibility.clone(),
+            created_at: Some(capsule.value.created_at),
             publisher_github_user_id: publisher.github_user_id,
             publisher_login,
             publisher_display_name: publisher.display_name.clone(),
@@ -2379,6 +2380,7 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
             publisher_display_name: Some("mosure".to_string()),
@@ -2412,6 +2414,7 @@ mod tests {
             snapshot["headlines"][0]["headline"],
             serde_json::json!("codex finished release pass")
         );
+        assert!(snapshot["headlines"][0]["created_at"].is_string());
         assert_eq!(
             snapshot["feeds"][0]["publisher_login"],
             serde_json::json!("mosure")
@@ -2425,6 +2428,7 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
             publisher_display_name: Some("mosure".to_string()),
@@ -2469,6 +2473,7 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
             publisher_display_name: Some("mosure".to_string()),
@@ -2684,6 +2689,7 @@ mod tests {
         assert_eq!(headlines.len(), 1);
         assert_eq!(feeds[0]["feed_id"], serde_json::json!(feed_id));
         assert_eq!(headlines[0]["feed_id"], serde_json::json!(feed_id));
+        assert!(headlines[0]["created_at"].is_string());
         assert_eq!(headlines[0]["publisher_login"], serde_json::json!("mosure"));
         assert_eq!(
             headlines[0]["publisher_github_user_id"],
@@ -2705,6 +2711,7 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "old-login".to_string(),
             publisher_display_name: None,

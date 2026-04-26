@@ -640,7 +640,9 @@ body[data-mode="breaking"] .chips span {
   }
 
   .story-time {
-    display: none;
+    right: 28px;
+    bottom: 28px;
+    max-width: calc(100% - 56px);
   }
 
   .status {

@@ -102,6 +102,8 @@ mod tests {
         assert!(html.contains("storyTime.textContent = `posted ${relativeTime(timestamp)}`;"));
         assert!(html.contains("function clearStoryTime"));
         assert!(html.contains("refreshStoryTime();"));
+        assert!(html.contains(".story-time {\n    right: 28px;\n    bottom: 28px;"));
+        assert!(!html.contains(".story-time {\n    display: none;"));
     }
 
     #[test]
@@ -234,6 +236,9 @@ mod tests {
         assert!(html.contains("function headlineMatchesRoute"));
         assert!(html.contains("const requestedFeeds = requestedFeedLabels(route);"));
         assert!(html.contains("function headlineMatchesReelFilters"));
+        assert!(html.contains(
+            "created_at: item.created_at || item.createdAt || item.published_at || item.publishedAt"
+        ));
         assert!(html.contains("requestedCsvParams(params, [\"projects\", \"project\"])"));
         assert!(html.contains("function headlineTagTerms"));
         assert!(html.contains("function copyReelFilterParams"));

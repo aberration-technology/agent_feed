@@ -708,6 +708,8 @@ pub struct RemoteHeadlineView {
     pub feed_id: FeedId,
     pub feed_label: String,
     pub compatibility: ProtocolCompatibility,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub created_at: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_github_user_id: Option<u64>,
     pub publisher_login: String,
@@ -750,6 +752,7 @@ impl RemoteHeadlineView {
             feed_id: entry.feed_id.clone(),
             feed_label: entry.feed_label.clone(),
             compatibility: capsule.value.compatibility.clone(),
+            created_at: Some(capsule.value.created_at),
             publisher_github_user_id: publisher
                 .github_user_id
                 .or(Some(entry.owner.github_user_id.get())),
@@ -1782,6 +1785,7 @@ mod tests {
             RemoteHeadlineView::from_entry_and_capsule(&entry, &capsule).expect("view builds");
 
         assert_eq!(view.compatibility, ProtocolCompatibility::current());
+        assert_eq!(view.created_at, Some(capsule.value.created_at));
         assert_eq!(view.publisher_login, "mosure");
         assert_eq!(view.publisher_avatar.as_deref(), Some("/avatar/github/123"));
         assert!(view.verified);
