@@ -24,9 +24,9 @@ use agent_feed_summarize::{
     RecentSummary, SummaryConfig, SummaryError, SummaryProcessorConfig, summarize_feed,
     summarize_feed_with_recent,
 };
-use agent_feed_views::{PublishStatusUpdate, StatusView};
+use agent_feed_views::{PublishStatusUpdate, PublishStatusView, StatusView};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
@@ -89,7 +89,10 @@ impl From<CliEdgeFallback> for EdgeFallbackMode {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    Doctor,
+    Doctor {
+        #[command(subcommand)]
+        command: Option<DoctorCommand>,
+    },
     Init {
         #[arg(long)]
         auto: bool,
@@ -245,6 +248,22 @@ enum Commands {
     Uninstall {
         #[arg(long)]
         restore_hooks: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DoctorCommand {
+    Publish {
+        #[arg(long, default_value = LOOPBACK_ADDR)]
+        server: String,
+        #[arg(long, default_value = "https://api.feed.aberration.technology")]
+        edge: String,
+        #[arg(long, default_value = "agent-feed-mainnet")]
+        network_id: String,
+        #[arg(long)]
+        auth_store: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -581,10 +600,27 @@ async fn main() -> Result<(), CliError> {
 
 async fn run_command(command: Commands) -> Result<(), CliError> {
     match command {
-        Commands::Doctor => {
-            let report = doctor_report();
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
+        Commands::Doctor { command } => match command {
+            Some(DoctorCommand::Publish {
+                server,
+                edge,
+                network_id,
+                auth_store,
+                json,
+            }) => {
+                info!(%server, %edge, %network_id, json, "publish doctor requested");
+                let report = doctor_publish(&server, &edge, &network_id, auth_store);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", format_publish_doctor_report(&report));
+                }
+            }
+            None => {
+                let report = doctor_report();
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        },
         Commands::Init {
             auto,
             codex,
@@ -1583,7 +1619,10 @@ fn log_filter(filter: &str) -> tracing_subscriber::EnvFilter {
 
 fn command_name(command: &Commands) -> &'static str {
     match command {
-        Commands::Doctor => "doctor",
+        Commands::Doctor { command } => match command {
+            Some(DoctorCommand::Publish { .. }) => "doctor.publish",
+            None => "doctor",
+        },
         Commands::Init { .. } => "init",
         Commands::Serve { .. } => "serve",
         Commands::Open { .. } => "open",
@@ -2842,6 +2881,59 @@ mod tests {
 
         assert_eq!(server, LOOPBACK_ADDR);
         assert!(json);
+    }
+
+    #[test]
+    fn doctor_publish_command_defaults_to_loopback_and_mainnet() {
+        let cli = Cli::try_parse_from(["agent-feed", "doctor", "publish", "--json"])
+            .expect("doctor publish parses");
+
+        let Commands::Doctor {
+            command:
+                Some(DoctorCommand::Publish {
+                    server,
+                    edge,
+                    network_id,
+                    json,
+                    ..
+                }),
+        } = cli.command
+        else {
+            panic!("expected doctor publish command");
+        };
+
+        assert_eq!(server, LOOPBACK_ADDR);
+        assert_eq!(edge, "https://api.feed.aberration.technology");
+        assert_eq!(network_id, "agent-feed-mainnet");
+        assert!(json);
+    }
+
+    #[test]
+    fn publish_doctor_report_is_actionable_and_lowercase() {
+        let report = PublishDoctorReport {
+            status: DoctorCheckStatus::Warn,
+            checks: vec![
+                PublishDoctorCheck {
+                    name: "auth",
+                    status: DoctorCheckStatus::Ok,
+                    detail: "signed in as @mosure".to_string(),
+                },
+                PublishDoctorCheck {
+                    name: "story gate",
+                    status: DoctorCheckStatus::Warn,
+                    detail: "no events observed since this feed process started".to_string(),
+                },
+            ],
+            next: "continue or restart codex/claude after `agent-feed serve --publish` is running"
+                .to_string(),
+        };
+
+        let output = format_publish_doctor_report(&report);
+
+        assert!(output.contains("publish doctor: warn"));
+        assert!(output.contains("auth: ok · signed in as @mosure"));
+        assert!(output.contains("story gate: warn"));
+        assert!(output.contains("next: continue or restart codex/claude"));
     }
 
     #[test]
@@ -5296,6 +5388,510 @@ fn parse_agent_list(value: &str) -> HashSet<&str> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DoctorCheckStatus {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl DoctorCheckStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PublishDoctorCheck {
+    name: &'static str,
+    status: DoctorCheckStatus,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PublishDoctorReport {
+    status: DoctorCheckStatus,
+    checks: Vec<PublishDoctorCheck>,
+    next: String,
+}
+
+fn doctor_publish(
+    server: &str,
+    edge: &str,
+    network_id: &str,
+    auth_store: Option<PathBuf>,
+) -> PublishDoctorReport {
+    let mut checks = Vec::new();
+    let mut next = None::<String>;
+
+    let auth_session = match load_publish_session(auth_store, edge) {
+        Ok(session) => {
+            push_doctor_check(
+                &mut checks,
+                DoctorCheckStatus::Ok,
+                "auth",
+                format!(
+                    "signed in as @{} · github:{} · expires {}",
+                    session.login, session.github_user_id, session.expires_at
+                ),
+            );
+            Some(session)
+        }
+        Err(err) => {
+            push_doctor_check(
+                &mut checks,
+                DoctorCheckStatus::Error,
+                "auth",
+                err.to_string(),
+            );
+            set_doctor_next(
+                &mut next,
+                format!(
+                    "run `agent-feed auth github --edge {}`",
+                    edge.trim_end_matches('/')
+                ),
+            );
+            None
+        }
+    };
+
+    let local_status = match get_json::<StatusView>(server, "/api/status") {
+        Ok(status) => {
+            push_doctor_check(
+                &mut checks,
+                DoctorCheckStatus::Ok,
+                "local server",
+                format!("reachable at {server} · status {}", status.status),
+            );
+            Some(status)
+        }
+        Err(err) => {
+            push_doctor_check(
+                &mut checks,
+                DoctorCheckStatus::Error,
+                "local server",
+                format!("not reachable at {server}: {err}"),
+            );
+            set_doctor_next(
+                &mut next,
+                "start `agent-feed serve --publish --feed workstation --workspace .`".to_string(),
+            );
+            None
+        }
+    };
+
+    if let Some(status) = local_status.as_ref() {
+        add_capture_doctor_check(&mut checks, &mut next, status);
+        add_story_doctor_check(&mut checks, &mut next, status);
+        add_publish_doctor_check(&mut checks, &mut next, status);
+        add_edge_visibility_doctor_check(
+            &mut checks,
+            &mut next,
+            edge,
+            network_id,
+            status.publish.as_ref(),
+            auth_session.as_ref(),
+        );
+    } else {
+        push_doctor_check(
+            &mut checks,
+            DoctorCheckStatus::Warn,
+            "capture",
+            "skipped because the local feed server is not reachable".to_string(),
+        );
+        push_doctor_check(
+            &mut checks,
+            DoctorCheckStatus::Warn,
+            "story gate",
+            "skipped because the local feed server is not reachable".to_string(),
+        );
+        push_doctor_check(
+            &mut checks,
+            DoctorCheckStatus::Warn,
+            "publish",
+            "skipped because the local feed server is not reachable".to_string(),
+        );
+        push_doctor_check(
+            &mut checks,
+            DoctorCheckStatus::Warn,
+            "edge snapshot",
+            "skipped until a local publisher reports its feed state".to_string(),
+        );
+    }
+
+    let status = checks
+        .iter()
+        .map(|check| check.status)
+        .max_by_key(|status| match status {
+            DoctorCheckStatus::Ok => 0,
+            DoctorCheckStatus::Warn => 1,
+            DoctorCheckStatus::Error => 2,
+        })
+        .unwrap_or(DoctorCheckStatus::Ok);
+    PublishDoctorReport {
+        status,
+        checks,
+        next: next.unwrap_or_else(|| {
+            if let Some(session) = auth_session.as_ref()
+                && let Some(status) = local_status.as_ref()
+                && let Some(publish) = status.publish.as_ref()
+            {
+                return format!(
+                    "open https://feed.aberration.technology/{}/{}?feed_mode=discovery",
+                    session.login, publish.feed
+                );
+            }
+            "feed publish path looks healthy".to_string()
+        }),
+    }
+}
+
+fn add_capture_doctor_check(
+    checks: &mut Vec<PublishDoctorCheck>,
+    next: &mut Option<String>,
+    status: &StatusView,
+) {
+    let watchers = status.capture_watchers.len();
+    let sources = status.captured_sources.len();
+    if watchers > 0 {
+        let imported = status
+            .capture_watchers
+            .iter()
+            .map(|watcher| watcher.imported_events)
+            .sum::<usize>();
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Ok,
+            "capture",
+            format!(
+                "{watchers} watcher{} · {sources} src · {imported} imported",
+                plural(watchers)
+            ),
+        );
+    } else if sources > 0 {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Warn,
+            "capture",
+            format!("{sources} src reported, but no active transcript watchers"),
+        );
+        set_doctor_next(
+            next,
+            "restart `agent-feed serve --publish` so future agent transcript writes are watched"
+                .to_string(),
+        );
+    } else {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Warn,
+            "capture",
+            "no active capture watchers or sources".to_string(),
+        );
+        set_doctor_next(
+            next,
+            "start `agent-feed serve --publish --feed workstation --workspace .`, then continue work in codex or claude".to_string(),
+        );
+    }
+}
+
+fn add_story_doctor_check(
+    checks: &mut Vec<PublishDoctorCheck>,
+    next: &mut Option<String>,
+    status: &StatusView,
+) {
+    if status.stored_bulletins > 0 || status.story.published_stories > 0 {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Ok,
+            "story gate",
+            format!(
+                "{} story/stories stored · {} published · {} rejected · {} deduped",
+                status.stored_bulletins,
+                status.story.published_stories,
+                status.story.rejected_stories,
+                status.story.deduped_stories
+            ),
+        );
+    } else if status.stored_events > 0 {
+        let detail = status
+            .story
+            .last_decision
+            .as_ref()
+            .map(|decision| {
+                format!(
+                    "{} {} · score {}/context {} · {}",
+                    decision.agent,
+                    decision.action,
+                    decision.score,
+                    decision.context_score,
+                    decision.reason
+                )
+            })
+            .unwrap_or_else(|| {
+                "events are arriving; waiting for completion, test, edit, or incident context"
+                    .to_string()
+            });
+        push_doctor_check(checks, DoctorCheckStatus::Warn, "story gate", detail);
+        set_doctor_next(
+            next,
+            "keep working until a completion, test, edit, or incident settles; inspect `agent-feed status` for gate details".to_string(),
+        );
+    } else {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Warn,
+            "story gate",
+            "no events observed since this feed process started".to_string(),
+        );
+        set_doctor_next(
+            next,
+            "continue or restart codex/claude after `agent-feed serve --publish` is running"
+                .to_string(),
+        );
+    }
+}
+
+fn add_publish_doctor_check(
+    checks: &mut Vec<PublishDoctorCheck>,
+    next: &mut Option<String>,
+    status: &StatusView,
+) {
+    let Some(publish) = status.publish.as_ref() else {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Warn,
+            "publish",
+            "local server is not running with --publish".to_string(),
+        );
+        set_doctor_next(
+            next,
+            "restart with `agent-feed serve --publish --feed workstation --workspace .`"
+                .to_string(),
+        );
+        return;
+    };
+
+    let check_status = match publish.state.as_str() {
+        "published" | "present" => DoctorCheckStatus::Ok,
+        "starting" | "queued" | "publishing" | "skipped" => DoctorCheckStatus::Warn,
+        "degraded" | "error" => DoctorCheckStatus::Error,
+        _ => DoctorCheckStatus::Warn,
+    };
+    let mut detail = format!(
+        "{} · feed {} · pending {} · last batch {} capsule{}",
+        publish.state,
+        publish.feed,
+        publish.pending_stories,
+        publish.last_batch_capsules,
+        plural(publish.last_batch_capsules)
+    );
+    if publish.last_edge_feeds > 0 || publish.last_edge_headlines > 0 {
+        let _ = write!(
+            detail,
+            " · edge accepted {} · {} feeds · {} headlines",
+            publish.last_edge_accepted, publish.last_edge_feeds, publish.last_edge_headlines
+        );
+    }
+    if let Some(error) = publish.last_error.as_deref() {
+        let _ = write!(detail, " · {error}");
+    } else if let Some(extra) = publish.detail.as_deref() {
+        let _ = write!(detail, " · {extra}");
+    }
+    push_doctor_check(checks, check_status, "publish", detail);
+    match publish.state.as_str() {
+        "degraded" | "error" => set_doctor_next(
+            next,
+            "check github auth and edge reachability, then rerun `agent-feed doctor publish`"
+                .to_string(),
+        ),
+        "starting" | "queued" | "publishing" => set_doctor_next(
+            next,
+            "wait for the next publish interval or a high-priority story, then rerun `agent-feed doctor publish`".to_string(),
+        ),
+        "skipped" => set_doctor_next(
+            next,
+            "keep working until the summarizer sees a meaningful headline change".to_string(),
+        ),
+        _ => {}
+    }
+}
+
+fn add_edge_visibility_doctor_check(
+    checks: &mut Vec<PublishDoctorCheck>,
+    next: &mut Option<String>,
+    edge: &str,
+    network_id: &str,
+    publish: Option<&PublishStatusView>,
+    auth_session: Option<&GithubAuthSession>,
+) {
+    let Some(publish) = publish else {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Warn,
+            "edge snapshot",
+            "skipped because local publish state is absent".to_string(),
+        );
+        return;
+    };
+    let path = format!(
+        "/network/snapshot?network={}",
+        edge_network_query_value(network_id)
+    );
+    let snapshot = match get_edge_json(edge, &path) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            push_doctor_check(
+                checks,
+                DoctorCheckStatus::Error,
+                "edge snapshot",
+                format!("could not load {path}: {err}"),
+            );
+            set_doctor_next(
+                next,
+                "verify edge health at https://api.feed.aberration.technology/healthz".to_string(),
+            );
+            return;
+        }
+    };
+    let feeds = snapshot
+        .get("feeds")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let headlines = snapshot
+        .get("headlines")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let expected_login = publish
+        .publisher
+        .as_deref()
+        .or_else(|| auth_session.map(|session| session.login.as_str()))
+        .map(clean_github_login);
+    let feed_visible = snapshot
+        .get("feeds")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                value_str(item, "label") == Some(publish.feed.as_str())
+                    && publisher_matches(item, expected_login.as_deref())
+            })
+        });
+    let visible_headlines = snapshot
+        .get("headlines")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    value_str(item, "feed_label") == Some(publish.feed.as_str())
+                        && publisher_matches(item, expected_login.as_deref())
+                })
+                .count()
+        })
+        .unwrap_or_default();
+    if feed_visible {
+        let status = if publish.last_batch_capsules > 0 && visible_headlines == 0 {
+            DoctorCheckStatus::Warn
+        } else {
+            DoctorCheckStatus::Ok
+        };
+        push_doctor_check(
+            checks,
+            status,
+            "edge snapshot",
+            format!(
+                "feed visible · {visible_headlines} matching headline{} · network has {feeds} feeds and {headlines} headlines",
+                plural(visible_headlines)
+            ),
+        );
+        if status == DoctorCheckStatus::Warn {
+            set_doctor_next(
+                next,
+                "wait for the next accepted capsule batch; the feed is visible but no matching headline is in the edge snapshot yet".to_string(),
+            );
+        }
+    } else {
+        push_doctor_check(
+            checks,
+            DoctorCheckStatus::Warn,
+            "edge snapshot",
+            format!(
+                "feed `{}` is not visible in the edge snapshot yet · network has {feeds} feeds and {headlines} headlines",
+                publish.feed
+            ),
+        );
+        set_doctor_next(
+            next,
+            "wait for feed presence registration or rerun `agent-feed serve --publish --feed <name>`"
+                .to_string(),
+        );
+    }
+}
+
+fn push_doctor_check(
+    checks: &mut Vec<PublishDoctorCheck>,
+    status: DoctorCheckStatus,
+    name: &'static str,
+    detail: String,
+) {
+    checks.push(PublishDoctorCheck {
+        name,
+        status,
+        detail,
+    });
+}
+
+fn set_doctor_next(next: &mut Option<String>, value: String) {
+    if next.is_none() {
+        *next = Some(value);
+    }
+}
+
+fn format_publish_doctor_report(report: &PublishDoctorReport) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "publish doctor: {}", report.status.as_str());
+    for check in &report.checks {
+        let _ = writeln!(
+            output,
+            "{}: {} · {}",
+            check.name,
+            check.status.as_str(),
+            check.detail
+        );
+    }
+    let _ = writeln!(output, "next: {}", report.next);
+    output
+}
+
+fn edge_network_query_value(network_id: &str) -> &str {
+    if network_id.trim().is_empty() || network_id == "agent-feed-mainnet" {
+        "mainnet"
+    } else {
+        network_id
+    }
+}
+
+fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn clean_github_login(login: &str) -> String {
+    login.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+fn publisher_matches(value: &Value, expected_login: Option<&str>) -> bool {
+    let Some(expected_login) = expected_login else {
+        return true;
+    };
+    value_str(value, "publisher_login")
+        .map(clean_github_login)
+        .is_some_and(|login| login == expected_login)
+}
+
 fn format_local_status(status: &StatusView) -> String {
     let mut output = String::new();
     let watchers = status.capture_watchers.len();
@@ -5477,6 +6073,25 @@ where
     let response = get_http(server, path)?;
     let body = http_response_body(&response)?;
     Ok(serde_json::from_str(body.trim())?)
+}
+
+fn get_edge_json(edge: &str, path: &str) -> Result<Value, CliError> {
+    let url = format!("{}{}", edge.trim_end_matches('/'), path);
+    let output = ProcessCommand::new("curl")
+        .args(["-fsS", "--connect-timeout", "5", "--max-time", "15", &url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| CliError::Http(format!("failed to start curl: {err}")))?;
+    if !output.status.success() {
+        return Err(CliError::Http(format!(
+            "edge request failed with {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 fn get_http(server: &str, path: &str) -> Result<String, CliError> {
