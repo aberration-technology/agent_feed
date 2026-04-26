@@ -119,6 +119,18 @@ publish from every local workspace:
 agent-feed serve --p2p --publish --feed workstation --all-workspaces
 ```
 
+to inspect the active network boundary:
+
+```sh
+agent-feed p2p status
+agent-feed p2p doctor
+```
+
+these report the active edge snapshot fallback and the staged native/browser
+libp2p protocol requirements. peers are never subscribed automatically; fabric,
+routing, and browser-handoff peers can participate without receiving feed
+headlines.
+
 the hosted browser shell is:
 
 ```text

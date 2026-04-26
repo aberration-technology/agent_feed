@@ -57,6 +57,95 @@ impl P2pDataPlane {
             Self::BrowserLibp2p => "browser_libp2p",
         }
     }
+
+    #[must_use]
+    pub fn capability(self, edge_fallback: EdgeFallbackMode) -> P2pDataPlaneCapability {
+        let edge_enabled = edge_fallback.allows_edge_publish();
+        match self {
+            Self::EdgeSnapshotFallback => P2pDataPlaneCapability {
+                data_plane: self,
+                available: edge_enabled,
+                production_default: true,
+                publish_available: edge_enabled,
+                subscribe_available: edge_enabled,
+                reason: if edge_enabled {
+                    "edge directory and snapshot endpoints are the active production data plane"
+                } else {
+                    "edge snapshot fallback is disabled by configuration"
+                },
+                next_step: if edge_enabled {
+                    "keep edge publish enabled until native libp2p is available"
+                } else {
+                    "enable edge fallback or build a native libp2p data plane"
+                },
+                protocols: EDGE_SNAPSHOT_PROTOCOLS,
+                transports: EDGE_SNAPSHOT_TRANSPORTS,
+            },
+            Self::NativeLibp2p => P2pDataPlaneCapability {
+                data_plane: self,
+                available: false,
+                production_default: false,
+                publish_available: false,
+                subscribe_available: false,
+                reason: "native libp2p transport is not linked into this build",
+                next_step: "implement the native swarm with identify, rendezvous, kad, gossipsub, request-response, relay, and autonat",
+                protocols: NATIVE_LIBP2P_PROTOCOLS,
+                transports: NATIVE_LIBP2P_TRANSPORTS,
+            },
+            Self::BrowserLibp2p => P2pDataPlaneCapability {
+                data_plane: self,
+                available: false,
+                production_default: false,
+                publish_available: false,
+                subscribe_available: false,
+                reason: "browser libp2p live transport is staged behind the static shell and edge seed path",
+                next_step: "wire signed browser seeds to browser-compatible transports and keep https snapshot fallback explicit",
+                protocols: BROWSER_LIBP2P_PROTOCOLS,
+                transports: BROWSER_LIBP2P_TRANSPORTS,
+            },
+        }
+    }
+}
+
+pub const EDGE_SNAPSHOT_PROTOCOLS: &[&str] = &[
+    "edge_directory_snapshot",
+    "signed_story_capsule",
+    "github_identity",
+    "feed_presence",
+];
+pub const EDGE_SNAPSHOT_TRANSPORTS: &[&str] = &["https"];
+pub const NATIVE_LIBP2P_PROTOCOLS: &[&str] = &[
+    "identify",
+    "ping",
+    "rendezvous",
+    "kad_provider",
+    "gossipsub",
+    "request_response",
+    "relay_client",
+    "autonat",
+];
+pub const NATIVE_LIBP2P_TRANSPORTS: &[&str] =
+    &["tcp", "quic_v1", "websocket", "webrtc_direct", "relay"];
+pub const BROWSER_LIBP2P_PROTOCOLS: &[&str] = &[
+    "signed_browser_seed",
+    "gossipsub",
+    "request_response",
+    "relay_client",
+    "https_snapshot_fallback",
+];
+pub const BROWSER_LIBP2P_TRANSPORTS: &[&str] = &["webrtc_direct", "webtransport", "relay", "https"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P2pDataPlaneCapability {
+    pub data_plane: P2pDataPlane,
+    pub available: bool,
+    pub production_default: bool,
+    pub publish_available: bool,
+    pub subscribe_available: bool,
+    pub reason: &'static str,
+    pub next_step: &'static str,
+    pub protocols: &'static [&'static str],
+    pub transports: &'static [&'static str],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -318,6 +407,36 @@ impl P2pNetworkConfig {
     }
 
     #[must_use]
+    pub fn active_transport_capability(&self) -> P2pDataPlaneCapability {
+        self.data_plane.capability(self.edge_fallback)
+    }
+
+    #[must_use]
+    pub fn transport_capabilities(&self) -> Vec<P2pDataPlaneCapability> {
+        [
+            P2pDataPlane::EdgeSnapshotFallback,
+            P2pDataPlane::NativeLibp2p,
+            P2pDataPlane::BrowserLibp2p,
+        ]
+        .into_iter()
+        .map(|data_plane| data_plane.capability(self.edge_fallback))
+        .collect()
+    }
+
+    pub fn with_data_plane(mut self, data_plane: P2pDataPlane) -> Result<Self, P2pError> {
+        let capability = data_plane.capability(self.edge_fallback);
+        if !capability.available {
+            return Err(P2pError::DataPlaneUnavailable(format!(
+                "{}: {}",
+                data_plane.as_str(),
+                capability.reason
+            )));
+        }
+        self.data_plane = data_plane;
+        Ok(self)
+    }
+
+    #[must_use]
     pub fn is_single_bootstrap_topology(&self) -> bool {
         self.topology == BootstrapTopology::SingleBootstrap
             && single_bootstrap_host(&self.bootstrap_peers).is_some()
@@ -345,6 +464,11 @@ impl P2pRuntimeStatus {
             P2pDataPlane::NativeLibp2p => "native p2p live",
             P2pDataPlane::BrowserLibp2p => "browser p2p live",
         }
+    }
+
+    #[must_use]
+    pub fn transport_capability(&self) -> P2pDataPlaneCapability {
+        self.data_plane.capability(self.edge_fallback)
     }
 }
 
@@ -425,6 +549,8 @@ pub enum P2pError {
     InvalidSignature,
     #[error("p2p compatibility rejected: {0}")]
     IncompatibleProtocol(String),
+    #[error("p2p data plane unavailable: {0}")]
+    DataPlaneUnavailable(String),
     #[error(transparent)]
     Proto(#[from] agent_feed_p2p_proto::ProtoError),
     #[error(transparent)]
@@ -2205,5 +2331,64 @@ mod tests {
         assert_eq!(status.projection_label(), "edge snapshot mode");
         assert_eq!(status.topology.as_str(), "single_bootstrap");
         assert!(status.edge_fallback.allows_edge_publish());
+        assert!(status.transport_capability().available);
+    }
+
+    #[test]
+    fn native_data_plane_is_gated_until_transport_is_enabled() {
+        let err = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto)
+            .with_data_plane(P2pDataPlane::NativeLibp2p)
+            .expect_err("native libp2p is not available in this build");
+
+        assert!(matches!(
+            err,
+            P2pError::DataPlaneUnavailable(message)
+                if message.contains("native_libp2p")
+                    && message.contains("not linked")
+        ));
+    }
+
+    #[test]
+    fn native_readiness_lists_required_protocols_and_transports() {
+        let capability = P2pDataPlane::NativeLibp2p.capability(EdgeFallbackMode::Auto);
+
+        assert!(!capability.available);
+        assert!(capability.protocols.contains(&"identify"));
+        assert!(capability.protocols.contains(&"rendezvous"));
+        assert!(capability.protocols.contains(&"kad_provider"));
+        assert!(capability.protocols.contains(&"gossipsub"));
+        assert!(capability.protocols.contains(&"request_response"));
+        assert!(capability.transports.contains(&"quic_v1"));
+        assert!(capability.transports.contains(&"webrtc_direct"));
+    }
+
+    #[test]
+    fn edge_snapshot_readiness_honors_fallback_policy() {
+        let enabled = P2pDataPlane::EdgeSnapshotFallback.capability(EdgeFallbackMode::Auto);
+        let disabled = P2pDataPlane::EdgeSnapshotFallback.capability(EdgeFallbackMode::Off);
+
+        assert!(enabled.available);
+        assert!(enabled.publish_available);
+        assert!(enabled.subscribe_available);
+        assert!(!disabled.available);
+        assert!(!disabled.publish_available);
+        assert!(disabled.reason.contains("disabled"));
+    }
+
+    #[test]
+    fn config_reports_all_data_plane_capabilities() {
+        let config = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto);
+        let capabilities = config.transport_capabilities();
+
+        assert_eq!(capabilities.len(), 3);
+        assert!(capabilities.iter().any(|capability| {
+            capability.data_plane == P2pDataPlane::EdgeSnapshotFallback && capability.available
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.data_plane == P2pDataPlane::NativeLibp2p && !capability.available
+        }));
+        assert!(capabilities.iter().any(|capability| {
+            capability.data_plane == P2pDataPlane::BrowserLibp2p && !capability.available
+        }));
     }
 }

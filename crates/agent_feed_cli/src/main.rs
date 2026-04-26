@@ -11,7 +11,9 @@ use agent_feed_edge::{
 };
 use agent_feed_ingest::source_from_str;
 use agent_feed_install::{doctor_report, init_plan};
-use agent_feed_p2p::{EdgeFallbackMode, MAINNET_EDGE_BASE_URL, P2pDataPlane, P2pNetworkConfig};
+use agent_feed_p2p::{
+    EdgeFallbackMode, MAINNET_EDGE_BASE_URL, P2pDataPlane, P2pDataPlaneCapability, P2pNetworkConfig,
+};
 use agent_feed_p2p_proto::{
     FeedVisibility, ProtocolCompatibility, PublisherIdentity, Signed, StoryCapsule,
 };
@@ -1151,13 +1153,20 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 }
             }
             P2pCommand::Status => {
-                let status =
-                    P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto).status();
+                let config = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto);
+                let status = config.status();
+                let transport = status.transport_capability();
+                let data_planes = config
+                    .transport_capabilities()
+                    .iter()
+                    .map(p2p_capability_json)
+                    .collect::<Vec<_>>();
                 info!(
                     network_id = %status.network_id,
                     data_plane = status.data_plane.as_str(),
                     topology = status.topology.as_str(),
                     bootstrap_peers = status.bootstrap_peers.len(),
+                    transport_available = transport.available,
                     "p2p status requested"
                 );
                 println!(
@@ -1170,10 +1179,12 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         "topology": status.topology.as_str(),
                         "edge_fallback": status.edge_fallback.as_str(),
                         "bootstrap_peers": status.bootstrap_peers,
+                        "transport": p2p_capability_json(&transport),
+                        "data_planes": data_planes,
                         "fabric_peers": status.fabric_peers,
                         "subscribed_feeds": status.subscribed_feeds,
                         "publishing": status.publishing,
-                        "note": "current production uses one bootstrap/edge peer and edge snapshot fallback until native libp2p is enabled",
+                        "note": "current production uses one bootstrap edge and edge snapshot fallback; native and browser libp2p transports are not enabled in this build",
                     }))?
                 );
             }
@@ -1184,11 +1195,14 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             }
             P2pCommand::Doctor => {
                 let config = P2pNetworkConfig::mainnet_single_bootstrap(EdgeFallbackMode::Auto);
+                let active = config.active_transport_capability();
                 info!(
                     network_id = %config.network_id,
                     topology = config.topology.as_str(),
                     bootstrap_peers = config.bootstrap_peers.len(),
                     single_bootstrap = config.is_single_bootstrap_topology(),
+                    data_plane = active.data_plane.as_str(),
+                    transport_available = active.available,
                     "p2p doctor requested"
                 );
                 println!("p2p doctor: story capsule protocol ok");
@@ -1196,8 +1210,25 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 println!("p2p doctor: bootstrap_host=api.feed.aberration.technology");
                 println!("p2p doctor: data_plane={}", config.data_plane.as_str());
                 println!(
-                    "p2p doctor: native libp2p transport not enabled yet; using edge snapshot fallback"
+                    "p2p doctor: active_transport={} available={} · {}",
+                    active.data_plane.as_str(),
+                    active.available,
+                    active.reason
                 );
+                for capability in config.transport_capabilities() {
+                    let status = if capability.available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    };
+                    println!(
+                        "p2p doctor: {} {status} · protocols={} · transports={} · {}",
+                        capability.data_plane.as_str(),
+                        capability.protocols.join(","),
+                        capability.transports.join(","),
+                        capability.next_step
+                    );
+                }
             }
             P2pCommand::Discover {
                 provider,
@@ -2906,6 +2937,30 @@ mod tests {
         assert_eq!(edge, "https://api.feed.aberration.technology");
         assert_eq!(network_id, "agent-feed-mainnet");
         assert!(json);
+    }
+
+    #[test]
+    fn p2p_capability_json_exposes_transport_boundary() {
+        let capability =
+            agent_feed_p2p::P2pDataPlane::NativeLibp2p.capability(EdgeFallbackMode::Auto);
+        let value = p2p_capability_json(&capability);
+
+        assert_eq!(value["data_plane"], "native_libp2p");
+        assert_eq!(value["available"], false);
+        assert!(
+            value["protocols"]
+                .as_array()
+                .expect("protocols array")
+                .iter()
+                .any(|protocol| protocol == "gossipsub")
+        );
+        assert!(
+            value["transports"]
+                .as_array()
+                .expect("transports array")
+                .iter()
+                .any(|transport| transport == "webrtc_direct")
+        );
     }
 
     #[test]
@@ -5873,6 +5928,20 @@ fn edge_network_query_value(network_id: &str) -> &str {
     } else {
         network_id
     }
+}
+
+fn p2p_capability_json(capability: &P2pDataPlaneCapability) -> Value {
+    json!({
+        "data_plane": capability.data_plane.as_str(),
+        "available": capability.available,
+        "production_default": capability.production_default,
+        "publish_available": capability.publish_available,
+        "subscribe_available": capability.subscribe_available,
+        "reason": capability.reason,
+        "next_step": capability.next_step,
+        "protocols": capability.protocols,
+        "transports": capability.transports,
+    })
 }
 
 fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
