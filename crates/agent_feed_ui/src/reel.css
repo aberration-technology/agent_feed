@@ -484,7 +484,8 @@ body.controls-visible .stage-actions,
   display: none;
 }
 
-.timeline-feeds a {
+.timeline-feeds a,
+.timeline-feeds .feed-action {
   flex: 0 0 auto;
   border: 1px solid var(--line);
   color: var(--muted);
@@ -497,9 +498,16 @@ body.controls-visible .stage-actions,
   color: color-mix(in srgb, var(--muted), transparent 18%);
 }
 
+.timeline-feeds .feed-action[data-kind="follow"] {
+  border-color: rgba(216, 124, 124, 0.28);
+  color: color-mix(in srgb, var(--accent), var(--muted) 24%);
+}
+
 .timeline-feeds a:hover,
 .timeline-feeds a[aria-current],
-.timeline-feeds a:focus-visible {
+.timeline-feeds a:focus-visible,
+.timeline-feeds .feed-action:hover,
+.timeline-feeds .feed-action:focus-visible {
   border-color: var(--accent);
   color: var(--accent);
   outline: none;

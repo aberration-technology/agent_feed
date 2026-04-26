@@ -2466,6 +2466,10 @@ function renderTimeline(route, ticket) {
     const feedLabel = feed.label || feed.feed_label || "feed";
     nav.appendChild(feedLink(route.login, feedLabel, feedLabel, route.feed === feedLabel));
   }
+  const follow = toolbarFollowButton(route);
+  if (follow) {
+    nav.appendChild(follow);
+  }
   nav.appendChild(timelineModeLink(route, "following", "following", false));
   toolbar.appendChild(nav);
   timeline.appendChild(toolbar);
@@ -2651,6 +2655,24 @@ function userFeedPath(login, label) {
     return `/${cleanLogin}/*`;
   }
   return `/${cleanLogin}/${encodeURIComponent(label)}`;
+}
+
+function toolbarFollowButton(route) {
+  if (!route || route.kind !== "user") {
+    return undefined;
+  }
+  const feed = route.feed && route.feed !== "*" ? route.feed : "*";
+  const target = normalizeFollowTarget(`${route.login}/${feed}`);
+  if (!target) {
+    return undefined;
+  }
+  const wildcard = target.endsWith("/*");
+  const button = followButton(target, {
+    inactive: wildcard ? "follow all" : "follow feed",
+    active: "saved",
+  });
+  button.dataset.kind = "follow";
+  return button;
 }
 
 function timelineActions(feed, route) {

@@ -317,6 +317,10 @@ mod tests {
         assert!(html.contains("window.localStorage.setItem(\"feed.following\""));
         assert!(html.contains("function fetchFollowingTarget"));
         assert!(html.contains("function renderFollowingTimeline"));
+        assert!(html.contains("function toolbarFollowButton"));
+        assert!(html.contains("inactive: wildcard ? \"follow all\" : \"follow feed\""));
+        assert!(html.contains("button.dataset.kind = \"follow\";"));
+        assert!(html.contains("const follow = toolbarFollowButton(route);"));
         assert!(html.contains("copyReelFilterParams(route, params);"));
         assert!(html.contains("nothing followed yet"));
         assert!(!html.contains("no subscriptions selected"));
@@ -367,6 +371,7 @@ mod tests {
         assert!(html.contains("link.dataset.kind = \"mode\";"));
         assert!(html.contains("link.dataset.kind = \"feed\";"));
         assert!(html.contains(".timeline-feeds a[data-kind=\"mode\"]"));
+        assert!(html.contains(".timeline-feeds .feed-action[data-kind=\"follow\"]"));
     }
 
     #[test]
