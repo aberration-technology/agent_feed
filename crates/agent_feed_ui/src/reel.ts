@@ -29,6 +29,7 @@ let controlsTimer = undefined;
 let remoteRefreshTimer = undefined;
 let remoteRefreshInFlight = false;
 let remoteHeadlinesSignature = "";
+let remoteFeedCount = undefined;
 let localSnapshotSignature = "";
 let activeStartedAt = 0;
 let activeDwellMs = 14000;
@@ -911,6 +912,7 @@ function scheduleNext(dwellMs) {
 }
 
 function applySnapshot(snapshot) {
+  remoteFeedCount = undefined;
   if (!snapshot || !Array.isArray(snapshot.bulletins)) {
     logWarn("snapshot payload missing bulletins", snapshot);
   }
@@ -1727,6 +1729,7 @@ async function startGlobalDiscoveryRoute(route, refresh = false) {
       return;
     }
     if (headlines.length) {
+      updateSourceCountFromFeeds(feeds);
       applyRemoteHeadlines(route, headlines);
       return;
     }
@@ -1744,6 +1747,7 @@ async function startGlobalDiscoveryRoute(route, refresh = false) {
       "network fabric may still be routing peers",
       "waiting for published headlines",
     ]);
+    updateSourceCountFromFeeds([]);
   } catch (error) {
     renderRemoteState(route, "failed", [
       "edge snapshot mode unavailable",
@@ -1884,6 +1888,7 @@ async function startUserRoute(route, refresh = false) {
       return;
     }
     if (headlines.length && !route.interactive) {
+      updateSourceCountFromFeeds(compatibleFeeds);
       applyRemoteHeadlines(route, headlines);
       return;
     }
@@ -1892,6 +1897,7 @@ async function startUserRoute(route, refresh = false) {
         "github identity found",
         "no visible settled story streams",
       ], ticket.profile);
+      updateSourceCountFromFeeds([]);
       logInfo("feed.user.no_visible_streams", {
         login: ticket.profile?.login || route.login,
         github_user_id: ticket.github_user_id || ticket.resolved_github_id,
@@ -3157,7 +3163,12 @@ function publisherLoginForProfile(feed, ticket) {
 }
 
 function updateSourceCountFromFeeds(feeds) {
-  setText(sourceCount, `${feeds.length} feeds`);
+  remoteFeedCount = Array.isArray(feeds) ? feeds.length : 0;
+  setText(sourceCount, feedCountLabel(remoteFeedCount));
+}
+
+function feedCountLabel(count) {
+  return `${count} ${count === 1 ? "feed" : "feeds"}`;
 }
 
 function connectSse() {
@@ -3203,6 +3214,10 @@ function updateClock() {
 }
 
 function updateSourceCount() {
+  if (remoteRoute && remoteFeedCount !== undefined) {
+    setText(sourceCount, feedCountLabel(remoteFeedCount));
+    return;
+  }
   const sources = new Set();
   for (const bulletin of bulletins) {
     const source = bulletinSourceKey(bulletin);
@@ -3213,7 +3228,7 @@ function updateSourceCount() {
   if (sources.size > 0) {
     setText(sourceCount, `${sources.size} ${sources.size === 1 ? "story source" : "story sources"}`);
   } else {
-    setText(sourceCount, "0 stories");
+    setText(sourceCount, "0 src");
   }
 }
 

@@ -253,10 +253,16 @@ mod tests {
     fn browser_network_source_count_uses_feed_identity_not_chips() {
         let html = render_index_with_config(Some("remote"), &config(true));
 
+        assert!(html.contains(r#"<span id="source-count">0 feeds</span>"#));
+        assert!(html.contains("let remoteFeedCount = undefined;"));
+        assert!(html.contains("function updateSourceCountFromFeeds(feeds)"));
+        assert!(html.contains("setText(sourceCount, feedCountLabel(remoteFeedCount));"));
+        assert!(html.contains("if (remoteRoute && remoteFeedCount !== undefined)"));
         assert!(html.contains("source_key:"));
         assert!(html.contains("function bulletinSourceKey"));
         assert!(html.contains("bulletin.feed_id || bulletin.feedId"));
         assert!(html.contains("bulletin.lower_third || bulletin.lowerThird"));
+        assert!(!html.contains("0 stories"));
         assert!(!html.contains("const firstChip = bulletin.chips?.[0];\n    const label"));
     }
 
