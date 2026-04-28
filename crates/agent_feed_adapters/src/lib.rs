@@ -232,7 +232,9 @@ pub mod codex {
         pub session_id: Option<String>,
         pub turn_id: Option<String>,
         pub cwd: Option<String>,
+        pub active_cwd: Option<String>,
         pub project: Option<String>,
+        pub active_project: Option<String>,
         pub model: Option<String>,
         active_calls: HashMap<String, TranscriptToolContext>,
         recent_messages: VecDeque<String>,
@@ -280,6 +282,19 @@ pub mod codex {
         fn take_call_context(&mut self, payload: &Value) -> Option<TranscriptToolContext> {
             let call_id = payload.get("call_id").and_then(Value::as_str)?;
             self.active_calls.remove(call_id)
+        }
+
+        fn remember_work_cwd(&mut self, cwd: Option<&str>) {
+            let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) else {
+                return;
+            };
+            self.active_cwd = Some(cwd.to_string());
+            self.active_project = project_from_cwd(cwd);
+        }
+
+        fn reset_turn_work_context(&mut self) {
+            self.active_cwd = None;
+            self.active_project = None;
         }
     }
 
@@ -347,6 +362,7 @@ pub mod codex {
         }
 
         if envelope_type == "turn_context" {
+            state.reset_turn_work_context();
             state.turn_id = payload
                 .get("turn_id")
                 .and_then(Value::as_str)
@@ -371,17 +387,20 @@ pub mod codex {
         }
 
         match (envelope_type, payload_type) {
-            ("event_msg", "task_started") => Some(build_event(
-                state,
-                timestamp,
-                TranscriptEvent::new(
-                    EventKind::TurnStart,
-                    "codex turn started",
-                    45,
-                    Severity::Info,
-                )
-                .optional_summary(state.model.as_deref().map(|model| format!("model {model}"))),
-            )),
+            ("event_msg", "task_started") => {
+                state.reset_turn_work_context();
+                Some(build_event(
+                    state,
+                    timestamp,
+                    TranscriptEvent::new(
+                        EventKind::TurnStart,
+                        "codex turn started",
+                        45,
+                        Severity::Info,
+                    )
+                    .optional_summary(state.model.as_deref().map(|model| format!("model {model}"))),
+                ))
+            }
             ("event_msg", "task_complete") => task_complete_event(state, timestamp, payload),
             ("event_msg", "turn_aborted") => task_failed_event(state, timestamp, payload),
             ("event_msg", "item_completed") => item_completed_event(state, timestamp, payload),
@@ -525,6 +544,7 @@ pub mod codex {
             .or_else(|| context.as_ref().and_then(|context| context.command.clone()));
         let cwd = cwd_from_payload(payload)
             .or_else(|| context.as_ref().and_then(|context| context.cwd.clone()));
+        state.remember_work_cwd(cwd.as_deref());
         let duration = payload.get("duration").and_then(Value::as_str);
         let summary = if command.as_deref().is_some_and(is_test_command) {
             match (success, duration) {
@@ -599,6 +619,7 @@ pub mod codex {
             .unwrap_or_else(|| payload.get("status").and_then(Value::as_str) == Some("completed"));
         let cwd = cwd_from_payload(payload)
             .or_else(|| context.as_ref().and_then(|context| context.cwd.clone()));
+        state.remember_work_cwd(cwd.as_deref());
         let files = files_from_changes(payload.get("changes"));
         let summary = if files.is_empty() {
             "patch applied without exposing raw diff.".to_string()
@@ -642,6 +663,7 @@ pub mod codex {
         let name = payload.get("name").and_then(Value::as_str)?;
         let command = command_from_arguments(payload.get("arguments"));
         let cwd = cwd_from_arguments(payload.get("arguments"));
+        state.remember_work_cwd(cwd.as_deref());
         state.insert_call_context(
             payload,
             TranscriptToolContext {
@@ -798,12 +820,30 @@ pub mod codex {
         event.adapter = "codex.transcript".to_string();
         event.session_id = state.session_id.clone();
         event.turn_id = state.turn_id.clone();
-        event.cwd = draft.cwd.or_else(|| state.cwd.clone());
+        event.cwd = draft
+            .cwd
+            .or_else(|| state.active_cwd.clone())
+            .or_else(|| state.cwd.clone());
+        let context_project = draft
+            .summary
+            .as_deref()
+            .and_then(project_from_text)
+            .or_else(|| draft.command.as_deref().and_then(project_from_text));
         event.project = event
             .cwd
             .as_deref()
             .and_then(project_from_cwd)
-            .or_else(|| state.project.clone());
+            .or_else(|| state.active_project.clone())
+            .or_else(|| state.project.clone())
+            .or_else(|| context_project.clone());
+        if event
+            .project
+            .as_deref()
+            .is_some_and(is_generic_root_project)
+            && let Some(project) = context_project
+        {
+            event.project = Some(project);
+        }
         event.occurred_at = timestamp.and_then(parse_timestamp);
         event.summary = draft.summary;
         event.command = draft.command;
@@ -824,6 +864,105 @@ pub mod codex {
             .file_name()
             .and_then(|name| name.to_str())
             .map(ToOwned::to_owned)
+    }
+
+    fn is_generic_root_project(project: &str) -> bool {
+        matches!(project, "repo" | "repos" | "workspace" | "workspaces")
+    }
+
+    fn project_from_text(text: &str) -> Option<String> {
+        project_from_path_text(text).or_else(|| {
+            text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+                .filter_map(project_from_token)
+                .next()
+        })
+    }
+
+    fn project_from_path_text(text: &str) -> Option<String> {
+        text.split_whitespace()
+            .map(|token| {
+                token.trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        '"' | '\''
+                            | '`'
+                            | ','
+                            | '.'
+                            | ':'
+                            | ';'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                    )
+                })
+            })
+            .filter(|token| token.contains('/'))
+            .filter_map(project_from_path_token)
+            .next()
+    }
+
+    fn project_from_path_token(token: &str) -> Option<String> {
+        let token = token.trim_end_matches(".git");
+        let segments = token
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>();
+        for window in segments.windows(2) {
+            if matches!(
+                window[0],
+                "repo" | "repos" | "workspace" | "workspaces" | "projects"
+            ) && let Some(project) = project_from_repo_segment(window[1])
+            {
+                return Some(project);
+            }
+        }
+        segments
+            .iter()
+            .copied()
+            .filter_map(project_from_token)
+            .next()
+    }
+
+    fn project_from_token(token: &str) -> Option<String> {
+        let token = token.trim_matches(['_', '-', '.', ',', ':', ';']);
+        if token.len() < 3 || token.len() > 48 || token.contains('/') || token.contains('\\') {
+            return None;
+        }
+        let normalized = token.to_ascii_lowercase();
+        if normalized.starts_with("burn_p2p") {
+            return Some("burn_p2p".to_string());
+        }
+        if normalized.starts_with("burn_dragon") {
+            return Some("burn_dragon".to_string());
+        }
+        if normalized.starts_with("agent_feed") {
+            return Some("agent_feed".to_string());
+        }
+        if normalized.starts_with("agent_reel") {
+            return Some("agent_reel".to_string());
+        }
+        None
+    }
+
+    fn project_from_repo_segment(segment: &str) -> Option<String> {
+        let segment = segment.trim_matches(['_', '-', '.', ',', ':', ';']);
+        if segment.len() < 3 || segment.len() > 64 {
+            return None;
+        }
+        let normalized = segment.to_ascii_lowercase();
+        if is_generic_root_project(&normalized) {
+            return None;
+        }
+        if normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return Some(normalized);
+        }
+        None
     }
 
     fn session_id_from_path(path: Option<&Path>) -> Option<String> {
@@ -1736,12 +1875,49 @@ mod tests {
     }
 
     #[test]
+    fn codex_transcript_infers_project_from_root_workspace_message() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Burn_dragon browser training now uses the shared p2p receipt path."}]}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:05.000Z","payload":{"type":"task_complete","turn_id":"turn_1","last_agent_message":"Burn_p2p publish receipts are now project aware.","duration_ms":5000}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events[0].project.as_deref(), Some("repos"));
+        assert_eq!(events[1].kind, EventKind::AgentMessage);
+        assert_eq!(events[1].project.as_deref(), Some("burn_dragon"));
+        assert_eq!(events[2].kind, EventKind::TurnComplete);
+        assert_eq!(events[2].project.as_deref(), Some("burn_p2p"));
+    }
+
+    #[test]
+    fn codex_transcript_does_not_infer_tool_names_as_projects() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"function_call","name":"write_stdin","call_id":"call_1","arguments":{"session_id":123,"chars":"","yield_time_ms":1000}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:05.000Z","payload":{"type":"task_complete","turn_id":"turn_1","last_agent_message":"waiting for the build to finish.","duration_ms":5000}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events[0].project.as_deref(), Some("repos"));
+        assert_eq!(events[1].kind, EventKind::ToolStart);
+        assert_eq!(events[1].project.as_deref(), Some("repos"));
+        assert_eq!(events[2].kind, EventKind::TurnComplete);
+        assert_eq!(events[2].project.as_deref(), Some("repos"));
+    }
+
+    #[test]
     fn codex_transcript_uses_tool_workdir_for_project_tags() {
         let transcript = r#"
 {"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos"}}
 {"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos","turn_id":"turn_1"}}
 {"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":{"cmd":"cargo test -p burn_p2p_browser","workdir":"/home/mosure/repos/burn_p2p"}}}
 {"type":"event_msg","timestamp":"2026-04-24T03:17:04.000Z","payload":{"type":"exec_command_end","call_id":"call_1","turn_id":"turn_1","status":"completed","exit_code":0,"duration":"4s","command":["cargo","test","-p","burn_p2p_browser"],"cwd":"/home/mosure/repos/burn_p2p"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:07.000Z","payload":{"type":"task_complete","turn_id":"turn_1","last_agent_message":"Burn_p2p browser training receipts now flush reliably.","duration_ms":7000}}
 "#;
 
         let events = normalize_transcript(transcript, None).expect("transcript normalizes");
@@ -1757,6 +1933,12 @@ mod tests {
         assert_eq!(events[2].project.as_deref(), Some("burn_p2p"));
         assert_eq!(
             events[2].cwd.as_deref(),
+            Some("/home/mosure/repos/burn_p2p")
+        );
+        assert_eq!(events[3].kind, EventKind::TurnComplete);
+        assert_eq!(events[3].project.as_deref(), Some("burn_p2p"));
+        assert_eq!(
+            events[3].cwd.as_deref(),
             Some("/home/mosure/repos/burn_p2p")
         );
     }

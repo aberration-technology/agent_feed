@@ -4,7 +4,7 @@ use agent_feed_auth_github::{
     GithubAuthError, GithubAuthSession, GithubCliAuthConfig, GithubSessionStore, begin_cli_login,
     complete_cli_login, parse_cli_callback_request,
 };
-use agent_feed_core::AgentEvent;
+use agent_feed_core::{AgentEvent, EventKind, Severity, SourceKind};
 use agent_feed_directory::{RemoteUserRoute, validate_logical_feed_label};
 use agent_feed_edge::{
     EdgeConfig, EdgeFabricConfig, EdgeServerConfig, OrgDeploymentPolicy, serve_http,
@@ -49,6 +49,7 @@ const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
 const CAPTURE_STATUS_HEARTBEAT: Duration = Duration::from_secs(15);
 const STARTUP_STATE_SAMPLE_BYTES: usize = 1024 * 1024;
 const STARTUP_CONTEXT_TAIL_BYTES: usize = 512 * 1024;
+const STARTUP_RECAP_MAX_AGE: time::Duration = time::Duration::minutes(45);
 const STARTUP_CONTEXT_TAG: &str = "startup-context";
 
 #[derive(Debug, Parser)]
@@ -1779,6 +1780,7 @@ struct ProcessorSessionRegistry {
 #[derive(Debug, Default)]
 struct ProcessorSessionRegistryState {
     summary_memory_paths: Vec<PathBuf>,
+    processor_work_dirs: Vec<PathBuf>,
     session_ids: HashSet<String>,
     skipped_session_ids: HashSet<String>,
     processor_events_dropped: u64,
@@ -1799,6 +1801,7 @@ impl ProcessorSessionRegistry {
     fn from_summary_config(config: &SummaryConfig) -> Self {
         let registry = Self::default();
         if let Some(path) = summary_memory_path(config) {
+            registry.add_processor_work_dir(summary_memory_work_dir(&path));
             registry.add_summary_memory_path(path);
             registry.refresh();
         }
@@ -1812,6 +1815,17 @@ impl ProcessorSessionRegistry {
         };
         if !state.summary_memory_paths.contains(&path) {
             state.summary_memory_paths.push(path);
+        }
+    }
+
+    fn add_processor_work_dir(&self, path: PathBuf) {
+        let Ok(mut state) = self.inner.lock() else {
+            warn!("processor session registry lock poisoned while adding processor work dir");
+            return;
+        };
+        let path = clean_path(&expand_home_path(path));
+        if !state.processor_work_dirs.contains(&path) {
+            state.processor_work_dirs.push(path);
         }
     }
 
@@ -1871,6 +1885,16 @@ impl ProcessorSessionRegistry {
         self.inner
             .lock()
             .is_ok_and(|state| state.session_ids.contains(session_id))
+    }
+
+    fn owns_cwd(&self, cwd: &str) -> bool {
+        let cwd = clean_path(&expand_home_path(PathBuf::from(cwd)));
+        self.inner.lock().is_ok_and(|state| {
+            state
+                .processor_work_dirs
+                .iter()
+                .any(|root| cwd == *root || cwd.starts_with(root))
+        })
     }
 
     fn drop_processor_event(&self, event: &AgentEvent) -> bool {
@@ -1938,6 +1962,13 @@ fn summary_memory_path(config: &SummaryConfig) -> Option<PathBuf> {
         }
         _ => None,
     }
+}
+
+fn summary_memory_work_dir(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("codex-memory-work")
 }
 
 fn summary_memory_codex_session_ids(path: &Path) -> Vec<String> {
@@ -3861,6 +3892,105 @@ mod tests {
     }
 
     #[test]
+    fn codex_startup_recap_emits_recent_active_root_workspace_work() {
+        let root = temp_test_root("codex-startup-recap-root");
+        let workspace = root.join("repos");
+        let burn_dragon = workspace.join("burn_dragon");
+        fs::create_dir_all(&burn_dragon).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "root-active-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_1",
+                        "arguments": {
+                            "cmd": "gh run list --repo aberration-technology/burn_dragon --branch main",
+                            "workdir": burn_dragon
+                        }
+                    }
+                }),
+            ],
+        );
+        let input = fs::read_to_string(&transcript).expect("transcript reads");
+
+        let recap =
+            codex_startup_recap_event(&transcript, &input, TranscriptState::default(), None, None)
+                .expect("active root workspace recap emits");
+
+        assert_eq!(recap.kind, EventKind::AgentMessage);
+        assert_eq!(recap.project.as_deref(), Some("burn_dragon"));
+        let burn_dragon_path = burn_dragon.to_string_lossy().to_string();
+        assert_eq!(recap.cwd.as_deref(), Some(burn_dragon_path.as_str()));
+        assert_eq!(
+            recap.summary.as_deref(),
+            Some("deployment workflow monitoring is active.")
+        );
+        assert!(recap.tags.iter().any(|tag| tag == "active-attach"));
+        assert!(!recap.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_startup_recap_infers_project_from_root_assistant_context() {
+        let root = temp_test_root("codex-startup-recap-project-context");
+        let workspace = root.join("repos");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "root-context-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Burn_p2p browser peers now receive structured training receipts through the shared edge path."
+                        }]
+                    }
+                }),
+            ],
+        );
+        let input = fs::read_to_string(&transcript).expect("transcript reads");
+
+        let recap =
+            codex_startup_recap_event(&transcript, &input, TranscriptState::default(), None, None)
+                .expect("assistant context recap emits");
+
+        assert_eq!(recap.project.as_deref(), Some("burn_p2p"));
+        assert_eq!(
+            recap.summary.as_deref(),
+            Some(
+                "Burn_p2p browser peers now receive structured training receipts through the shared edge path."
+            )
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
     fn claude_stream_compiles_meaningful_settled_stories() {
         let root = temp_test_root("claude-meaningful-stories");
         let workspace = root.join("repo");
@@ -4232,6 +4362,86 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn processor_guard_requires_owned_workdir_for_unregistered_internal_prompt() {
+        let root = temp_test_root("processor-owned-workdir");
+        let store = root.join("summary-memory.json");
+        let work_dir = summary_memory_work_dir(&store);
+        let workspace = root.join("repos");
+        fs::create_dir_all(&work_dir).expect("processor work dir");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let mut config = SummaryConfig::p2p_default();
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: store.display().to_string(),
+            key: "feed:test".to_string(),
+            command: "codex".to_string(),
+        };
+        let registry = ProcessorSessionRegistry::from_summary_config(&config);
+        let processor_input = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "new-processor-session", "cwd": work_dir}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-24T03:16:50.000Z",
+                "payload": {
+                    "type": "user_message",
+                    "message": internal_story_summary_prompt()
+                }
+            })
+        );
+        let real_input = format!(
+            "{}\n{}\n",
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "real-root-session", "cwd": workspace}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-04-24T03:16:50.000Z",
+                "payload": {
+                    "type": "user_message",
+                    "message": internal_story_summary_prompt()
+                }
+            })
+        );
+
+        assert!(is_agent_feed_internal_transcript_for_registry(
+            &processor_input,
+            None,
+            Some(&registry)
+        ));
+        assert!(!is_agent_feed_internal_transcript_for_registry(
+            &real_input,
+            None,
+            Some(&registry)
+        ));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn processor_guard_skips_default_memory_workdir_without_publish_registry() {
+        let default_store = PathBuf::from(default_summary_memory_store_string());
+        let default_work_dir = summary_memory_work_dir(&default_store);
+        let input = format!(
+            "{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {"id": "default-processor-session", "cwd": default_work_dir}
+            })
+        );
+
+        assert!(is_agent_feed_internal_transcript_for_registry(
+            &input, None, None
+        ));
+        assert!(is_agent_feed_internal_transcript(&input));
     }
 
     #[test]
@@ -5386,7 +5596,13 @@ fn poll_codex_watchers(
         watcher.offset = len;
         watcher.pending.push_str(&chunk);
         let complete = split_complete_jsonl(&mut watcher.pending);
-        if watcher.internal_processor || is_agent_feed_internal_transcript(&complete) {
+        if watcher.internal_processor
+            || is_agent_feed_internal_transcript_for_registry(
+                &complete,
+                Some(&watcher.state),
+                processor_registry,
+            )
+        {
             watcher.internal_processor = true;
             let session_id =
                 codex_session_id_from_input(&complete).or_else(|| watcher.state.session_id.clone());
@@ -5460,7 +5676,7 @@ fn import_codex_chunk(
     processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
-    if is_agent_feed_internal_transcript(input) {
+    if is_agent_feed_internal_transcript_for_registry(input, Some(state), processor_registry) {
         debug!(
             path = %path.display(),
             "codex transcript chunk skipped agent-feed internal processor session"
@@ -5582,7 +5798,8 @@ fn initialize_codex_watcher(
     } else {
         warm_codex_state_from_sample_at(path, initial_len, &mut state)?;
         let context = transcript_suffix_at(path, STARTUP_CONTEXT_TAIL_BYTES, initial_len)?;
-        import_codex_context_chunk(
+        let recap_state = state.clone();
+        let mut stats = import_codex_context_chunk(
             server,
             path,
             &context,
@@ -5590,9 +5807,226 @@ fn initialize_codex_watcher(
             workspace,
             event_sink,
             processor_registry,
-        )
+        );
+        if let Some(recap) =
+            codex_startup_recap_event(path, &context, recap_state, workspace, processor_registry)
+            && post_codex_synthetic_event(server, path, &recap, event_sink, "startup recap")
+        {
+            stats.imported += 1;
+        }
+        stats
     };
     Ok((state, stats, initial_len))
+}
+
+fn post_codex_synthetic_event(
+    server: &str,
+    path: &Path,
+    event: &AgentEvent,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    label: &'static str,
+) -> bool {
+    let body = match serde_json::to_string(event) {
+        Ok(body) => body,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                %label,
+                "codex synthetic event encode failed"
+            );
+            return false;
+        }
+    };
+    if let Err(err) = post_json(server, "/ingest/codex/jsonl", &body) {
+        warn!(
+            path = %path.display(),
+            %server,
+            error = %err,
+            %label,
+            "codex synthetic event post failed"
+        );
+        return false;
+    }
+    if let Some(sender) = event_sink
+        && let Err(err) = sender.send(event.clone())
+    {
+        warn!(
+            path = %path.display(),
+            event_id = %event.id,
+            error = %err,
+            %label,
+            "codex synthetic event publish queue send failed"
+        );
+    }
+    info!(
+        path = %path.display(),
+        event_id = %event.id,
+        project = event.project.as_deref().unwrap_or("local"),
+        summary = event.summary.as_deref().unwrap_or_default(),
+        %label,
+        "codex active session startup recap emitted"
+    );
+    true
+}
+
+fn codex_startup_recap_event(
+    path: &Path,
+    input: &str,
+    mut state: TranscriptState,
+    workspace: Option<&WorkspaceFilter>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
+) -> Option<AgentEvent> {
+    if is_agent_feed_internal_transcript_for_registry(input, Some(&state), processor_registry) {
+        return None;
+    }
+
+    let mut candidate = None::<(AgentEvent, String)>;
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(event) = normalize_transcript_value(value, &mut state, Some(path)) else {
+            continue;
+        };
+        if processor_registry.is_some_and(|registry| registry.drop_processor_event(&event)) {
+            continue;
+        }
+        if !event_matches_workspace(&event, workspace, path, "codex") {
+            continue;
+        }
+        if !event_is_recent_for_attach(&event) {
+            continue;
+        }
+        let Some(summary) = attach_recap_summary(&event) else {
+            continue;
+        };
+        candidate = Some((event, summary));
+    }
+
+    let (event, summary) = candidate?;
+    let mut recap = AgentEvent::new(
+        SourceKind::Codex,
+        EventKind::AgentMessage,
+        "codex active session recap",
+    );
+    recap.agent = "codex".to_string();
+    recap.adapter = "codex.transcript".to_string();
+    recap.session_id = event.session_id;
+    recap.turn_id = event.turn_id;
+    recap.project = event.project;
+    recap.cwd = event.cwd;
+    recap.occurred_at = event.occurred_at;
+    recap.summary = Some(summary);
+    recap.tags = vec![
+        "codex".to_string(),
+        "transcript".to_string(),
+        "active-attach".to_string(),
+    ];
+    recap.score_hint = Some(74);
+    recap.severity = Severity::Notice;
+    Some(recap)
+}
+
+fn event_is_recent_for_attach(event: &AgentEvent) -> bool {
+    let occurred = event.occurred_at.unwrap_or(event.received_at);
+    let age = time::OffsetDateTime::now_utc() - occurred;
+    age >= -time::Duration::minutes(5) && age <= STARTUP_RECAP_MAX_AGE
+}
+
+fn attach_recap_summary(event: &AgentEvent) -> Option<String> {
+    if matches!(
+        event.kind,
+        EventKind::AgentMessage
+            | EventKind::TurnComplete
+            | EventKind::TurnFail
+            | EventKind::TestFail
+            | EventKind::PermissionDenied
+            | EventKind::McpFail
+    ) && let Some(summary) = event
+        .summary
+        .as_deref()
+        .filter(|summary| attach_summary_has_context(summary))
+    {
+        return Some(summary.trim().to_string());
+    }
+    active_command_recap_summary(event)
+}
+
+fn attach_summary_has_context(summary: &str) -> bool {
+    let lowered = summary.to_ascii_lowercase();
+    if summary.len() < 24
+        || lowered.contains("raw output omitted")
+        || lowered.contains("raw diff omitted")
+        || lowered.contains("command lifecycle captured")
+        || lowered.starts_with("turn completed in ")
+        || lowered.starts_with("model ")
+    {
+        return false;
+    }
+    [
+        "auth",
+        "aws",
+        "browser",
+        "burn_",
+        "callback",
+        "canary",
+        "deployment",
+        "diloco",
+        "edge",
+        "github",
+        "gpu",
+        "network",
+        "p2p",
+        "pages",
+        "publish",
+        "release",
+        "terraform",
+        "training",
+        "webgpu",
+        "workflow",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+fn active_command_recap_summary(event: &AgentEvent) -> Option<String> {
+    if !matches!(
+        event.kind,
+        EventKind::CommandExec | EventKind::ToolStart | EventKind::ToolComplete
+    ) {
+        return None;
+    }
+    let command = event.command.as_deref()?.to_ascii_lowercase();
+    if command.contains("receipt") && command.contains("training") {
+        return Some("browser training receipt verification is active.".to_string());
+    }
+    if command.contains("burn_p2p_browser") || command.contains("browser") {
+        return Some("browser peer verification is active.".to_string());
+    }
+    if command.contains("gh run") || command.contains("workflow") {
+        return Some("deployment workflow monitoring is active.".to_string());
+    }
+    if command.contains("terraform") {
+        return Some("infrastructure deployment work is active.".to_string());
+    }
+    if command.contains("cargo test")
+        || command.contains("nextest")
+        || command.contains("pytest")
+        || command.contains("npm test")
+    {
+        if event.project.as_deref() == Some("burn_p2p") {
+            return Some("p2p verification is active.".to_string());
+        }
+        if event.project.as_deref() == Some("burn_dragon") {
+            return Some("browser training verification is active.".to_string());
+        }
+        return None;
+    }
+    if command.contains("training") || command.contains("webgpu") || command.contains("diloco") {
+        return Some("training system work is active.".to_string());
+    }
+    None
 }
 
 fn import_codex_context_chunk(
@@ -5628,7 +6062,7 @@ fn import_codex_filtered_chunk(
     include_event: impl Fn(&AgentEvent) -> bool,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
-    if is_agent_feed_internal_transcript(input) {
+    if is_agent_feed_internal_transcript_for_registry(input, Some(state), processor_registry) {
         debug!(
             path = %path.display(),
             "codex transcript chunk skipped agent-feed internal processor session"
@@ -6298,7 +6732,7 @@ fn active_codex_session_paths(
             );
             continue;
         }
-        if is_agent_feed_internal_transcript_path(&path)? {
+        if is_agent_feed_internal_transcript_path(&path, processor_registry)? {
             if let Some(registry) = processor_registry {
                 let session_id = codex_session_id_from_path_or_sample(&path)?;
                 registry.record_processor_session_skipped(session_id.as_deref());
@@ -6397,7 +6831,7 @@ fn active_claude_session_paths(
 
     let mut paths = Vec::new();
     for path in jsonl_files_by_mtime(root)? {
-        if is_agent_feed_internal_transcript_path(&path)? {
+        if is_agent_feed_internal_transcript_path(&path, None)? {
             debug!(
                 path = %path.display(),
                 "claude active session skipped agent-feed internal processor session"
@@ -6422,9 +6856,16 @@ fn active_claude_session_paths(
 
 const AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES: usize = 256 * 1024;
 
-fn is_agent_feed_internal_transcript_path(path: &Path) -> Result<bool, CliError> {
+fn is_agent_feed_internal_transcript_path(
+    path: &Path,
+    processor_registry: Option<&ProcessorSessionRegistry>,
+) -> Result<bool, CliError> {
     let sample = transcript_sample(path, AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES)?;
-    Ok(is_agent_feed_internal_transcript(&sample))
+    Ok(is_agent_feed_internal_transcript_for_registry(
+        &sample,
+        None,
+        processor_registry,
+    ))
 }
 
 fn transcript_sample(path: &Path, max_bytes: usize) -> Result<String, CliError> {
@@ -6505,21 +6946,102 @@ fn transcript_prefix(path: &Path, end_offset: u64) -> Result<String, CliError> {
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
+#[derive(Clone, Debug, Default)]
+struct InternalTranscriptSignals {
+    saw_internal_prompt: bool,
+    saw_external_activity: bool,
+    session_id: Option<String>,
+    cwd: Option<String>,
+}
+
 fn is_agent_feed_internal_transcript(input: &str) -> bool {
-    let mut saw_internal_prompt = false;
-    let mut saw_external_activity = false;
+    let signals = internal_transcript_signals(input, None);
+    if signals
+        .cwd
+        .as_deref()
+        .is_some_and(is_default_processor_work_dir)
+    {
+        return true;
+    }
+    signals.saw_internal_prompt && !signals.saw_external_activity
+}
+
+fn is_agent_feed_internal_transcript_for_registry(
+    input: &str,
+    state: Option<&TranscriptState>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
+) -> bool {
+    let signals = internal_transcript_signals(input, state);
+    if signals
+        .cwd
+        .as_deref()
+        .is_some_and(is_default_processor_work_dir)
+    {
+        return true;
+    }
+    let Some(registry) = processor_registry else {
+        return signals.saw_internal_prompt && !signals.saw_external_activity;
+    };
+    if let Some(session_id) = signals.session_id.as_deref()
+        && registry.is_known_session_id(session_id)
+    {
+        return true;
+    }
+    if !signals.saw_internal_prompt || signals.saw_external_activity {
+        return false;
+    }
+    signals
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| registry.owns_cwd(cwd))
+}
+
+fn is_default_processor_work_dir(cwd: &str) -> bool {
+    let cwd = clean_path(&expand_home_path(PathBuf::from(cwd)));
+    let default_store = PathBuf::from(default_summary_memory_store_string());
+    let default_work_dir = clean_path(&expand_home_path(summary_memory_work_dir(&default_store)));
+    cwd == default_work_dir || cwd.starts_with(&default_work_dir)
+}
+
+fn internal_transcript_signals(
+    input: &str,
+    state: Option<&TranscriptState>,
+) -> InternalTranscriptSignals {
+    let mut signals = InternalTranscriptSignals {
+        session_id: state.and_then(|state| state.session_id.clone()),
+        cwd: state.and_then(|state| state.active_cwd.clone().or_else(|| state.cwd.clone())),
+        ..InternalTranscriptSignals::default()
+    };
 
     for line in input.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        saw_external_activity |= transcript_value_has_external_activity(&value);
+        signals.saw_external_activity |= transcript_value_has_external_activity(&value);
+        if signals.session_id.is_none() {
+            signals.session_id = codex_session_id_from_value(&value);
+        }
+        if signals.cwd.is_none() {
+            signals.cwd = codex_cwd_from_value(&value);
+        }
         if line.contains(INTERNAL_SUMMARIZER_MARKER) {
-            saw_internal_prompt |= transcript_user_payload_contains_internal_prompt(&value);
+            signals.saw_internal_prompt |= transcript_user_payload_contains_internal_prompt(&value);
         }
     }
 
-    saw_internal_prompt && !saw_external_activity
+    signals
+}
+
+fn codex_cwd_from_value(value: &Value) -> Option<String> {
+    let payload = value.get("payload").unwrap_or(value);
+    value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("workdir").and_then(Value::as_str))
+        .or_else(|| payload.get("cwd").and_then(Value::as_str))
+        .or_else(|| payload.get("workdir").and_then(Value::as_str))
+        .filter(|cwd| !cwd.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn transcript_user_payload_contains_internal_prompt(value: &Value) -> bool {

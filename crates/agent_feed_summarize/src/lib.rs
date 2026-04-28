@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESSOR_MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const HTTP_MAX_RESPONSE_BYTES: usize = 128 * 1024;
+pub const DEFAULT_CODEX_SUMMARY_MODEL: &str = "gpt-5.3-codex-spark";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SummaryError {
@@ -324,7 +325,12 @@ impl SummaryProcessorConfig {
     pub fn codex_command() -> Self {
         Self::Process {
             command: "codex".to_string(),
-            args: vec!["exec".to_string(), "--json".to_string()],
+            args: vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                DEFAULT_CODEX_SUMMARY_MODEL.to_string(),
+            ],
         }
     }
 
@@ -700,24 +706,33 @@ impl SummaryProcessor for CodexSessionMemoryProcessor {
         let mut store = self.load_store()?;
         let existing = store.records.get(&self.key).cloned();
         let prompt = self.prompt_with_memory(request, existing.as_ref());
-        let mut args = vec!["exec".to_string()];
-        if let Some(session_id) = existing
+        let args = if let Some(session_id) = existing
             .as_ref()
             .and_then(|record| record.codex_session_id.as_deref())
             .filter(|session_id| !session_id.trim().is_empty())
         {
-            args.push("resume".to_string());
-            args.push("--json".to_string());
-            args.push("--skip-git-repo-check".to_string());
-            args.push(session_id.to_string());
-            args.push("-".to_string());
+            vec![
+                "exec".to_string(),
+                "resume".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                DEFAULT_CODEX_SUMMARY_MODEL.to_string(),
+                "--skip-git-repo-check".to_string(),
+                session_id.to_string(),
+                "-".to_string(),
+            ]
         } else {
-            args.push("--json".to_string());
-            args.push("--sandbox".to_string());
-            args.push("read-only".to_string());
-            args.push("--skip-git-repo-check".to_string());
-            args.push("-".to_string());
-        }
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                DEFAULT_CODEX_SUMMARY_MODEL.to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "-".to_string(),
+            ]
+        };
         let work_dir = self.work_dir();
         fs::create_dir_all(&work_dir).map_err(|err| {
             SummaryError::Processor(format!(
@@ -1306,7 +1321,12 @@ fn summarize_request_inner(
                 let processor_request = request_for_external_processor(request, config)?;
                 ExternalProcessProcessor::new(
                     "codex",
-                    vec!["exec".to_string(), "--json".to_string()],
+                    vec![
+                        "exec".to_string(),
+                        "--json".to_string(),
+                        "--model".to_string(),
+                        DEFAULT_CODEX_SUMMARY_MODEL.to_string(),
+                    ],
                 )
                 .summarize(&processor_request)?
             }
@@ -3340,7 +3360,18 @@ mod tests {
         assert_eq!(SummaryProcessorConfig::ClaudeCodeExec.name(), "claude-code");
         let codex = SummaryProcessorConfig::codex_command();
         let claude = SummaryProcessorConfig::claude_command();
-        assert!(matches!(codex, SummaryProcessorConfig::Process { .. }));
+        let SummaryProcessorConfig::Process { args, .. } = codex else {
+            panic!("expected codex process config");
+        };
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "--json".to_string(),
+                "--model".to_string(),
+                DEFAULT_CODEX_SUMMARY_MODEL.to_string(),
+            ]
+        );
         assert!(matches!(claude, SummaryProcessorConfig::Process { .. }));
     }
 
@@ -3437,12 +3468,12 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(
             args.lines()
                 .next()
-                .is_some_and(|line| line.contains("exec --json"))
+                .is_some_and(|line| line.contains("exec --json --model gpt-5.3-codex-spark"))
         );
         assert!(
             args.lines()
                 .nth(1)
-                .is_some_and(|line| line.contains("exec resume --json"))
+                .is_some_and(|line| line.contains("exec resume --json --model gpt-5.3-codex-spark"))
         );
         assert!(args.contains("summary-session-1"));
         assert_eq!(first.headline, "remembered feed context");
