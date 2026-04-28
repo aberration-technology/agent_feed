@@ -4235,6 +4235,51 @@ mod tests {
     }
 
     #[test]
+    fn transcript_startup_tail_respects_attach_boundary() {
+        let root = temp_test_root("transcript-attach-boundary");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "boundary-session", "cwd": root}
+            })],
+        );
+        let attach_offset = fs::metadata(&transcript)
+            .expect("transcript metadata")
+            .len();
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .expect("transcript appends");
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {"type": "exec_command_end", "turn_id": "future-turn"}
+                })
+            )
+            .expect("future event writes");
+        }
+
+        let startup_tail =
+            transcript_suffix_at(&transcript, STARTUP_CONTEXT_TAIL_BYTES, attach_offset)
+                .expect("bounded startup tail reads");
+        let full_tail = transcript_suffix(&transcript, STARTUP_CONTEXT_TAIL_BYTES)
+            .expect("full startup tail reads");
+
+        assert!(startup_tail.contains("boundary-session"));
+        assert!(!startup_tail.contains("future-turn"));
+        assert!(full_tail.contains("future-turn"));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
     fn processor_registry_skips_known_summary_session_without_prompt_scan() {
         let root = temp_test_root("active-codex-registry");
         let sessions = root.join("sessions");
@@ -5521,9 +5566,10 @@ fn initialize_codex_watcher(
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
     processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> Result<(TranscriptState, ImportStats, u64), CliError> {
+    let initial_len = fs::metadata(path)?.len();
     let mut state = TranscriptState::default();
     let stats = if include_history {
-        let input = fs::read_to_string(path)?;
+        let input = transcript_prefix(path, initial_len)?;
         import_codex_chunk(
             server,
             path,
@@ -5534,8 +5580,8 @@ fn initialize_codex_watcher(
             processor_registry,
         )
     } else {
-        warm_codex_state_from_sample(path, &mut state)?;
-        let context = transcript_suffix(path, STARTUP_CONTEXT_TAIL_BYTES)?;
+        warm_codex_state_from_sample_at(path, initial_len, &mut state)?;
+        let context = transcript_suffix_at(path, STARTUP_CONTEXT_TAIL_BYTES, initial_len)?;
         import_codex_context_chunk(
             server,
             path,
@@ -5546,8 +5592,7 @@ fn initialize_codex_watcher(
             processor_registry,
         )
     };
-    let offset = fs::metadata(path)?.len();
-    Ok((state, stats, offset))
+    Ok((state, stats, initial_len))
 }
 
 fn import_codex_context_chunk(
@@ -5663,8 +5708,18 @@ fn import_codex_filtered_chunk(
     stats
 }
 
+#[cfg(test)]
 fn warm_codex_state_from_sample(path: &Path, state: &mut TranscriptState) -> Result<(), CliError> {
-    let sample = transcript_sample(path, STARTUP_STATE_SAMPLE_BYTES)?;
+    let len = fs::metadata(path)?.len();
+    warm_codex_state_from_sample_at(path, len, state)
+}
+
+fn warm_codex_state_from_sample_at(
+    path: &Path,
+    end_offset: u64,
+    state: &mut TranscriptState,
+) -> Result<(), CliError> {
+    let sample = transcript_sample_at(path, STARTUP_STATE_SAMPLE_BYTES, end_offset)?;
     warm_codex_state(path, &sample, state);
     Ok(())
 }
@@ -6028,17 +6083,17 @@ fn initialize_claude_watcher(
     include_history: bool,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
 ) -> Result<(ClaudeState, ImportStats, u64), CliError> {
+    let initial_len = fs::metadata(path)?.len();
     let mut state = ClaudeState::default();
     let stats = if include_history {
-        let input = fs::read_to_string(path)?;
+        let input = transcript_prefix(path, initial_len)?;
         import_claude_chunk(server, path, &input, &mut state, workspace, event_sink)
     } else {
-        warm_claude_state_from_sample(path, &mut state)?;
-        let context = transcript_suffix(path, STARTUP_CONTEXT_TAIL_BYTES)?;
+        warm_claude_state_from_sample_at(path, initial_len, &mut state)?;
+        let context = transcript_suffix_at(path, STARTUP_CONTEXT_TAIL_BYTES, initial_len)?;
         import_claude_context_chunk(server, path, &context, &mut state, workspace, event_sink)
     };
-    let offset = fs::metadata(path)?.len();
-    Ok((state, stats, offset))
+    Ok((state, stats, initial_len))
 }
 
 fn import_claude_context_chunk(
@@ -6121,8 +6176,12 @@ fn import_claude_context_chunk(
     stats
 }
 
-fn warm_claude_state_from_sample(path: &Path, state: &mut ClaudeState) -> Result<(), CliError> {
-    let sample = transcript_sample(path, STARTUP_STATE_SAMPLE_BYTES)?;
+fn warm_claude_state_from_sample_at(
+    path: &Path,
+    end_offset: u64,
+    state: &mut ClaudeState,
+) -> Result<(), CliError> {
+    let sample = transcript_sample_at(path, STARTUP_STATE_SAMPLE_BYTES, end_offset)?;
     warm_claude_state(path, &sample, state);
     Ok(())
 }
@@ -6369,12 +6428,19 @@ fn is_agent_feed_internal_transcript_path(path: &Path) -> Result<bool, CliError>
 }
 
 fn transcript_sample(path: &Path, max_bytes: usize) -> Result<String, CliError> {
+    let len = fs::metadata(path)?.len();
+    transcript_sample_at(path, max_bytes, len)
+}
+
+fn transcript_sample_at(
+    path: &Path,
+    max_bytes: usize,
+    end_offset: u64,
+) -> Result<String, CliError> {
     let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
+    let len = file.metadata()?.len().min(end_offset);
     if len <= max_bytes as u64 {
-        let mut input = String::new();
-        file.read_to_string(&mut input)?;
-        return Ok(input);
+        return transcript_prefix(path, len);
     }
 
     let mut prefix = vec![0u8; max_bytes / 2];
@@ -6391,9 +6457,19 @@ fn transcript_sample(path: &Path, max_bytes: usize) -> Result<String, CliError> 
     Ok(sample)
 }
 
+#[cfg(test)]
 fn transcript_suffix(path: &Path, max_bytes: usize) -> Result<String, CliError> {
+    let len = fs::metadata(path)?.len();
+    transcript_suffix_at(path, max_bytes, len)
+}
+
+fn transcript_suffix_at(
+    path: &Path,
+    max_bytes: usize,
+    end_offset: u64,
+) -> Result<String, CliError> {
     let mut file = File::open(path)?;
-    let len = file.metadata()?.len();
+    let len = file.metadata()?.len().min(end_offset);
     if len == 0 || max_bytes == 0 {
         return Ok(String::new());
     }
@@ -6401,7 +6477,7 @@ fn transcript_suffix(path: &Path, max_bytes: usize) -> Result<String, CliError> 
     let start = len.saturating_sub(max_bytes as u64);
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.take(len - start).read_to_end(&mut bytes)?;
     let mut sample = String::from_utf8_lossy(&bytes).to_string();
 
     if start > 0 {
@@ -6419,6 +6495,14 @@ fn transcript_suffix(path: &Path, max_bytes: usize) -> Result<String, CliError> 
     }
 
     Ok(sample)
+}
+
+fn transcript_prefix(path: &Path, end_offset: u64) -> Result<String, CliError> {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len().min(end_offset);
+    let mut bytes = Vec::new();
+    file.take(len).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
 fn is_agent_feed_internal_transcript(input: &str) -> bool {
