@@ -2537,6 +2537,12 @@ mod tests {
         fs::write(path, format!("{lines}\n")).expect("jsonl writes");
     }
 
+    fn internal_story_summary_prompt() -> String {
+        format!(
+            "You are the private local headline memory for one agent feed. Maintain continuity across calls, but publish only when the new redacted delta changes the public story.\nsummary_memory_key=feed:test:workspace:all-workspaces\nprior_memory_digest=none\nprior_semantic_fingerprint=none\n\n{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries.\nfeed=github:1:workstation\nmode=FeedRollup\nrecent_published=none\nstories:\n- agent=codex family=Turn score=76 headline=codex checked ci status deck=16 safe command events settled around ci status."
+        )
+    }
+
     #[test]
     fn p2p_publish_accepts_feed_name_alias() {
         let cli = Cli::try_parse_from([
@@ -3896,7 +3902,7 @@ mod tests {
                     "timestamp": "2026-04-24T03:16:50.000Z",
                     "payload": {
                         "type": "user_message",
-                        "message": INTERNAL_SUMMARIZER_MARKER
+                        "message": internal_story_summary_prompt()
                     }
                 }),
             ],
@@ -3926,6 +3932,58 @@ mod tests {
     }
 
     #[test]
+    fn active_codex_sessions_keep_root_workspace_session_that_mentions_internal_marker() {
+        let root = temp_test_root("active-codex-root-real");
+        let workspace = root.join("repos");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let real = sessions.join("root-workspace-session.jsonl");
+        write_jsonl(
+            &real,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "root-workspace-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:16:50.000Z",
+                    "payload": {
+                        "type": "user_message",
+                        "message": internal_story_summary_prompt()
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-04-24T03:17:00.000Z",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"cargo test\",\"workdir\":\"/tmp/repos/burn_dragon\"}",
+                        "call_id": "call_real"
+                    }
+                }),
+            ],
+        );
+
+        let paths =
+            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 4, None)
+                .expect("active sessions resolve");
+
+        assert_eq!(paths, vec![real.clone()]);
+        assert!(
+            !is_agent_feed_internal_transcript(
+                &fs::read_to_string(&real).expect("real session reads")
+            ),
+            "real root workspace sessions should not be hidden by marker mentions"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
     fn active_claude_sessions_skip_agent_feed_internal_summarizer_sessions() {
         let root = temp_test_root("active-claude-internal");
         let projects = root.join("projects");
@@ -3937,7 +3995,7 @@ mod tests {
             [json!({
                 "type": "user",
                 "message": {
-                    "content": INTERNAL_SUMMARIZER_MARKER
+                    "content": internal_story_summary_prompt()
                 }
             })],
         );
@@ -5797,8 +5855,6 @@ fn active_claude_session_paths(
 
 const AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES: usize = 256 * 1024;
 
-const AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS: &[&str] = &[INTERNAL_SUMMARIZER_MARKER];
-
 fn is_agent_feed_internal_transcript_path(path: &Path) -> Result<bool, CliError> {
     let sample = transcript_sample(path, AGENT_FEED_INTERNAL_TRANSCRIPT_SAMPLE_BYTES)?;
     Ok(is_agent_feed_internal_transcript(&sample))
@@ -5858,25 +5914,28 @@ fn transcript_suffix(path: &Path, max_bytes: usize) -> Result<String, CliError> 
 }
 
 fn is_agent_feed_internal_transcript(input: &str) -> bool {
-    input.lines().any(|line| {
-        if !AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS
-            .iter()
-            .any(|marker| line.contains(marker))
-        {
-            return false;
+    let mut saw_internal_prompt = false;
+    let mut saw_external_activity = false;
+
+    for line in input.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        saw_external_activity |= transcript_value_has_external_activity(&value);
+        if line.contains(INTERNAL_SUMMARIZER_MARKER) {
+            saw_internal_prompt |= transcript_user_payload_contains_internal_prompt(&value);
         }
-        serde_json::from_str::<Value>(line)
-            .ok()
-            .is_some_and(|value| transcript_user_payload_contains_internal_marker(&value))
-    })
+    }
+
+    saw_internal_prompt && !saw_external_activity
 }
 
-fn transcript_user_payload_contains_internal_marker(value: &Value) -> bool {
+fn transcript_user_payload_contains_internal_prompt(value: &Value) -> bool {
     let top_type = value.get("type").and_then(Value::as_str);
     if top_type == Some("user")
         && value
             .get("message")
-            .is_some_and(value_contains_internal_marker)
+            .is_some_and(value_contains_internal_prompt)
     {
         return true;
     }
@@ -5886,22 +5945,87 @@ fn transcript_user_payload_contains_internal_marker(value: &Value) -> bool {
     if payload.get("type").and_then(Value::as_str) == Some("user_message")
         && payload
             .get("message")
-            .is_some_and(value_contains_internal_marker)
+            .is_some_and(value_contains_internal_prompt)
     {
         return true;
     }
     false
 }
 
-fn value_contains_internal_marker(value: &Value) -> bool {
+fn value_contains_internal_prompt(value: &Value) -> bool {
+    let mut text = String::new();
+    collect_value_text(value, &mut text);
+    text_is_internal_summarizer_prompt(&text)
+}
+
+fn collect_value_text(value: &Value, output: &mut String) {
     match value {
-        Value::String(value) => AGENT_FEED_INTERNAL_TRANSCRIPT_MARKERS
-            .iter()
-            .any(|marker| value.contains(marker)),
-        Value::Array(values) => values.iter().any(value_contains_internal_marker),
-        Value::Object(map) => map.values().any(value_contains_internal_marker),
-        _ => false,
+        Value::String(value) => {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(value);
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_value_text(value, output);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_value_text(value, output);
+            }
+        }
+        _ => {}
     }
+}
+
+fn text_is_internal_summarizer_prompt(text: &str) -> bool {
+    if !text.contains(INTERNAL_SUMMARIZER_MARKER) {
+        return false;
+    }
+
+    let story_prompt = text
+        .contains("Return one JSON object with headline, deck, lower_third, chips")
+        && text.contains("feed=")
+        && text.contains("mode=")
+        && text.contains("stories:");
+    let memory_prompt = text
+        .contains("You are the private local headline memory for one agent feed")
+        && text.contains("summary_memory_key=")
+        && text.contains("prior_memory_digest=")
+        && text.contains("prior_semantic_fingerprint=");
+    let external_story_prompt =
+        story_prompt && text.contains("Set publish=false") && text.contains("recent_published");
+    let image_prompt = text.contains("Either return")
+        && text.contains("\"image\": null")
+        && text.contains("headline=")
+        && text.contains("deck=")
+        && text.contains("chips=");
+
+    (memory_prompt && story_prompt) || external_story_prompt || image_prompt
+}
+
+fn transcript_value_has_external_activity(value: &Value) -> bool {
+    let top_type = value.get("type").and_then(Value::as_str);
+    let payload = value.get("payload").unwrap_or(value);
+    let payload_type = payload.get("type").and_then(Value::as_str).or(top_type);
+
+    matches!(
+        payload_type,
+        Some(
+            "function_call"
+                | "function_call_output"
+                | "exec_command_end"
+                | "tool_call"
+                | "tool_result"
+                | "command.exec"
+                | "command_exec"
+                | "file_change"
+                | "file.changed"
+        )
+    ) || payload.get("command").is_some()
+        || payload.get("call_id").is_some()
 }
 
 fn session_matches_workspace(
