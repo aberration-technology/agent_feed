@@ -1412,26 +1412,29 @@ fn request_for_external_processor(
                 None
             };
         }
-        story.headline = clean_and_clamp(
+        let project_tags =
+            project_tags_for_stories(std::slice::from_ref(story), &config.guardrails);
+        story.headline = clean_and_clamp_with_project_tags(
             &story.headline,
             config.budget.max_headline_chars,
             &config.guardrails,
+            &project_tags,
         )?
         .0;
-        story.deck = clean_and_clamp(
+        story.deck = clean_and_clamp_with_project_tags(
             &story.deck,
             config.budget.max_deck_chars,
             &config.guardrails,
+            &project_tags,
         )?
         .0;
-        story.lower_third = clean_and_clamp(
+        story.lower_third = clean_and_clamp_with_project_tags(
             &story.lower_third,
             config.budget.max_lower_third_chars,
             &config.guardrails,
+            &project_tags,
         )?
         .0;
-        let project_tags =
-            project_tags_for_stories(std::slice::from_ref(story), &config.guardrails);
         story.chips = story
             .chips
             .iter()
@@ -1686,45 +1689,58 @@ fn build_summary(
     let guardrails = &config.guardrails;
     let processor_publish = processor_output.publish;
     let processor_publish_reason = processor_output.publish_reason.clone();
-    let (mut headline, mut violations) = clean_and_clamp(
+    let project_tags = project_tags_for_stories(&request.stories, guardrails);
+    let (mut headline, mut violations) = clean_and_clamp_with_project_tags(
         &processor_output.headline,
         budget.max_headline_chars,
         guardrails,
+        &project_tags,
     )?;
+    headline = remove_project_placeholder_inline(&headline);
     if headline.is_empty() {
-        let (fallback, fallback_violations) = clean_and_clamp(
+        let (fallback, fallback_violations) = clean_and_clamp_with_project_tags(
             &fallback_headline(request),
             budget.max_headline_chars,
             guardrails,
+            &project_tags,
         )?;
-        headline = fallback;
+        headline = remove_project_placeholder_inline(&fallback);
         violations.extend(fallback_violations);
     }
     if headline.is_empty() {
         headline = "feed activity settled".to_string();
     }
 
-    let (mut deck, deck_violations) =
-        clean_and_clamp(&processor_output.deck, budget.max_deck_chars, guardrails)?;
+    let (mut deck, deck_violations) = clean_and_clamp_with_project_tags(
+        &processor_output.deck,
+        budget.max_deck_chars,
+        guardrails,
+        &project_tags,
+    )?;
+    deck = remove_project_placeholder_inline(&deck);
     violations.extend(deck_violations);
     if deck.is_empty() {
-        let (fallback, fallback_violations) =
-            clean_and_clamp(&fallback_deck(request), budget.max_deck_chars, guardrails)?;
-        deck = fallback;
+        let (fallback, fallback_violations) = clean_and_clamp_with_project_tags(
+            &fallback_deck(request),
+            budget.max_deck_chars,
+            guardrails,
+            &project_tags,
+        )?;
+        deck = remove_project_placeholder_inline(&fallback);
         violations.extend(fallback_violations);
     }
     if deck.is_empty() {
         deck = "settled story activity reached the feed.".to_string();
     }
 
-    let project_tags = project_tags_for_stories(&request.stories, guardrails);
-    let (mut lower_third, lower_violations) = clean_and_clamp(
+    let (mut lower_third, lower_violations) = clean_and_clamp_with_project_tags(
         processor_output
             .lower_third
             .as_deref()
             .unwrap_or("feed · redacted"),
         budget.max_lower_third_chars,
         guardrails,
+        &project_tags,
     )?;
     violations.extend(lower_violations);
     if lower_third.is_empty() {
@@ -1843,9 +1859,25 @@ fn clean_and_clamp(
     max_chars: usize,
     guardrails: &SummaryGuardrails,
 ) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
+    clean_and_clamp_with_project_tags(value, max_chars, guardrails, &[])
+}
+
+fn clean_and_clamp_with_project_tags(
+    value: &str,
+    max_chars: usize,
+    guardrails: &SummaryGuardrails,
+    project_tags: &[String],
+) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
     let mut input = value.to_string();
     if !guardrails.allow_project_names {
-        input = mask_project_like_terms(&input);
+        input = mask_project_like_terms_except(
+            &input,
+            if guardrails.allow_project_tags {
+                project_tags
+            } else {
+                &[]
+            },
+        );
     }
     if !guardrails.allow_command_text {
         input = mask_command_like_terms(&input);
@@ -1933,6 +1965,19 @@ fn remove_project_placeholder_segments(value: &str) -> String {
     } else {
         cleaned
     }
+}
+
+fn remove_project_placeholder_inline(value: &str) -> String {
+    Regex::new(r"(?i)(?:^|\s+)\[project\](?:\s+|$)")
+        .expect("project placeholder regex is valid")
+        .replace_all(value, " ")
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(['.', ',', ';', ':', '-'])
+        .trim()
+        .to_string()
 }
 
 fn public_project_tag(project: &str) -> Option<String> {
@@ -2933,11 +2978,13 @@ fn strict_lower_third(
     }
 }
 
-fn mask_project_like_terms(input: &str) -> String {
+fn mask_project_like_terms_except(input: &str, allowed_project_tags: &[String]) -> String {
     input
         .split_whitespace()
         .map(|word| {
-            if word.contains('_') || word.contains('/') || word.ends_with(".rs") {
+            if is_allowed_project_tag_word(word, allowed_project_tags) {
+                word
+            } else if word.contains('_') || word.contains('/') || word.ends_with(".rs") {
                 "[project]"
             } else {
                 word
@@ -2945,6 +2992,18 @@ fn mask_project_like_terms(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn is_allowed_project_tag_word(word: &str, allowed_project_tags: &[String]) -> bool {
+    if allowed_project_tags.is_empty() {
+        return false;
+    }
+    let token = word
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '.'))
+        .trim_matches('`');
+    allowed_project_tags
+        .iter()
+        .any(|project| project.eq_ignore_ascii_case(token))
 }
 
 fn mask_command_like_terms(input: &str) -> String {
@@ -3090,6 +3149,27 @@ mod tests {
             "browser route keeps feed identity stable"
         );
         assert!(summaries[0].deck.contains("public headline"));
+    }
+
+    #[test]
+    fn active_project_ci_outcome_survives_summary_gate() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut story = public_project_story("burn_p2p", 76);
+        story.family = StoryFamily::Turn;
+        story.key.family = StoryFamily::Turn;
+        story.headline = "burn_p2p release readiness turns green".to_string();
+        story.deck = "only the remaining release lanes continue while the paired burn_dragon ci rerun stays active.".to_string();
+
+        let summaries = summarize_feed("github:35904762:workstation", &[story], &config)
+            .expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].headline,
+            "burn_p2p release readiness turns green"
+        );
+        assert!(summaries[0].chips.iter().any(|chip| chip == "burn_p2p"));
     }
 
     #[test]
@@ -3593,6 +3673,23 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(!summaries[0].chips.iter().any(|chip| chip == "[project]"));
         assert!(!summaries[0].headline.contains("burn_dragon"));
         assert!(!summaries[0].deck.contains("burn_dragon"));
+    }
+
+    #[test]
+    fn project_placeholder_is_removed_from_public_copy() {
+        let config = SummaryConfig::p2p_default();
+        let mut story = public_project_story("burn_dragon", 88);
+        story.headline = "[project] publish verification advances".to_string();
+        story.deck = "[project] native smoke is blocked by runner disk exhaustion.".to_string();
+        let summaries =
+            summarize_feed("github:35904762:workstation", &[story], &config).expect("summary");
+
+        let display = format!(
+            "{} {} {}",
+            summaries[0].headline, summaries[0].deck, summaries[0].lower_third
+        );
+        assert!(!display.contains("[project]"));
+        assert!(summaries[0].lower_third.starts_with("burn_dragon ·"));
     }
 
     struct EndpointLikeProcessor;

@@ -121,7 +121,7 @@ enum Commands {
         no_p2p: bool,
         #[arg(
             long,
-            help = "publish future settled stories while serving; implies --p2p and requires github auth"
+            help = "publish future summarized stories while serving; implies --p2p and requires github auth"
         )]
         publish: bool,
         #[arg(
@@ -667,7 +667,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             summarizer,
             summary_style,
             summary_prompt_max_chars,
-            per_story,
+            per_story: _,
             allow_project_names,
             summary_memory_store,
             summary_memory_reset,
@@ -716,7 +716,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     summarizer: &summarizer,
                     summary_style: &summary_style,
                     summary_prompt_max_chars,
-                    per_story,
+                    per_story: true,
                     allow_project_names,
                     summary_memory_store: summary_memory_store.as_deref(),
                     summary_endpoint: summary_endpoint.as_deref(),
@@ -829,11 +829,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     if p2p_enabled {
                         if publish {
                             println!(
-                                "p2p publish enabled: future settled stories publish as feed `{feed}` via edge snapshot fallback"
+                                "p2p publish enabled: future summarized stories publish as feed `{feed}` via edge snapshot fallback"
                             );
                         } else {
                             println!(
-                                "p2p discovery ux enabled; add --publish --feed <name> to publish future settled stories from this serve process"
+                                "p2p discovery ux enabled; add --publish --feed <name> to publish future summarized stories from this serve process"
                             );
                         }
                     }
@@ -2195,7 +2195,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
         "serve p2p publisher started"
     );
     println!(
-        "p2p publish: signed in as @{}; publishing future settled stories to `{}` via edge snapshot fallback",
+        "p2p publish: signed in as @{}; publishing future summarized stories to `{}` via edge snapshot fallback",
         config.session.login, config.feed
     );
     post_serve_publish_status(
@@ -2237,7 +2237,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
                 if !stories.is_empty() {
                     info!(
                         stories = stories.len(),
-                        "p2p publisher queued settled stories"
+                        "p2p publisher queued story updates"
                     );
                     for story in &stories {
                         log_compiled_story("queued", story);
@@ -2248,7 +2248,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
                         PublishStatusPost {
                             state: "queued",
                             pending_stories: pending.len(),
-                            detail: Some("settled stories queued for publish"),
+                            detail: Some("story updates queued for publish"),
                             ..PublishStatusPost::default()
                         },
                     );
@@ -2304,7 +2304,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
             if !flushed.is_empty() {
                 info!(
                     stories = flushed.len(),
-                    "p2p publisher flushed settled story windows"
+                    "p2p publisher flushed story windows"
                 );
                 for story in &flushed {
                     log_compiled_story("flushed", story);
@@ -2315,7 +2315,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
                     PublishStatusPost {
                         state: "queued",
                         pending_stories: pending.len(),
-                        detail: Some("story compiler flushed settled windows"),
+                        detail: Some("story compiler flushed publishable windows"),
                         ..PublishStatusPost::default()
                     },
                 );
@@ -2355,7 +2355,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
                 last_publish = Instant::now();
                 if result.capsules > 0 {
                     println!(
-                        "p2p publish: sent {} capsule(s) from {} settled story/stories",
+                        "p2p publish: sent {} capsule(s) from {} story update(s)",
                         result.capsules,
                         stories.len()
                     );
@@ -2372,7 +2372,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
                     );
                 } else {
                     println!(
-                        "p2p publish: skipped {} settled story/stories; no meaningful headline change",
+                        "p2p publish: skipped {} story update(s); no meaningful headline change",
                         stories.len()
                     );
                     post_serve_publish_status(
@@ -3939,6 +3939,64 @@ mod tests {
         );
         assert!(recap.tags.iter().any(|tag| tag == "active-attach"));
         assert!(!recap.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_startup_recap_prefers_meaningful_agent_update_over_later_command() {
+        let root = temp_test_root("codex-startup-recap-prefers-agent-update");
+        let workspace = root.join("repos");
+        let burn_dragon = workspace.join("burn_dragon");
+        fs::create_dir_all(&burn_dragon).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "root-active-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "The workflow patch is deliberately narrow: clean target artifacts immediately before native-smoke and again before wasm-smoke. YAML parses cleanly, so burn_dragon CI can retry without changing runtime code."
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_1",
+                        "arguments": {
+                            "cmd": "gh run watch 123 --repo aberration-technology/burn_dragon",
+                            "workdir": burn_dragon
+                        }
+                    }
+                }),
+            ],
+        );
+        let input = fs::read_to_string(&transcript).expect("transcript reads");
+
+        let recap =
+            codex_startup_recap_event(&transcript, &input, TranscriptState::default(), None, None)
+                .expect("active root workspace recap emits");
+
+        assert_eq!(recap.project.as_deref(), Some("burn_dragon"));
+        let summary = recap.summary.as_deref().expect("summary exists");
+        assert!(summary.contains("workflow patch is deliberately narrow"));
+        assert!(summary.contains("burn_dragon CI can retry"));
+        assert_ne!(summary, "deployment workflow monitoring is active.");
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
@@ -5881,7 +5939,7 @@ fn codex_startup_recap_event(
         return None;
     }
 
-    let mut candidate = None::<(AgentEvent, String)>;
+    let mut candidate = None::<(AgentEvent, String, u8, time::OffsetDateTime)>;
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -5901,10 +5959,19 @@ fn codex_startup_recap_event(
         let Some(summary) = attach_recap_summary(&event) else {
             continue;
         };
-        candidate = Some((event, summary));
+        let rank = attach_recap_rank(&event, &summary);
+        let occurred_at = event.occurred_at.unwrap_or(event.received_at);
+        let should_replace = candidate
+            .as_ref()
+            .is_none_or(|(_, _, existing_rank, existing_at)| {
+                rank > *existing_rank || (rank == *existing_rank && occurred_at > *existing_at)
+            });
+        if should_replace {
+            candidate = Some((event, summary, rank, occurred_at));
+        }
     }
 
-    let (event, summary) = candidate?;
+    let (event, summary, _, _) = candidate?;
     let mut recap = AgentEvent::new(
         SourceKind::Codex,
         EventKind::AgentMessage,
@@ -5926,6 +5993,20 @@ fn codex_startup_recap_event(
     recap.score_hint = Some(74);
     recap.severity = Severity::Notice;
     Some(recap)
+}
+
+fn attach_recap_rank(event: &AgentEvent, summary: &str) -> u8 {
+    match event.kind {
+        EventKind::AgentMessage | EventKind::TurnComplete | EventKind::TurnFail
+            if attach_summary_has_context(summary) =>
+        {
+            100
+        }
+        EventKind::TestFail | EventKind::PermissionDenied | EventKind::McpFail => 90,
+        EventKind::ToolComplete | EventKind::ToolFail if attach_summary_has_context(summary) => 80,
+        EventKind::CommandExec | EventKind::ToolStart | EventKind::ToolComplete => 40,
+        _ => 10,
+    }
 }
 
 fn event_is_recent_for_attach(event: &AgentEvent) -> bool {

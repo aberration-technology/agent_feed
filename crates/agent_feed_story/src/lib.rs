@@ -298,6 +298,7 @@ pub struct StoryCompiler {
     config: StoryCompilerConfig,
     windows: BTreeMap<StoryKey, StoryWindow>,
     recent_fingerprints: VecDeque<String>,
+    active_update_fingerprints: BTreeMap<StoryKey, String>,
     diagnostics: StoryCompilerDiagnostics,
 }
 
@@ -314,6 +315,7 @@ impl StoryCompiler {
             config,
             windows: BTreeMap::new(),
             recent_fingerprints: VecDeque::new(),
+            active_update_fingerprints: BTreeMap::new(),
             diagnostics: StoryCompilerDiagnostics::default(),
         }
     }
@@ -413,6 +415,45 @@ impl StoryCompiler {
                 self.windows.insert(key, window);
                 continue;
             }
+            if is_open_turn_window(&window) {
+                if let Some(story) = self.compile_active_update(&window) {
+                    let fingerprint = semantic_story_fingerprint(&story.headline, &story.deck);
+                    let changed = self
+                        .active_update_fingerprints
+                        .get(&key)
+                        .is_none_or(|existing| existing != &fingerprint);
+                    if changed && self.accept_story(&story) {
+                        self.active_update_fingerprints
+                            .insert(key.clone(), fingerprint);
+                        self.diagnostics.published_stories += 1;
+                        self.record_story_decision(
+                            &story,
+                            StoryDecisionAction::Published,
+                            "active update emitted",
+                        );
+                        stories.push(story);
+                    } else {
+                        self.diagnostics.deduped_stories += 1;
+                        self.record_story_decision(
+                            &story,
+                            StoryDecisionAction::Deduped,
+                            "active update did not meaningfully change",
+                        );
+                    }
+                    self.windows.insert(key, window);
+                    continue;
+                }
+                if should_retain_open_window(&window) {
+                    self.diagnostics.retained_windows += 1;
+                    self.record_window_decision(
+                        &window,
+                        StoryDecisionAction::Retained,
+                        "open turn is waiting for a meaningful outcome update",
+                    );
+                    self.windows.insert(key, window);
+                    continue;
+                }
+            }
             if let Some(rejection) = self.compile_rejection(&window) {
                 if rejection.score < self.config.min_score && should_retain_open_window(&window) {
                     self.diagnostics.retained_windows += 1;
@@ -433,6 +474,7 @@ impl StoryCompiler {
                 continue;
             };
             if self.accept_story(&story) {
+                self.active_update_fingerprints.remove(&key);
                 self.diagnostics.published_stories += 1;
                 self.record_story_decision(&story, StoryDecisionAction::Published, "story emitted");
                 stories.push(story);
@@ -489,8 +531,38 @@ impl StoryCompiler {
         if self.compile_rejection(&window).is_some() {
             return None;
         }
+        self.compile_window_with_scores(window, None, None)
+    }
+
+    fn compile_active_update(&self, window: &StoryWindow) -> Option<CompiledStory> {
+        let summary = window.signals.latest_summary.as_deref()?;
+        if !active_update_summary(summary) {
+            return None;
+        }
+        let score = story_score(window).max(72);
+        let context_score = context_score(window).max(76);
+        let story = self.compile_window_with_scores(
+            window.clone(),
+            Some(score.min(88)),
+            Some(context_score.min(100)),
+        )?;
+        if is_low_quality_story(window, &story.headline, &story.deck)
+            && !active_summary_has_release_outcome(summary)
+        {
+            return None;
+        }
+        Some(story)
+    }
+
+    fn compile_window_with_scores(
+        &self,
+        window: StoryWindow,
+        score_override: Option<u8>,
+        context_score_override: Option<u8>,
+    ) -> Option<CompiledStory> {
         let score = story_score(&window);
-        let context_score = context_score(&window);
+        let score = score_override.unwrap_or(score);
+        let context_score = context_score_override.unwrap_or_else(|| context_score(&window));
         let mut headline = headline(&window);
         let mut deck = deck(&window);
         if let Some((rewritten_headline, rewritten_deck)) =
@@ -705,6 +777,15 @@ fn should_retain_open_window(window: &StoryWindow) -> bool {
     window.key.family == StoryFamily::Turn
         && window.signals.highest_score >= 30
         && window.counters.events < 128
+}
+
+fn is_open_turn_window(window: &StoryWindow) -> bool {
+    window.key.family == StoryFamily::Turn
+        && window.state == StoryWindowState::Open
+        && window
+            .signals
+            .latest_kind
+            .is_none_or(|kind| !matches!(kind, EventKind::TurnComplete | EventKind::TurnFail))
 }
 
 fn story_key(event: &AgentEvent) -> StoryKey {
@@ -1056,6 +1137,16 @@ fn is_low_quality_story(window: &StoryWindow, headline: &str, deck: &str) -> boo
         headline.to_ascii_lowercase(),
         deck.to_ascii_lowercase()
     );
+    if window
+        .signals
+        .latest_summary
+        .as_deref()
+        .map(normalized_story_text)
+        .as_deref()
+        .is_some_and(summary_is_operator_chatter)
+    {
+        return true;
+    }
     if window.key.family == StoryFamily::FileChange
         && !window
             .signals
@@ -1189,7 +1280,117 @@ fn story_impact_rewrite(
         deck,
         window.signals.latest_summary.as_deref().unwrap_or_default()
     ));
-    let rewrite = if combined.contains("github username")
+    let project = window.key.project_hash.as_deref().unwrap_or_default();
+    let is_burn_p2p = combined.contains("burn p2p") || project.eq_ignore_ascii_case("burn_p2p");
+    let is_burn_dragon =
+        combined.contains("burn dragon") || project.eq_ignore_ascii_case("burn_dragon");
+    let rewrite = if is_burn_p2p
+        && combined.contains("release readiness")
+        && combined.contains("green")
+    {
+        Some((
+            "burn_p2p release readiness turns green",
+            "only the remaining release lanes continue while the paired burn_dragon ci rerun stays active",
+        ))
+    } else if is_burn_p2p
+        && (combined.contains("crate") || combined.contains("crates io"))
+        && combined.contains("missing")
+        && (combined.contains("burn dragon") || combined.contains("deploy"))
+    {
+        Some((
+            "burn_p2p release gap blocks burn_dragon deploy",
+            "the expected p2p crate version is not on crates.io yet, so the downstream deploy would fail at install time",
+        ))
+    } else if is_burn_p2p
+        && combined.contains("publish preflight")
+        && (combined.contains("dbus") || combined.contains("fmt"))
+    {
+        Some((
+            "burn_p2p publish preflight is blocked locally",
+            "cargo deny passed, but the fmt runner is still hitting the local rustup/dbus failure before publish can proceed",
+        ))
+    } else if is_burn_p2p
+        && combined.contains("integration")
+        && combined.contains("browser")
+        && (combined.contains("green") || combined.contains("success"))
+    {
+        Some((
+            "burn_p2p release checks narrow to final lanes",
+            "browser, integration, and codeql checks are green while the last release lanes finish",
+        ))
+    } else if is_burn_p2p
+        && combined.contains("published")
+        && (combined.contains("green") || combined.contains("success"))
+    {
+        Some((
+            "burn_p2p release publishes with checks green",
+            "the package is live and downstream validation is moving through the paired burn_dragon lanes",
+        ))
+    } else if is_burn_p2p && combined.contains("publish completed successfully") {
+        Some((
+            "burn_p2p release publish completes",
+            "the crate release cleared its publish path and downstream verification can continue",
+        ))
+    } else if is_burn_p2p && combined.contains("nightly") && combined.contains("completed green") {
+        Some((
+            "burn_p2p nightly validation finishes green",
+            "the scheduled release-health lane cleared before the final repository sanity checks",
+        ))
+    } else if is_burn_p2p
+        && (combined.contains("wasm compile") || combined.contains("wasm checks"))
+        && (combined.contains("passed") || combined.contains("green"))
+    {
+        Some((
+            "burn_p2p wasm browser checks pass",
+            "the replacement receipt retry fix now clears the direct browser and app wasm checks",
+        ))
+    } else if is_burn_p2p
+        && combined.contains("wasm browser clippy")
+        && (combined.contains("clean") || combined.contains("passes"))
+    {
+        Some((
+            "burn_p2p wasm browser lint is clean",
+            "the local browser feature set now clears clippy against the release candidate",
+        ))
+    } else if is_burn_p2p
+        && (combined.contains("fixed the check") || combined.contains("now passes"))
+    {
+        Some((
+            "burn_p2p integration tooling checks pass",
+            "the local xtask path now builds against the staged burn_p2p crates",
+        ))
+    } else if is_burn_dragon && combined.contains("head ci") && combined.contains("green") {
+        Some((
+            "burn_dragon ci turns green with wasm smoke",
+            "the current head clears the browser smoke lane before final repository checks",
+        ))
+    } else if is_burn_dragon
+        && combined.contains("version surfaces")
+        && combined.contains("line up")
+    {
+        Some((
+            "burn_dragon release versions align with burn_p2p",
+            "workspace and app manifests now point at the matching p2p release line",
+        ))
+    } else if is_burn_dragon
+        && combined.contains("wasm")
+        && (combined.contains("failed") || combined.contains("failure"))
+    {
+        Some((
+            "burn_dragon wasm browser lane needs a ci fix",
+            "the p2p browser check exposed a wasm clippy failure before release validation could finish",
+        ))
+    } else if is_burn_dragon && combined.contains("failing lint") {
+        Some((
+            "burn_dragon browser training lint is isolated",
+            "the remaining failure is narrowed to the browser training contribution builder",
+        ))
+    } else if is_burn_dragon && combined.contains("rerun") && combined.contains("progress") {
+        Some((
+            "burn_dragon ci rerun tracks the wasm browser lane",
+            "the deployment workflow retry is still active after the earlier browser training receipt failure",
+        ))
+    } else if combined.contains("github username")
         || combined.contains("username route")
         || (combined.contains("github") && combined.contains("discovery"))
     {
@@ -1613,6 +1814,105 @@ fn meaningful_summary(input: &str) -> bool {
     !summary_is_redundant(input) && summary_has_work_context(input)
 }
 
+fn active_update_summary(input: &str) -> bool {
+    if summary_is_redundant(input) {
+        return false;
+    }
+    let normalized = normalized_story_text(input);
+    if normalized.is_empty()
+        || normalized.starts_with("i am ")
+        || normalized.starts_with("i m ")
+        || normalized.starts_with("i ll ")
+        || normalized.starts_with("i will ")
+        || normalized.contains("waiting for the build")
+        || normalized.contains("polling at")
+        || summary_is_operator_chatter(&normalized)
+    {
+        return false;
+    }
+    (summary_has_work_context(input) || summary_mentions_public_project(&normalized))
+        && active_summary_has_release_outcome(input)
+}
+
+fn summary_is_operator_chatter(normalized: &str) -> bool {
+    [
+        "i am checking",
+        "i m checking",
+        "i'm checking",
+        "i’m checking",
+        "i am tightening",
+        "i m tightening",
+        "i'm tightening",
+        "i’m tightening",
+        "i am patching",
+        "i m patching",
+        "i'm patching",
+        "i’m patching",
+        "i found the",
+        "i m past",
+        "i'm past",
+        "i’m past",
+        "your feed",
+        "your workstation feed",
+        "your active codex",
+        "the live edge now has",
+        "the daemon is now actually",
+        "the fixed daemon is running",
+        "publish interval",
+        "listening on 127.0.0.1",
+        "127.0.0.1:7777",
+        "the fixed binary is installed",
+        "restart the local daemon",
+        "live daemon capture",
+        "user-facing story",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn active_summary_has_release_outcome(input: &str) -> bool {
+    let normalized = normalized_story_text(input);
+    [
+        "accepted",
+        "blocked",
+        "broken",
+        "complete",
+        "completed",
+        "degraded",
+        "failed",
+        "failure",
+        "fixed",
+        "green",
+        "landed",
+        "missing",
+        "passed",
+        "preflight",
+        "problem",
+        "publish",
+        "published",
+        "publishes",
+        "pushed",
+        "ready",
+        "readiness",
+        "regressed",
+        "reliably",
+        "released",
+        "remaining",
+        "rerun",
+        "running",
+        "shipped",
+        "success",
+        "support",
+        "supports",
+        "turned green",
+        "unblocked",
+        "uses",
+        "works",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn summary_has_work_context(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
     [
@@ -1625,6 +1925,8 @@ fn summary_has_work_context(input: &str) -> bool {
         "capture",
         "canary",
         "cli",
+        "ci",
+        "codeql",
         "coverage",
         "deployment",
         "discovery",
@@ -1648,6 +1950,7 @@ fn summary_has_work_context(input: &str) -> bool {
         "privacy",
         "publish",
         "release",
+        "readiness",
         "route",
         "security",
         "story",
@@ -1656,11 +1959,28 @@ fn summary_has_work_context(input: &str) -> bool {
         "summarization",
         "terraform",
         "training",
+        "wasm",
+        "webgpu",
         "workflow",
         "user",
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+        || summary_mentions_public_project(&lowered)
+}
+
+fn summary_mentions_public_project(normalized_or_lowered: &str) -> bool {
+    [
+        "agent_feed",
+        "agent reel",
+        "agent_reel",
+        "burn dragon",
+        "burn p2p",
+        "burn_dragon",
+        "burn_p2p",
+    ]
+    .iter()
+    .any(|needle| normalized_or_lowered.contains(needle))
 }
 
 fn clamp_words(input: &str, max_words: usize) -> String {
@@ -1722,6 +2042,30 @@ mod tests {
     }
 
     #[test]
+    fn operator_chatter_does_not_publish_as_story() {
+        let mut compiler = StoryCompiler::default();
+        let mut message = event(EventKind::AgentMessage, "codex posted an update");
+        message.summary = Some(
+            "The live edge now has five accepted headlines from your workstation feed. I’m tightening the final story gate."
+                .to_string(),
+        );
+
+        assert!(compiler.ingest(message).is_empty());
+        assert!(compiler.flush().is_empty());
+        let decision = compiler
+            .diagnostics()
+            .last_decision
+            .expect("decision recorded");
+        assert!(
+            matches!(
+                decision.action,
+                StoryDecisionAction::Waiting | StoryDecisionAction::Retained
+            ),
+            "operator chatter should remain unpublished"
+        );
+    }
+
+    #[test]
     fn same_turn_can_publish_meaningfully_changed_updates() {
         let mut compiler = StoryCompiler::default();
         let mut first = event(EventKind::AgentMessage, "codex posted an update");
@@ -1764,6 +2108,142 @@ mod tests {
                 .map(|decision| decision.action),
             Some(StoryDecisionAction::Deduped)
         );
+    }
+
+    #[test]
+    fn active_ci_outcome_publishes_before_turn_completion() {
+        let mut compiler = StoryCompiler::default();
+        let mut command = event(EventKind::CommandExec, "codex started a command");
+        command.project = Some("burn_p2p".to_string());
+        command.command = Some(
+            "sleep 240; gh run list --repo aberration-technology/burn_p2p --branch main"
+                .to_string(),
+        );
+        assert!(compiler.ingest(command).is_empty());
+
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_p2p".to_string());
+        update.summary = Some(
+            "`burn_p2p` Release Readiness is green too. Only `burn_p2p` PR Fast and the rerun `burn_dragon` CI remain active.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].project.as_deref(), Some("burn_p2p"));
+        assert_eq!(
+            stories[0].headline,
+            "burn_p2p release readiness turns green"
+        );
+        assert!(stories[0].deck.contains("remaining release lanes"));
+        assert!(stories[0].score >= 72);
+        assert!(stories[0].context_score >= 76);
+    }
+
+    #[test]
+    fn active_ci_update_is_not_repeated_on_next_flush() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_p2p".to_string());
+        update.summary = Some(
+            "`burn_p2p` Integration is green now; Browser and CodeQL are also green. Remaining there: PR Fast and Release Readiness.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        assert_eq!(compiler.flush().len(), 1);
+        assert!(compiler.flush().is_empty());
+        assert_eq!(
+            compiler
+                .diagnostics()
+                .last_decision
+                .as_ref()
+                .map(|decision| decision.action),
+            Some(StoryDecisionAction::Deduped)
+        );
+    }
+
+    #[test]
+    fn active_publish_status_rewrites_to_news_headline() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_p2p".to_string());
+        update.summary = Some(
+            "The `burn_p2p` side is already green and published as `0.21.0-pre.38`; `burn_dragon` lint passed with the new version. The remaining waits are release lanes.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(
+            stories[0].headline,
+            "burn_p2p release publishes with checks green"
+        );
+        assert!(!stories[0].deck.contains("I’m"));
+    }
+
+    #[test]
+    fn active_missing_crate_update_rewrites_to_news_headline() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_p2p".to_string());
+        update.summary = Some(
+            "Crates.io currently reports `burn_p2p_bootstrap` max version `0.21.0-pre.42`; `0.21.0-pre.43` is missing. Since burn_dragon’s production workflow references `0.21.0-pre.43`, I’m going to publish the burn_p2p release now rather than letting the deploy fail at crate install time.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(
+            stories[0].headline,
+            "burn_p2p release gap blocks burn_dragon deploy"
+        );
+        assert!(stories[0].deck.contains("crates.io"));
+        assert!(!stories[0].deck.contains("I’m"));
+    }
+
+    #[test]
+    fn active_publish_preflight_failure_rewrites_to_news_headline() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_p2p".to_string());
+        update.summary = Some(
+            "The publish preflight passed `cargo deny` with the `/tmp` Cargo home, then hit the same local rustup/DBus problem on `cargo fmt --check`. I’m going to run the preflight with toolchain binaries pinned in the environment so `fmt` and later `clippy` don’t route through rustup shims.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(
+            stories[0].headline,
+            "burn_p2p publish preflight is blocked locally"
+        );
+        assert!(stories[0].deck.contains("cargo deny passed"));
+        assert!(!stories[0].deck.contains("I’m"));
+    }
+
+    #[test]
+    fn active_burn_dragon_ci_status_rewrites_to_news_headline() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_dragon".to_string());
+        update.summary = Some(
+            "The current `burn_dragon` head CI is now green, including `wasm-smoke`. I’m doing the last repository and workflow status checks now.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(
+            stories[0].headline,
+            "burn_dragon ci turns green with wasm smoke"
+        );
+        assert!(stories[0].deck.contains("browser smoke lane"));
+        assert!(!stories[0].deck.contains("I’m"));
     }
 
     #[test]

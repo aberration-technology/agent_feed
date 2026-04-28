@@ -829,13 +829,26 @@ pub mod codex {
             .as_deref()
             .and_then(project_from_text)
             .or_else(|| draft.command.as_deref().and_then(project_from_text));
-        event.project = event
-            .cwd
-            .as_deref()
-            .and_then(project_from_cwd)
-            .or_else(|| state.active_project.clone())
-            .or_else(|| state.project.clone())
-            .or_else(|| context_project.clone());
+        let prefer_text_project = matches!(
+            draft.kind,
+            EventKind::AgentMessage
+                | EventKind::TurnComplete
+                | EventKind::TurnFail
+                | EventKind::SummaryCreated
+        );
+        let cwd_project = event.cwd.as_deref().and_then(project_from_cwd);
+        event.project = if prefer_text_project {
+            context_project
+                .clone()
+                .or_else(|| cwd_project.clone())
+                .or_else(|| state.active_project.clone())
+                .or_else(|| state.project.clone())
+        } else {
+            cwd_project
+                .or_else(|| state.active_project.clone())
+                .or_else(|| state.project.clone())
+                .or_else(|| context_project.clone())
+        };
         if event
             .project
             .as_deref()
@@ -1941,6 +1954,28 @@ mod tests {
             events[3].cwd.as_deref(),
             Some("/home/mosure/repos/burn_p2p")
         );
+    }
+
+    #[test]
+    fn codex_root_workspace_message_prefers_mentioned_project_over_last_tool_workdir() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":{"cmd":"gh run list --repo aberration-technology/burn_dragon","workdir":"/home/mosure/repos/burn_dragon"}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:04.000Z","payload":{"type":"exec_command_end","call_id":"call_1","turn_id":"turn_1","status":"completed","exit_code":0,"duration":"4s","command":["gh","run","list"],"cwd":"/home/mosure/repos/burn_dragon"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:07.000Z","payload":{"type":"agent_message","message":"`burn_p2p` Release Readiness is green too. Only `burn_p2p` PR Fast and the rerun `burn_dragon` CI remain active."}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+        let message = events
+            .iter()
+            .find(|event| event.kind == EventKind::AgentMessage)
+            .expect("agent message event");
+
+        assert_eq!(message.project.as_deref(), Some("burn_p2p"));
+        let summary = message.summary.as_deref().expect("summary present");
+        assert!(summary.starts_with("burn_p2p` Release Readiness is green"));
+        assert!(summary.contains("burn_dragon"));
     }
 
     #[test]
