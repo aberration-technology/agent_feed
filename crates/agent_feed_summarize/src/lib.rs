@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -681,6 +681,14 @@ impl CodexSessionMemoryProcessor {
             processor_prompt(request)
         )
     }
+
+    fn work_dir(&self) -> PathBuf {
+        self.store_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("codex-memory-work")
+    }
 }
 
 impl SummaryProcessor for CodexSessionMemoryProcessor {
@@ -710,7 +718,21 @@ impl SummaryProcessor for CodexSessionMemoryProcessor {
             args.push("--skip-git-repo-check".to_string());
             args.push("-".to_string());
         }
-        let stdout = run_process(&self.command, &args, &prompt)?;
+        let work_dir = self.work_dir();
+        fs::create_dir_all(&work_dir).map_err(|err| {
+            SummaryError::Processor(format!(
+                "codex memory work directory create failed for {}: {err}",
+                work_dir.display()
+            ))
+        })?;
+        let stdout = run_process_with_options(
+            &self.command,
+            &args,
+            &prompt,
+            ProcessOptions {
+                current_dir: Some(work_dir),
+            },
+        )?;
         let ParsedProcessorOutput {
             summary,
             codex_session_id,
@@ -769,12 +791,33 @@ impl ImageProcessor for ExternalImageProcessor {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProcessOptions {
+    current_dir: Option<PathBuf>,
+}
+
 fn run_process(command: &str, args: &[String], stdin_text: &str) -> Result<String, SummaryError> {
-    let mut child = Command::new(command)
+    run_process_with_options(command, args, stdin_text, ProcessOptions::default())
+}
+
+fn run_process_with_options(
+    command: &str,
+    args: &[String],
+    stdin_text: &str,
+    options: ProcessOptions,
+) -> Result<String, SummaryError> {
+    let mut command_builder = Command::new(command);
+    command_builder
         .args(args)
+        .env("AGENT_FEED_INTERNAL_PROCESSOR", "summary")
+        .env("AGENT_FEED_CAPTURE_DISABLED", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(current_dir) = options.current_dir {
+        command_builder.current_dir(current_dir);
+    }
+    let mut child = command_builder
         .spawn()
         .map_err(|err| SummaryError::Processor(format!("spawn {command} failed: {err}")))?;
     let mut stdin = child
@@ -3352,17 +3395,20 @@ mod tests {
         fs::create_dir_all(&root).expect("temp dir creates");
         let script = root.join("fake-codex");
         let args_log = root.join("args.log");
+        let env_log = root.join("env.log");
         let store = root.join("memory.json");
         fs::write(
             &script,
             format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
+printf 'capture_disabled=%s processor=%s pwd=%s\n' "$AGENT_FEED_CAPTURE_DISABLED" "$AGENT_FEED_INTERNAL_PROCESSOR" "$PWD" >> '{}'
 cat >/dev/null
 printf '%s\n' '{{"type":"session_meta","payload":{{"id":"summary-session-1"}}}}'
 printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_agent_message":"{{\"headline\":\"codex remembered feed context\",\"deck\":\"new publish only happens after meaning changes.\",\"chips\":[\"codex\",\"memory\"],\"memory_digest\":\"context retained\",\"semantic_fingerprint\":\"memory:retained\"}}"}}}}'
 "#,
-                args_log.display()
+                args_log.display(),
+                env_log.display()
             ),
         )
         .expect("script writes");
@@ -3406,6 +3452,10 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
                 .expect("store reads")
                 .contains("summary-session-1")
         );
+        let env = fs::read_to_string(env_log).expect("env log reads");
+        assert!(env.contains("capture_disabled=1"));
+        assert!(env.contains("processor=summary"));
+        assert!(env.contains("codex-memory-work"));
         let _ = fs::remove_dir_all(&root);
     }
 

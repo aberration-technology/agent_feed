@@ -40,7 +40,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -744,6 +744,8 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     workspace_filter_for_memory.as_ref(),
                     summary_memory_reset,
                 )?;
+                let processor_registry =
+                    ProcessorSessionRegistry::from_summary_config(&summary_config);
                 let session = ensure_publish_session(
                     auth_store,
                     &edge,
@@ -769,8 +771,9 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     summary_config,
                     publish_interval: Duration::from_secs(publish_interval_secs.max(1)),
                     edge_fallback,
+                    processor_registry: processor_registry.clone(),
                 });
-                Some(sender)
+                Some((sender, processor_registry))
             } else {
                 None
             };
@@ -808,7 +811,11 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     codex_history,
                     codex_sessions_dir,
                     claude_projects_dir,
-                    event_sink: publish_sink,
+                    event_sink: publish_sink.as_ref().map(|(sender, _)| sender.clone()),
+                    processor_registry: publish_sink
+                        .as_ref()
+                        .map(|(_, registry)| registry.clone())
+                        .unwrap_or_default(),
                 })
             };
             serve_with_ready(
@@ -972,6 +979,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     &sessions_dir,
                     sessions,
                     workspace_filter.as_ref(),
+                    None,
                 )?;
                 info!(
                     sessions_requested = sessions,
@@ -991,6 +999,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         poll_ms,
                         workspace_filter.as_ref(),
                         true,
+                        None,
                         None,
                     )?;
                 } else {
@@ -1025,6 +1034,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     &sessions_dir,
                     sessions,
                     workspace_filter.as_ref(),
+                    None,
                 )?;
                 info!(
                     sessions_requested = sessions,
@@ -1422,6 +1432,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                         &sessions_dir,
                         sessions,
                         workspace_filter.as_ref(),
+                        None,
                     )?;
                     if include_history {
                         stories.extend(compile_codex_stories(&paths, workspace_filter.as_ref())?);
@@ -1760,6 +1771,214 @@ impl WorkspaceFilterLogValue for Option<WorkspaceFilter> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProcessorSessionRegistry {
+    inner: Arc<Mutex<ProcessorSessionRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct ProcessorSessionRegistryState {
+    summary_memory_paths: Vec<PathBuf>,
+    session_ids: HashSet<String>,
+    skipped_session_ids: HashSet<String>,
+    processor_events_dropped: u64,
+    processor_sessions_skipped: u64,
+    ambiguous_internal_candidates: u64,
+    last_refresh: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessorSessionRegistrySnapshot {
+    known_sessions: usize,
+    processor_events_dropped: u64,
+    processor_sessions_skipped: u64,
+    ambiguous_internal_candidates: u64,
+}
+
+impl ProcessorSessionRegistry {
+    fn from_summary_config(config: &SummaryConfig) -> Self {
+        let registry = Self::default();
+        if let Some(path) = summary_memory_path(config) {
+            registry.add_summary_memory_path(path);
+            registry.refresh();
+        }
+        registry
+    }
+
+    fn add_summary_memory_path(&self, path: PathBuf) {
+        let Ok(mut state) = self.inner.lock() else {
+            warn!("processor session registry lock poisoned while adding summary memory path");
+            return;
+        };
+        if !state.summary_memory_paths.contains(&path) {
+            state.summary_memory_paths.push(path);
+        }
+    }
+
+    fn maybe_refresh(&self) {
+        let should_refresh = self.inner.lock().is_ok_and(|state| {
+            state
+                .last_refresh
+                .is_none_or(|last_refresh| last_refresh.elapsed() >= Duration::from_secs(5))
+        });
+        if should_refresh {
+            self.refresh();
+        }
+    }
+
+    fn refresh(&self) {
+        let paths = match self.inner.lock() {
+            Ok(state) => state.summary_memory_paths.clone(),
+            Err(_) => {
+                warn!("processor session registry lock poisoned before refresh");
+                return;
+            }
+        };
+        let mut discovered = HashSet::new();
+        for path in paths {
+            for session_id in summary_memory_codex_session_ids(&path) {
+                discovered.insert(session_id);
+            }
+        }
+        let Ok(mut state) = self.inner.lock() else {
+            warn!("processor session registry lock poisoned during refresh");
+            return;
+        };
+        for session_id in discovered {
+            state.session_ids.insert(session_id);
+        }
+        state.last_refresh = Some(Instant::now());
+    }
+
+    #[cfg(test)]
+    fn register_session(&self, session_id: impl Into<String>) {
+        let session_id = session_id.into();
+        if session_id.trim().is_empty() {
+            return;
+        }
+        let Ok(mut state) = self.inner.lock() else {
+            warn!("processor session registry lock poisoned while registering session");
+            return;
+        };
+        state.session_ids.insert(session_id);
+    }
+
+    fn is_known_session_id(&self, session_id: &str) -> bool {
+        if session_id.trim().is_empty() {
+            return false;
+        }
+        self.maybe_refresh();
+        self.inner
+            .lock()
+            .is_ok_and(|state| state.session_ids.contains(session_id))
+    }
+
+    fn drop_processor_event(&self, event: &AgentEvent) -> bool {
+        let Some(session_id) = event.session_id.as_deref() else {
+            return false;
+        };
+        if !self.is_known_session_id(session_id) {
+            return false;
+        }
+        let Ok(mut state) = self.inner.lock() else {
+            warn!("processor session registry lock poisoned while dropping event");
+            return true;
+        };
+        state.processor_events_dropped = state.processor_events_dropped.saturating_add(1);
+        debug!(
+            event_id = %event.id,
+            session_id,
+            source = %event.source,
+            kind = ?event.kind,
+            "processor session event dropped before feed ingest"
+        );
+        true
+    }
+
+    fn record_processor_session_skipped(&self, session_id: Option<&str>) {
+        let Ok(mut state) = self.inner.lock() else {
+            warn!("processor session registry lock poisoned while recording skipped session");
+            return;
+        };
+        if let Some(session_id) = session_id.filter(|session_id| !session_id.trim().is_empty()) {
+            let session_id = session_id.to_string();
+            state.session_ids.insert(session_id.clone());
+            if !state.skipped_session_ids.insert(session_id) {
+                return;
+            }
+            state.processor_sessions_skipped = state.processor_sessions_skipped.saturating_add(1);
+        } else {
+            state.processor_sessions_skipped = state.processor_sessions_skipped.saturating_add(1);
+            state.ambiguous_internal_candidates =
+                state.ambiguous_internal_candidates.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> ProcessorSessionRegistrySnapshot {
+        self.maybe_refresh();
+        self.inner.lock().map_or_else(
+            |_| {
+                warn!("processor session registry lock poisoned while snapshotting");
+                ProcessorSessionRegistrySnapshot::default()
+            },
+            |state| ProcessorSessionRegistrySnapshot {
+                known_sessions: state.session_ids.len(),
+                processor_events_dropped: state.processor_events_dropped,
+                processor_sessions_skipped: state.processor_sessions_skipped,
+                ambiguous_internal_candidates: state.ambiguous_internal_candidates,
+            },
+        )
+    }
+}
+
+fn summary_memory_path(config: &SummaryConfig) -> Option<PathBuf> {
+    match &config.processor {
+        SummaryProcessorConfig::CodexSessionMemory { store_path, .. } => {
+            Some(PathBuf::from(store_path))
+        }
+        _ => None,
+    }
+}
+
+fn summary_memory_codex_session_ids(path: &Path) -> Vec<String> {
+    let Ok(input) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&input) else {
+        warn!(
+            path = %path.display(),
+            "summary memory store could not be parsed while refreshing processor guard"
+        );
+        return Vec::new();
+    };
+    let mut session_ids = Vec::new();
+    collect_summary_memory_codex_session_ids(&value, &mut session_ids);
+    session_ids
+}
+
+fn collect_summary_memory_codex_session_ids(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == "codex_session_id"
+                    && let Some(session_id) = value.as_str()
+                    && !session_id.trim().is_empty()
+                {
+                    output.push(session_id.to_string());
+                    continue;
+                }
+                collect_summary_memory_codex_session_ids(value, output);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_summary_memory_codex_session_ids(value, output);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug)]
 struct ServeAgentCapture {
     agents: String,
@@ -1771,6 +1990,7 @@ struct ServeAgentCapture {
     codex_sessions_dir: Option<PathBuf>,
     claude_projects_dir: Option<PathBuf>,
     event_sink: Option<mpsc::Sender<AgentEvent>>,
+    processor_registry: ProcessorSessionRegistry,
 }
 
 struct ServePublishConfig {
@@ -1784,6 +2004,7 @@ struct ServePublishConfig {
     summary_config: SummaryConfig,
     publish_interval: Duration,
     edge_fallback: EdgeFallbackMode,
+    processor_registry: ProcessorSessionRegistry,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1838,6 +2059,7 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
         let sessions = capture.sessions;
         let poll_ms = capture.poll_ms;
         let event_sink = capture.event_sink.clone();
+        let processor_registry = capture.processor_registry.clone();
         spawn_agent_capture("codex", move || {
             info!(
                 sessions_requested = sessions,
@@ -1862,6 +2084,7 @@ fn start_serve_agent_capture(bind: SocketAddr, capture: ServeAgentCapture) {
                 workspace: workspace.as_ref(),
                 include_history,
                 event_sink: event_sink.as_ref(),
+                processor_registry,
             })
         });
     }
@@ -1964,6 +2187,9 @@ fn run_serve_publisher(config: ServePublishConfig) {
     loop {
         match config.receiver.recv_timeout(Duration::from_millis(500)) {
             Ok(event) => {
+                if config.processor_registry.drop_processor_event(&event) {
+                    continue;
+                }
                 debug!(
                     event_id = %event.id,
                     kind = ?event.kind,
@@ -2094,6 +2320,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
         );
         match publish_story_batch(&config, &stories, &mut recent, &mut next_seq) {
             Ok(result) => {
+                config.processor_registry.refresh();
                 last_publish = Instant::now();
                 if result.capsules > 0 {
                     println!(
@@ -2377,6 +2604,7 @@ fn parse_edge_publish_ack(response: &str) -> Result<EdgePublishAck, CliError> {
 }
 
 fn post_serve_publish_status(config: &ServePublishConfig, status: PublishStatusPost<'_>) {
+    let processor = config.processor_registry.snapshot();
     let body = match serde_json::to_string(&PublishStatusUpdate {
         feed: config.feed.clone(),
         state: status.state.to_string(),
@@ -2389,6 +2617,10 @@ fn post_serve_publish_status(config: &ServePublishConfig, status: PublishStatusP
         last_edge_accepted: status.edge_ack.map_or(0, |ack| ack.accepted),
         last_edge_feeds: status.edge_ack.map_or(0, |ack| ack.feeds),
         last_edge_headlines: status.edge_ack.map_or(0, |ack| ack.headlines),
+        processor_sessions: processor.known_sessions,
+        processor_events_dropped: processor.processor_events_dropped,
+        processor_sessions_skipped: processor.processor_sessions_skipped,
+        ambiguous_internal_candidates: processor.ambiguous_internal_candidates,
         detail: status.detail.map(str::to_string),
         last_error: status.last_error.map(str::to_string),
     }) {
@@ -3284,6 +3516,10 @@ mod tests {
                 last_edge_accepted: 1,
                 last_edge_feeds: 1,
                 last_edge_headlines: 2,
+                processor_sessions: 0,
+                processor_events_dropped: 0,
+                processor_sessions_skipped: 0,
+                ambiguous_internal_candidates: 0,
                 detail: Some("edge accepted story capsule batch".to_string()),
                 last_error: None,
                 updated_at: now,
@@ -3839,7 +4075,7 @@ mod tests {
         let filter = WorkspaceFilter::from_cli(Some(workspace))
             .expect("filter builds")
             .expect("filter enabled");
-        let paths = active_codex_session_paths(&history, &sessions, 1, Some(&filter))
+        let paths = active_codex_session_paths(&history, &sessions, 1, Some(&filter), None)
             .expect("active sessions resolve");
 
         assert_eq!(paths, vec![inside]);
@@ -3871,9 +4107,14 @@ mod tests {
             })],
         );
 
-        let paths =
-            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 2, None)
-                .expect("active sessions resolve from session files");
+        let paths = active_codex_session_paths(
+            &root.join("missing-history.jsonl"),
+            &sessions,
+            2,
+            None,
+            None,
+        )
+        .expect("active sessions resolve from session files");
 
         assert_eq!(paths.len(), 2);
         assert!(paths.contains(&first));
@@ -3916,9 +4157,14 @@ mod tests {
             })],
         );
 
-        let paths =
-            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 4, None)
-                .expect("active sessions resolve");
+        let paths = active_codex_session_paths(
+            &root.join("missing-history.jsonl"),
+            &sessions,
+            4,
+            None,
+            None,
+        )
+        .expect("active sessions resolve");
 
         assert_eq!(paths, vec![real]);
         assert!(
@@ -3968,9 +4214,14 @@ mod tests {
             ],
         );
 
-        let paths =
-            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 4, None)
-                .expect("active sessions resolve");
+        let paths = active_codex_session_paths(
+            &root.join("missing-history.jsonl"),
+            &sessions,
+            4,
+            None,
+            None,
+        )
+        .expect("active sessions resolve");
 
         assert_eq!(paths, vec![real.clone()]);
         assert!(
@@ -3981,6 +4232,82 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn processor_registry_skips_known_summary_session_without_prompt_scan() {
+        let root = temp_test_root("active-codex-registry");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let store = root.join("summary-memory.json");
+        fs::write(
+            &store,
+            json!({
+                "records": {
+                    "feed:test": {
+                        "codex_session_id": "processor-session-1",
+                        "memory_digest": "prior feed memory",
+                        "semantic_fingerprint": "prior"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("summary memory writes");
+        let processor = sessions.join("processor-session-1.jsonl");
+        let real = sessions.join("real-coding-session.jsonl");
+        write_jsonl(
+            &processor,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": "processor-session-1", "cwd": root}
+            })],
+        );
+        write_jsonl(
+            &real,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:51.696Z",
+                "payload": {"id": "real-coding-session", "cwd": root}
+            })],
+        );
+
+        let registry = ProcessorSessionRegistry::default();
+        registry.add_summary_memory_path(store);
+        registry.refresh();
+        let paths = active_codex_session_paths(
+            &root.join("missing-history.jsonl"),
+            &sessions,
+            4,
+            None,
+            Some(&registry),
+        )
+        .expect("active sessions resolve");
+        let snapshot = registry.snapshot();
+
+        assert_eq!(paths, vec![real]);
+        assert_eq!(snapshot.known_sessions, 1);
+        assert_eq!(snapshot.processor_sessions_skipped, 1);
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn processor_registry_drops_registered_events_before_publish() {
+        let registry = ProcessorSessionRegistry::default();
+        registry.register_session("processor-session-2");
+        let mut event = AgentEvent::new(
+            agent_feed_core::SourceKind::Codex,
+            agent_feed_core::EventKind::AgentMessage,
+            "internal summary output",
+        );
+        event.session_id = Some("processor-session-2".to_string());
+
+        assert!(registry.drop_processor_event(&event));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.known_sessions, 1);
+        assert_eq!(snapshot.processor_events_dropped, 1);
     }
 
     #[test]
@@ -4047,9 +4374,14 @@ mod tests {
             ],
         );
 
-        let paths =
-            active_codex_session_paths(&root.join("missing-history.jsonl"), &sessions, 1, None)
-                .expect("active sessions resolve");
+        let paths = active_codex_session_paths(
+            &root.join("missing-history.jsonl"),
+            &sessions,
+            1,
+            None,
+            None,
+        )
+        .expect("active sessions resolve");
 
         assert_eq!(paths, vec![real]);
 
@@ -4124,7 +4456,8 @@ fn import_codex_sessions(
             continue;
         }
         let mut state = TranscriptState::default();
-        let file_stats = import_codex_chunk(server, path, &input, &mut state, workspace, None);
+        let file_stats =
+            import_codex_chunk(server, path, &input, &mut state, workspace, None, None);
         total.add(file_stats);
         info!(
             path = %path.display(),
@@ -4796,6 +5129,7 @@ struct CodexActiveWatch<'a> {
     workspace: Option<&'a WorkspaceFilter>,
     include_history: bool,
     event_sink: Option<&'a mpsc::Sender<AgentEvent>>,
+    processor_registry: ProcessorSessionRegistry,
 }
 
 fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliError> {
@@ -4812,6 +5146,7 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                 config.sessions_dir,
                 config.sessions,
                 config.workspace,
+                Some(&config.processor_registry),
             )?;
             for path in paths {
                 if !seen.insert(path.clone()) {
@@ -4823,6 +5158,7 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                     config.workspace,
                     config.include_history,
                     config.event_sink,
+                    Some(&config.processor_registry),
                 )?;
                 info!(
                     path = %path.display(),
@@ -4853,6 +5189,7 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                     state,
                     pending: String::new(),
                     last_status_at: Instant::now(),
+                    internal_processor: false,
                 });
             }
 
@@ -4874,6 +5211,7 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
             config.poll_ms,
             config.workspace,
             config.event_sink,
+            Some(&config.processor_registry),
         )?;
         std::thread::sleep(Duration::from_millis(config.poll_ms.max(100)));
     }
@@ -4886,11 +5224,18 @@ fn watch_codex_sessions(
     workspace: Option<&WorkspaceFilter>,
     include_history: bool,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let (state, stats, offset) =
-            initialize_codex_watcher(server, path, workspace, include_history, event_sink)?;
+        let (state, stats, offset) = initialize_codex_watcher(
+            server,
+            path,
+            workspace,
+            include_history,
+            event_sink,
+            processor_registry,
+        )?;
         info!(
             path = %path.display(),
             initial_events = stats.imported,
@@ -4920,12 +5265,20 @@ fn watch_codex_sessions(
             state,
             pending: String::new(),
             last_status_at: Instant::now(),
+            internal_processor: false,
         });
     }
 
     loop {
         std::thread::sleep(Duration::from_millis(poll_ms.max(100)));
-        poll_codex_watchers(server, &mut watchers, poll_ms, workspace, event_sink)?;
+        poll_codex_watchers(
+            server,
+            &mut watchers,
+            poll_ms,
+            workspace,
+            event_sink,
+            processor_registry,
+        )?;
     }
 }
 
@@ -4935,6 +5288,7 @@ fn poll_codex_watchers(
     poll_ms: u64,
     workspace: Option<&WorkspaceFilter>,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> Result<(), CliError> {
     for watcher in watchers {
         let len = fs::metadata(&watcher.path)?.len();
@@ -4947,6 +5301,7 @@ fn poll_codex_watchers(
             );
             watcher.offset = 0;
             watcher.pending.clear();
+            watcher.internal_processor = false;
             post_capture_watch_status(CaptureWatchPost {
                 server,
                 agent: "codex",
@@ -4986,6 +5341,33 @@ fn poll_codex_watchers(
         watcher.offset = len;
         watcher.pending.push_str(&chunk);
         let complete = split_complete_jsonl(&mut watcher.pending);
+        if watcher.internal_processor || is_agent_feed_internal_transcript(&complete) {
+            watcher.internal_processor = true;
+            let session_id =
+                codex_session_id_from_input(&complete).or_else(|| watcher.state.session_id.clone());
+            if let Some(registry) = processor_registry {
+                registry.record_processor_session_skipped(session_id.as_deref());
+            }
+            debug!(
+                path = %watcher.path.display(),
+                session_id = session_id.as_deref().unwrap_or("<unknown>"),
+                "codex transcript appended chunk skipped processor-owned session"
+            );
+            post_capture_watch_status(CaptureWatchPost {
+                server,
+                agent: "codex",
+                adapter: "codex.transcript",
+                path: &watcher.path,
+                state: "processor-skipped",
+                stats: ImportStats::default(),
+                offset: watcher.offset,
+                file_len: len,
+                poll_ms,
+                workspace,
+            });
+            watcher.last_status_at = Instant::now();
+            continue;
+        }
         let stats = import_codex_chunk(
             server,
             &watcher.path,
@@ -4993,6 +5375,7 @@ fn poll_codex_watchers(
             &mut watcher.state,
             workspace,
             event_sink,
+            processor_registry,
         );
         if stats.imported > 0 || stats.filtered > 0 {
             info!(
@@ -5029,6 +5412,7 @@ fn import_codex_chunk(
     state: &mut TranscriptState,
     workspace: Option<&WorkspaceFilter>,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     if is_agent_feed_internal_transcript(input) {
@@ -5036,6 +5420,11 @@ fn import_codex_chunk(
             path = %path.display(),
             "codex transcript chunk skipped agent-feed internal processor session"
         );
+        if let Some(registry) = processor_registry {
+            let session_id =
+                codex_session_id_from_input(input).or_else(|| state.session_id.clone());
+            registry.record_processor_session_skipped(session_id.as_deref());
+        }
         return stats;
     }
     for (index, line) in input
@@ -5065,6 +5454,10 @@ fn import_codex_chunk(
         let Some(event) = normalize_transcript_value(value, state, Some(path)) else {
             continue;
         };
+        if processor_registry.is_some_and(|registry| registry.drop_processor_event(&event)) {
+            stats.filtered += 1;
+            continue;
+        }
         if !event_matches_workspace(&event, workspace, path, "codex") {
             stats.filtered += 1;
             continue;
@@ -5126,15 +5519,32 @@ fn initialize_codex_watcher(
     workspace: Option<&WorkspaceFilter>,
     include_history: bool,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> Result<(TranscriptState, ImportStats, u64), CliError> {
     let mut state = TranscriptState::default();
     let stats = if include_history {
         let input = fs::read_to_string(path)?;
-        import_codex_chunk(server, path, &input, &mut state, workspace, event_sink)
+        import_codex_chunk(
+            server,
+            path,
+            &input,
+            &mut state,
+            workspace,
+            event_sink,
+            processor_registry,
+        )
     } else {
         warm_codex_state_from_sample(path, &mut state)?;
         let context = transcript_suffix(path, STARTUP_CONTEXT_TAIL_BYTES)?;
-        import_codex_context_chunk(server, path, &context, &mut state, workspace, event_sink)
+        import_codex_context_chunk(
+            server,
+            path,
+            &context,
+            &mut state,
+            workspace,
+            event_sink,
+            processor_registry,
+        )
     };
     let offset = fs::metadata(path)?.len();
     Ok((state, stats, offset))
@@ -5147,12 +5557,21 @@ fn import_codex_context_chunk(
     state: &mut TranscriptState,
     workspace: Option<&WorkspaceFilter>,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> ImportStats {
-    import_codex_filtered_chunk(server, path, input, state, workspace, event_sink, |event| {
-        is_startup_context_event(event)
-    })
+    import_codex_filtered_chunk(
+        server,
+        path,
+        input,
+        state,
+        workspace,
+        event_sink,
+        processor_registry,
+        is_startup_context_event,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_codex_filtered_chunk(
     server: &str,
     path: &Path,
@@ -5160,6 +5579,7 @@ fn import_codex_filtered_chunk(
     state: &mut TranscriptState,
     workspace: Option<&WorkspaceFilter>,
     event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
     include_event: impl Fn(&AgentEvent) -> bool,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
@@ -5168,6 +5588,11 @@ fn import_codex_filtered_chunk(
             path = %path.display(),
             "codex transcript chunk skipped agent-feed internal processor session"
         );
+        if let Some(registry) = processor_registry {
+            let session_id =
+                codex_session_id_from_input(input).or_else(|| state.session_id.clone());
+            registry.record_processor_session_skipped(session_id.as_deref());
+        }
         return stats;
     }
     for (index, line) in input
@@ -5191,6 +5616,10 @@ fn import_codex_filtered_chunk(
         let Some(mut event) = normalize_transcript_value(value, state, Some(path)) else {
             continue;
         };
+        if processor_registry.is_some_and(|registry| registry.drop_processor_event(&event)) {
+            stats.filtered += 1;
+            continue;
+        }
         if !include_event(&event) {
             continue;
         }
@@ -5748,6 +6177,7 @@ struct CodexWatcher {
     state: TranscriptState,
     pending: String,
     last_status_at: Instant,
+    internal_processor: bool,
 }
 
 #[derive(Debug)]
@@ -5764,6 +6194,7 @@ fn active_codex_session_paths(
     sessions_dir: &Path,
     limit: usize,
     workspace: Option<&WorkspaceFilter>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> Result<Vec<PathBuf>, CliError> {
     if limit == 0 || !sessions_dir.exists() {
         return Ok(Vec::new());
@@ -5796,7 +6227,23 @@ fn active_codex_session_paths(
         if !seen.insert(path.clone()) {
             continue;
         };
+        if let Some(registry) = processor_registry
+            && let Some(session_id) = codex_session_id_from_path_or_sample(&path)?
+            && registry.is_known_session_id(&session_id)
+        {
+            registry.record_processor_session_skipped(Some(&session_id));
+            debug!(
+                path = %path.display(),
+                session_id,
+                "codex active session skipped by processor registry"
+            );
+            continue;
+        }
         if is_agent_feed_internal_transcript_path(&path)? {
+            if let Some(registry) = processor_registry {
+                let session_id = codex_session_id_from_path_or_sample(&path)?;
+                registry.record_processor_session_skipped(session_id.as_deref());
+            }
             debug!(
                 path = %path.display(),
                 "codex active session skipped agent-feed internal processor session"
@@ -5817,6 +6264,67 @@ fn active_codex_session_paths(
         }
     }
     Ok(paths)
+}
+
+fn codex_session_id_from_path_or_sample(path: &Path) -> Result<Option<String>, CliError> {
+    let sample = transcript_sample(path, STARTUP_STATE_SAMPLE_BYTES)?;
+    if let Some(session_id) = codex_session_id_from_input(&sample) {
+        return Ok(Some(session_id));
+    }
+    Ok(codex_session_id_from_path(path))
+}
+
+fn codex_session_id_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let session_id = stem.strip_prefix("rollout-").unwrap_or(stem);
+    let session_id = session_id
+        .char_indices()
+        .rev()
+        .find_map(|(index, _)| {
+            let candidate = &session_id[index..];
+            is_uuid_like_session_id(candidate).then_some(candidate)
+        })
+        .unwrap_or(session_id);
+    if session_id.trim().is_empty() {
+        None
+    } else {
+        Some(session_id.to_string())
+    }
+}
+
+fn is_uuid_like_session_id(value: &str) -> bool {
+    value.len() == 36
+        && value
+            .chars()
+            .enumerate()
+            .all(|(index, character)| match index {
+                8 | 13 | 18 | 23 => character == '-',
+                _ => character.is_ascii_hexdigit(),
+            })
+}
+
+fn codex_session_id_from_input(input: &str) -> Option<String> {
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(session_id) = codex_session_id_from_value(&value) {
+            return Some(session_id);
+        }
+    }
+    None
+}
+
+fn codex_session_id_from_value(value: &Value) -> Option<String> {
+    let payload = value.get("payload").unwrap_or(value);
+    value
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .or_else(|| payload.get("session_id").and_then(Value::as_str))
+        .or_else(|| payload.get("id").and_then(Value::as_str))
+        .filter(|session_id| !session_id.trim().is_empty())
+        .map(str::to_string)
 }
 
 fn active_claude_session_paths(
@@ -6425,6 +6933,21 @@ fn add_publish_doctor_check(
             publish.last_edge_accepted, publish.last_edge_feeds, publish.last_edge_headlines
         );
     }
+    if publish.processor_sessions > 0
+        || publish.processor_events_dropped > 0
+        || publish.processor_sessions_skipped > 0
+        || publish.ambiguous_internal_candidates > 0
+    {
+        let _ = write!(
+            detail,
+            " · processor guard {} session{} · {} dropped · {} skipped · {} ambiguous",
+            publish.processor_sessions,
+            plural(publish.processor_sessions),
+            publish.processor_events_dropped,
+            publish.processor_sessions_skipped,
+            publish.ambiguous_internal_candidates
+        );
+    }
     if let Some(error) = publish.last_error.as_deref() {
         let _ = write!(detail, " · {error}");
     } else if let Some(extra) = publish.detail.as_deref() {
@@ -6706,6 +7229,21 @@ fn format_local_status(status: &StatusView) -> String {
                 output,
                 "edge: {} accepted · {} feeds · {} headlines",
                 publish.last_edge_accepted, publish.last_edge_feeds, publish.last_edge_headlines
+            );
+        }
+        if publish.processor_sessions > 0
+            || publish.processor_events_dropped > 0
+            || publish.processor_sessions_skipped > 0
+            || publish.ambiguous_internal_candidates > 0
+        {
+            let _ = writeln!(
+                output,
+                "processor guard: {} session{} · {} dropped · {} skipped · {} ambiguous",
+                publish.processor_sessions,
+                plural(publish.processor_sessions),
+                publish.processor_events_dropped,
+                publish.processor_sessions_skipped,
+                publish.ambiguous_internal_candidates
             );
         }
         if let Some(detail) = &publish.detail {

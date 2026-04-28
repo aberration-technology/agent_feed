@@ -586,6 +586,10 @@ async fn publish_status(
         last_edge_accepted: update.last_edge_accepted,
         last_edge_feeds: update.last_edge_feeds,
         last_edge_headlines: update.last_edge_headlines,
+        processor_sessions: update.processor_sessions,
+        processor_events_dropped: update.processor_events_dropped,
+        processor_sessions_skipped: update.processor_sessions_skipped,
+        ambiguous_internal_candidates: update.ambiguous_internal_candidates,
         detail: update
             .detail
             .as_deref()
@@ -607,6 +611,8 @@ async fn publish_status(
         pending_stories = view.pending_stories,
         last_batch_capsules = view.last_batch_capsules,
         last_edge_accepted = view.last_edge_accepted,
+        processor_sessions = view.processor_sessions,
+        processor_events_dropped = view.processor_events_dropped,
         "publish status updated"
     );
     Ok(Json(view))
@@ -1125,6 +1131,10 @@ mod tests {
                 last_edge_accepted: 1,
                 last_edge_feeds: 1,
                 last_edge_headlines: 2,
+                processor_sessions: 0,
+                processor_events_dropped: 0,
+                processor_sessions_skipped: 0,
+                ambiguous_internal_candidates: 0,
                 detail: Some("edge accepted story capsule batch".to_string()),
                 last_error: None,
             }),

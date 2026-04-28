@@ -75,6 +75,14 @@ pub struct PublishStatusUpdate {
     pub last_edge_accepted: usize,
     pub last_edge_feeds: usize,
     pub last_edge_headlines: usize,
+    #[serde(default)]
+    pub processor_sessions: usize,
+    #[serde(default)]
+    pub processor_events_dropped: u64,
+    #[serde(default)]
+    pub processor_sessions_skipped: u64,
+    #[serde(default)]
+    pub ambiguous_internal_candidates: u64,
     pub detail: Option<String>,
     pub last_error: Option<String>,
 }
@@ -92,6 +100,14 @@ pub struct PublishStatusView {
     pub last_edge_accepted: usize,
     pub last_edge_feeds: usize,
     pub last_edge_headlines: usize,
+    #[serde(default)]
+    pub processor_sessions: usize,
+    #[serde(default)]
+    pub processor_events_dropped: u64,
+    #[serde(default)]
+    pub processor_sessions_skipped: u64,
+    #[serde(default)]
+    pub ambiguous_internal_candidates: u64,
     pub detail: Option<String>,
     pub last_error: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
