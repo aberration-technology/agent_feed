@@ -19,7 +19,10 @@ use agent_feed_p2p_proto::{
 };
 use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve_with_ready};
-use agent_feed_story::{CompiledStory, StoryCompiler, compile_events};
+use agent_feed_story::{
+    CompiledStory, StoryCompiler, StoryCompilerDiagnostics, StoryDecision, StoryDecisionAction,
+    compile_events,
+};
 use agent_feed_summarize::{
     DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
     GuardrailPattern, INTERNAL_SUMMARIZER_MARKER, ImageDecisionMode, ImageProcessorConfig,
@@ -44,6 +47,9 @@ use tracing::{debug, error, info, warn};
 const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
 const CAPTURE_STATUS_HEARTBEAT: Duration = Duration::from_secs(15);
+const STARTUP_STATE_SAMPLE_BYTES: usize = 1024 * 1024;
+const STARTUP_CONTEXT_TAIL_BYTES: usize = 512 * 1024;
+const STARTUP_CONTEXT_TAG: &str = "startup-context";
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-feed", version)]
@@ -53,7 +59,7 @@ struct Cli {
         long,
         global = true,
         visible_alias = "log-filter",
-        default_value = "agent_feed=info,agent_feed_cli=info,tower_http=warn",
+        default_value = "agent_feed=info,agent_feed_cli=info,agent_feed_summarize=info,tower_http=warn",
         help = "tracing filter or level, for example debug or agent_feed=trace"
     )]
     log_level: String,
@@ -1643,7 +1649,7 @@ fn log_filter(filter: &str) -> tracing_subscriber::EnvFilter {
         })
         .unwrap_or_else(|_| {
             tracing_subscriber::EnvFilter::new(
-                "agent_feed=info,agent_feed_cli=info,tower_http=warn",
+                "agent_feed=info,agent_feed_cli=info,agent_feed_summarize=info,tower_http=warn",
             )
         })
 }
@@ -1962,14 +1968,23 @@ fn run_serve_publisher(config: ServePublishConfig) {
                     event_id = %event.id,
                     kind = ?event.kind,
                     agent = %event.agent,
+                    project = event.project.as_deref().unwrap_or("local"),
+                    session_id = event.session_id.as_deref().unwrap_or("<none>"),
+                    turn_id = event.turn_id.as_deref().unwrap_or("<none>"),
+                    score_hint = event.score_hint.unwrap_or_default(),
+                    startup_context = event.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG),
                     "p2p publisher received local event"
                 );
                 let stories = compiler.ingest(event);
+                log_story_compiler_decision("ingest", &compiler.diagnostics());
                 if !stories.is_empty() {
                     info!(
                         stories = stories.len(),
                         "p2p publisher queued settled stories"
                     );
+                    for story in &stories {
+                        log_compiled_story("queued", story);
+                    }
                     pending.extend(stories);
                     post_serve_publish_status(
                         &config,
@@ -2027,12 +2042,16 @@ fn run_serve_publisher(config: ServePublishConfig) {
 
         if last_flush.elapsed() >= config.publish_interval {
             let flushed = compiler.flush();
+            log_story_compiler_decision("flush", &compiler.diagnostics());
             last_flush = Instant::now();
             if !flushed.is_empty() {
                 info!(
                     stories = flushed.len(),
                     "p2p publisher flushed settled story windows"
                 );
+                for story in &flushed {
+                    log_compiled_story("flushed", story);
+                }
                 pending.extend(flushed);
                 post_serve_publish_status(
                     &config,
@@ -2051,6 +2070,15 @@ fn run_serve_publisher(config: ServePublishConfig) {
                 || pending.iter().any(|story| story.score >= 90)
                 || pending.len() >= 8);
         if !should_publish {
+            if !pending.is_empty() {
+                debug!(
+                    pending_stories = pending.len(),
+                    elapsed_ms = last_publish.elapsed().as_millis(),
+                    interval_ms = config.publish_interval.as_millis(),
+                    high_priority = pending.iter().any(|story| story.score >= 90),
+                    "p2p publish waiting for interval, priority, or batch size"
+                );
+            }
             continue;
         }
 
@@ -2155,8 +2183,44 @@ fn publish_story_batch(
 ) -> Result<PublishBatchResult, CliError> {
     let feed_id = publish_feed_id(config);
     let recent_summaries = recent.iter().cloned().collect::<Vec<_>>();
+    info!(
+        feed_name = %config.feed,
+        %feed_id,
+        stories = stories.len(),
+        recent_summaries = recent_summaries.len(),
+        summary_mode = ?config.summary_config.mode,
+        processor = summary_processor_label(&config.summary_config),
+        publish_policy_enabled = config.summary_config.publish.enabled,
+        recent_window = config.summary_config.publish.recent_window,
+        "p2p publish summarization started"
+    );
     let summaries =
         summarize_feed_with_recent(&feed_id, stories, &config.summary_config, &recent_summaries)?;
+    info!(
+        feed_name = %config.feed,
+        %feed_id,
+        stories = stories.len(),
+        summaries = summaries.len(),
+        "p2p publish summarization completed"
+    );
+    for summary in &summaries {
+        info!(
+            feed_name = %config.feed,
+            %feed_id,
+            action = summary.metadata.publish_action.as_str(),
+            reason = %summary.metadata.publish_reason,
+            processor = %summary.metadata.processor,
+            story_family = ?summary.story_family,
+            score = summary.score,
+            input_stories = summary.metadata.input_stories,
+            output_chars = summary.metadata.output_chars,
+            headline_similarity = summary.metadata.max_headline_similarity,
+            deck_similarity = summary.metadata.max_deck_similarity,
+            violations = summary.metadata.violations.len(),
+            headline_fingerprint = %summary.metadata.headline_fingerprint,
+            "p2p publish summary accepted for capsule"
+        );
+    }
     for summary in &summaries {
         recent.push_front(RecentSummary::from(summary));
     }
@@ -2176,6 +2240,7 @@ fn publish_story_batch(
     if capsules.is_empty() {
         info!(
             feed_name = %config.feed,
+            %feed_id,
             stories = stories.len(),
             summaries = summaries.len(),
             "p2p publish skipped empty capsule batch"
@@ -2208,6 +2273,103 @@ fn publish_story_batch(
         capsules: capsules.len(),
         edge_ack: Some(ack),
     })
+}
+
+fn log_story_compiler_decision(scope: &'static str, diagnostics: &StoryCompilerDiagnostics) {
+    let Some(decision) = diagnostics.last_decision.as_ref() else {
+        return;
+    };
+    match decision.action {
+        StoryDecisionAction::Published
+        | StoryDecisionAction::Rejected
+        | StoryDecisionAction::Deduped => log_story_decision_info(scope, decision, diagnostics),
+        StoryDecisionAction::Retained => {
+            debug!(
+                scope,
+                action = story_decision_action(decision.action),
+                reason = %decision.reason,
+                agent = %decision.agent,
+                family = ?decision.family,
+                score = decision.score,
+                context_score = decision.context_score,
+                open_windows = diagnostics.open_windows,
+                retained_windows = diagnostics.retained_windows,
+                "story compiler retained a window"
+            );
+        }
+        StoryDecisionAction::Waiting => {
+            debug!(
+                scope,
+                action = story_decision_action(decision.action),
+                reason = %decision.reason,
+                agent = %decision.agent,
+                family = ?decision.family,
+                score = decision.score,
+                context_score = decision.context_score,
+                open_windows = diagnostics.open_windows,
+                "story compiler waiting"
+            );
+        }
+    }
+}
+
+fn log_story_decision_info(
+    scope: &'static str,
+    decision: &StoryDecision,
+    diagnostics: &StoryCompilerDiagnostics,
+) {
+    info!(
+        scope,
+        action = story_decision_action(decision.action),
+        reason = %decision.reason,
+        agent = %decision.agent,
+        family = ?decision.family,
+        score = decision.score,
+        context_score = decision.context_score,
+        open_windows = diagnostics.open_windows,
+        settled_windows = diagnostics.settled_windows,
+        published_stories = diagnostics.published_stories,
+        rejected_stories = diagnostics.rejected_stories,
+        deduped_stories = diagnostics.deduped_stories,
+        "story compiler decision"
+    );
+}
+
+fn log_compiled_story(stage: &'static str, story: &CompiledStory) {
+    info!(
+        stage,
+        agent = %story.agent,
+        project = story.project.as_deref().unwrap_or("local"),
+        family = ?story.family,
+        score = story.score,
+        context_score = story.context_score,
+        severity = ?story.severity,
+        evidence_events = story.evidence_event_ids.len(),
+        headline_words = story.headline.split_whitespace().count(),
+        deck_words = story.deck.split_whitespace().count(),
+        "story queued for p2p summarization"
+    );
+}
+
+fn story_decision_action(action: StoryDecisionAction) -> &'static str {
+    match action {
+        StoryDecisionAction::Waiting => "waiting",
+        StoryDecisionAction::Retained => "retained",
+        StoryDecisionAction::Rejected => "rejected",
+        StoryDecisionAction::Deduped => "deduped",
+        StoryDecisionAction::Published => "published",
+    }
+}
+
+fn summary_processor_label(config: &SummaryConfig) -> &'static str {
+    match &config.processor {
+        SummaryProcessorConfig::Deterministic => "deterministic",
+        SummaryProcessorConfig::CodexExec => "codex-exec",
+        SummaryProcessorConfig::CodexSessionMemory { .. } => "codex-memory",
+        SummaryProcessorConfig::ClaudeCodeExec => "claude-code",
+        SummaryProcessorConfig::Process { .. } => "process",
+        SummaryProcessorConfig::HttpEndpoint { .. } => "http-endpoint",
+    }
 }
 
 fn parse_edge_publish_ack(response: &str) -> Result<EdgePublishAck, CliError> {
@@ -3058,10 +3220,14 @@ mod tests {
                     action: "rejected".to_string(),
                     reason: "summary was too generic or mechanical to publish".to_string(),
                     agent: "codex".to_string(),
+                    project: Some("agent_feed".to_string()),
+                    session_id: Some("session".to_string()),
+                    turn_id: Some("turn".to_string()),
                     family: "incident".to_string(),
                     score: 84,
                     context_score: 82,
                 }),
+                recent_decisions: Vec::new(),
             },
             publish: None,
             captured_sources: vec![agent_feed_views::CapturedSourceView {
@@ -3323,6 +3489,131 @@ mod tests {
         assert!(!summaries.is_empty());
         assert!(!summary_display.contains("shell command failed"));
         assert!(!summary_display.contains("cargo test --all"));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_startup_context_primes_future_completion_without_replaying_history() {
+        let root = temp_test_root("codex-startup-context");
+        let workspace = root.join("repo");
+        fs::create_dir_all(&workspace).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-04-24T03:16:49.696Z",
+                    "payload": {"id": "codex-startup-context", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "timestamp": "2026-04-24T03:16:49.697Z",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-04-24T03:16:55.000Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": "Browser feed discovery now follows signed story streams so public viewers can see live publisher work."
+                        }]
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:02.000Z",
+                    "payload": {
+                        "type": "patch_apply_end",
+                        "success": true,
+                        "changes": {"src/lib.rs": {}, "crates/feed/src/main.rs": {}}
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:04.000Z",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "status": "failed",
+                        "exit_code": 1,
+                        "duration": "120ms",
+                        "command": ["cargo", "test", "--all"]
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-04-24T03:17:05.000Z",
+                    "payload": {
+                        "type": "task_complete",
+                        "turn_id": "turn_1",
+                        "duration_ms": 15000
+                    }
+                }),
+            ],
+        );
+
+        let sample = transcript_suffix(&transcript, STARTUP_CONTEXT_TAIL_BYTES)
+            .expect("startup context tail reads");
+        let mut state = TranscriptState::default();
+        warm_codex_state_from_sample(&transcript, &mut state).expect("state warms from sample");
+        let mut compiler = StoryCompiler::default();
+        let mut context_events = Vec::new();
+        for line in sample
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let value = serde_json::from_str::<Value>(line).expect("json line parses");
+            let Some(event) = normalize_transcript_value(value, &mut state, Some(&transcript))
+            else {
+                continue;
+            };
+            if is_startup_context_event(&event) {
+                let mut event = event;
+                mark_startup_context_event(&mut event);
+                context_events.push(event.clone());
+                assert!(compiler.ingest(event).is_empty());
+            }
+        }
+
+        assert!(
+            context_events
+                .iter()
+                .any(|event| event.kind == agent_feed_core::EventKind::AgentMessage)
+        );
+        assert!(!context_events.iter().any(|event| matches!(
+            event.kind,
+            agent_feed_core::EventKind::TurnComplete
+                | agent_feed_core::EventKind::FileChanged
+                | agent_feed_core::EventKind::TestFail
+        )));
+        assert!(compiler.flush().is_empty());
+
+        let future = json!({
+            "type": "event_msg",
+            "timestamp": "2026-04-24T03:18:05.000Z",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn_1",
+                "duration_ms": 30000
+            }
+        });
+        let event = normalize_transcript_value(future, &mut state, Some(&transcript))
+            .expect("future completion normalizes");
+        let stories = compiler.ingest(event);
+
+        let turn = stories
+            .iter()
+            .find(|story| story.family == StoryFamily::Turn)
+            .expect("future completion publishes with startup context");
+        assert!(turn.headline.contains("browser feed discovery"));
+        assert!(!turn.headline.contains("turn completed"));
+        assert!(!turn.deck.contains("2 changed files"));
+        assert!(!turn.deck.contains("tests are red"));
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
@@ -4468,22 +4759,13 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                 if !seen.insert(path.clone()) {
                     continue;
                 }
-                let input = fs::read_to_string(&path)?;
-                let mut state = TranscriptState::default();
-                let stats = if config.include_history {
-                    import_codex_chunk(
-                        config.server,
-                        &path,
-                        &input,
-                        &mut state,
-                        config.workspace,
-                        config.event_sink,
-                    )
-                } else {
-                    warm_codex_state(&path, &input, &mut state);
-                    ImportStats::default()
-                };
-                let offset = fs::metadata(&path)?.len();
+                let (state, stats, offset) = initialize_codex_watcher(
+                    config.server,
+                    &path,
+                    config.workspace,
+                    config.include_history,
+                    config.event_sink,
+                )?;
                 info!(
                     path = %path.display(),
                     initial_events = stats.imported,
@@ -4549,15 +4831,8 @@ fn watch_codex_sessions(
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let input = fs::read_to_string(path)?;
-        let mut state = TranscriptState::default();
-        let stats = if include_history {
-            import_codex_chunk(server, path, &input, &mut state, workspace, event_sink)
-        } else {
-            warm_codex_state(path, &input, &mut state);
-            ImportStats::default()
-        };
-        let offset = fs::metadata(path)?.len();
+        let (state, stats, offset) =
+            initialize_codex_watcher(server, path, workspace, include_history, event_sink)?;
         info!(
             path = %path.display(),
             initial_events = stats.imported,
@@ -4787,11 +5062,138 @@ fn import_codex_chunk(
     stats
 }
 
+fn initialize_codex_watcher(
+    server: &str,
+    path: &Path,
+    workspace: Option<&WorkspaceFilter>,
+    include_history: bool,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<(TranscriptState, ImportStats, u64), CliError> {
+    let mut state = TranscriptState::default();
+    let stats = if include_history {
+        let input = fs::read_to_string(path)?;
+        import_codex_chunk(server, path, &input, &mut state, workspace, event_sink)
+    } else {
+        warm_codex_state_from_sample(path, &mut state)?;
+        let context = transcript_suffix(path, STARTUP_CONTEXT_TAIL_BYTES)?;
+        import_codex_context_chunk(server, path, &context, &mut state, workspace, event_sink)
+    };
+    let offset = fs::metadata(path)?.len();
+    Ok((state, stats, offset))
+}
+
+fn import_codex_context_chunk(
+    server: &str,
+    path: &Path,
+    input: &str,
+    state: &mut TranscriptState,
+    workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> ImportStats {
+    import_codex_filtered_chunk(server, path, input, state, workspace, event_sink, |event| {
+        is_startup_context_event(event)
+    })
+}
+
+fn import_codex_filtered_chunk(
+    server: &str,
+    path: &Path,
+    input: &str,
+    state: &mut TranscriptState,
+    workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+    include_event: impl Fn(&AgentEvent) -> bool,
+) -> ImportStats {
+    let mut stats = ImportStats::default();
+    if is_agent_feed_internal_transcript(input) {
+        debug!(
+            path = %path.display(),
+            "codex transcript chunk skipped agent-feed internal processor session"
+        );
+        return stats;
+    }
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(err) => {
+                debug!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "codex startup context line ignored"
+                );
+                continue;
+            }
+        };
+        let Some(mut event) = normalize_transcript_value(value, state, Some(path)) else {
+            continue;
+        };
+        if !include_event(&event) {
+            continue;
+        }
+        mark_startup_context_event(&mut event);
+        if !event_matches_workspace(&event, workspace, path, "codex") {
+            stats.filtered += 1;
+            continue;
+        }
+        let body = match serde_json::to_string(&event) {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "codex startup context event encode failed"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = post_json(server, "/ingest/codex/jsonl", &body) {
+            warn!(
+                path = %path.display(),
+                %server,
+                error = %err,
+                "codex startup context event post failed"
+            );
+            continue;
+        }
+        if let Some(sender) = event_sink
+            && let Err(err) = sender.send(event.clone())
+        {
+            warn!(
+                path = %path.display(),
+                event_id = %event.id,
+                error = %err,
+                "codex startup context publish queue send failed"
+            );
+        }
+        stats.imported += 1;
+    }
+    stats
+}
+
+fn warm_codex_state_from_sample(path: &Path, state: &mut TranscriptState) -> Result<(), CliError> {
+    let sample = transcript_sample(path, STARTUP_STATE_SAMPLE_BYTES)?;
+    warm_codex_state(path, &sample, state);
+    Ok(())
+}
+
 fn warm_codex_state(path: &Path, input: &str, state: &mut TranscriptState) {
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        let envelope_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(envelope_type, "session_meta" | "turn_context") {
+            continue;
+        }
         let _ = normalize_transcript_value(value, state, Some(path));
     }
 }
@@ -4818,15 +5220,13 @@ fn watch_claude_active_sessions(
                 if !seen.insert(path.clone()) {
                     continue;
                 }
-                let input = fs::read_to_string(&path)?;
-                let mut state = ClaudeState::default();
-                let stats = if include_history {
-                    import_claude_chunk(server, &path, &input, &mut state, workspace, event_sink)
-                } else {
-                    warm_claude_state(&path, &input, &mut state);
-                    ImportStats::default()
-                };
-                let offset = fs::metadata(&path)?.len();
+                let (state, stats, offset) = initialize_claude_watcher(
+                    &path,
+                    server,
+                    workspace,
+                    include_history,
+                    event_sink,
+                )?;
                 info!(
                     path = %path.display(),
                     initial_events = stats.imported,
@@ -4886,15 +5286,8 @@ fn watch_claude_sessions(
 ) -> Result<(), CliError> {
     let mut watchers = Vec::new();
     for path in paths {
-        let input = fs::read_to_string(path)?;
-        let mut state = ClaudeState::default();
-        let stats = if include_history {
-            import_claude_chunk(server, path, &input, &mut state, workspace, event_sink)
-        } else {
-            warm_claude_state(path, &input, &mut state);
-            ImportStats::default()
-        };
-        let offset = fs::metadata(path)?.len();
+        let (state, stats, offset) =
+            initialize_claude_watcher(path, server, workspace, include_history, event_sink)?;
         info!(
             path = %path.display(),
             initial_events = stats.imported,
@@ -5141,6 +5534,112 @@ fn import_claude_chunk(
     stats
 }
 
+fn initialize_claude_watcher(
+    path: &Path,
+    server: &str,
+    workspace: Option<&WorkspaceFilter>,
+    include_history: bool,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> Result<(ClaudeState, ImportStats, u64), CliError> {
+    let mut state = ClaudeState::default();
+    let stats = if include_history {
+        let input = fs::read_to_string(path)?;
+        import_claude_chunk(server, path, &input, &mut state, workspace, event_sink)
+    } else {
+        warm_claude_state_from_sample(path, &mut state)?;
+        let context = transcript_suffix(path, STARTUP_CONTEXT_TAIL_BYTES)?;
+        import_claude_context_chunk(server, path, &context, &mut state, workspace, event_sink)
+    };
+    let offset = fs::metadata(path)?.len();
+    Ok((state, stats, offset))
+}
+
+fn import_claude_context_chunk(
+    server: &str,
+    path: &Path,
+    input: &str,
+    state: &mut ClaudeState,
+    workspace: Option<&WorkspaceFilter>,
+    event_sink: Option<&mpsc::Sender<AgentEvent>>,
+) -> ImportStats {
+    let mut stats = ImportStats::default();
+    if is_agent_feed_internal_transcript(input) {
+        debug!(
+            path = %path.display(),
+            "claude startup context skipped agent-feed internal processor session"
+        );
+        return stats;
+    }
+    for (index, line) in input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(err) => {
+                debug!(
+                    path = %path.display(),
+                    line = index + 1,
+                    error = %err,
+                    "claude startup context line ignored"
+                );
+                continue;
+            }
+        };
+        let Some(mut event) = normalize_stream_value(value, state, Some(path)) else {
+            continue;
+        };
+        if !is_startup_context_event(&event) {
+            continue;
+        }
+        mark_startup_context_event(&mut event);
+        if !event_matches_workspace(&event, workspace, path, "claude") {
+            stats.filtered += 1;
+            continue;
+        }
+        let body = match serde_json::to_string(&event) {
+            Ok(body) => body,
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "claude startup context event encode failed"
+                );
+                continue;
+            }
+        };
+        if let Err(err) = post_json(server, "/ingest/claude/stream-json", &body) {
+            warn!(
+                path = %path.display(),
+                %server,
+                error = %err,
+                "claude startup context event post failed"
+            );
+            continue;
+        }
+        if let Some(sender) = event_sink
+            && let Err(err) = sender.send(event.clone())
+        {
+            warn!(
+                path = %path.display(),
+                event_id = %event.id,
+                error = %err,
+                "claude startup context publish queue send failed"
+            );
+        }
+        stats.imported += 1;
+    }
+    stats
+}
+
+fn warm_claude_state_from_sample(path: &Path, state: &mut ClaudeState) -> Result<(), CliError> {
+    let sample = transcript_sample(path, STARTUP_STATE_SAMPLE_BYTES)?;
+    warm_claude_state(path, &sample, state);
+    Ok(())
+}
+
 fn warm_claude_state(path: &Path, input: &str, state: &mut ClaudeState) {
     for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -5162,6 +5661,26 @@ fn split_complete_jsonl(buffer: &mut String) -> String {
     let pending = pending.to_string();
     *buffer = pending;
     complete
+}
+
+fn is_startup_context_event(event: &AgentEvent) -> bool {
+    matches!(
+        event.kind,
+        agent_feed_core::EventKind::SessionStart
+            | agent_feed_core::EventKind::TurnStart
+            | agent_feed_core::EventKind::CommandExec
+            | agent_feed_core::EventKind::ToolStart
+            | agent_feed_core::EventKind::McpCall
+            | agent_feed_core::EventKind::WebSearch
+            | agent_feed_core::EventKind::AgentMessage
+            | agent_feed_core::EventKind::AdapterHealth
+    )
+}
+
+fn mark_startup_context_event(event: &mut AgentEvent) {
+    if !event.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG) {
+        event.tags.push(STARTUP_CONTEXT_TAG.to_string());
+    }
 }
 
 #[derive(Debug)]
@@ -5305,6 +5824,36 @@ fn transcript_sample(path: &Path, max_bytes: usize) -> Result<String, CliError> 
     let mut sample = String::from_utf8_lossy(&prefix).to_string();
     sample.push('\n');
     sample.push_str(&String::from_utf8_lossy(&suffix));
+    Ok(sample)
+}
+
+fn transcript_suffix(path: &Path, max_bytes: usize) -> Result<String, CliError> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 || max_bytes == 0 {
+        return Ok(String::new());
+    }
+
+    let start = len.saturating_sub(max_bytes as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut sample = String::from_utf8_lossy(&bytes).to_string();
+
+    if start > 0 {
+        match sample.find('\n') {
+            Some(index) => sample = sample[index + 1..].to_string(),
+            None => sample.clear(),
+        }
+    }
+
+    if !sample.ends_with('\n') {
+        match sample.rfind('\n') {
+            Some(index) => sample.truncate(index + 1),
+            None => sample.clear(),
+        }
+    }
+
     Ok(sample)
 }
 

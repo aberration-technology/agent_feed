@@ -469,6 +469,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Result<Json<StatusView>, 
 }
 
 fn story_status_view(diagnostics: StoryCompilerDiagnostics) -> StoryStatusView {
+    let recent_decisions = diagnostics
+        .recent_decisions
+        .into_iter()
+        .map(story_decision_view)
+        .collect();
     StoryStatusView {
         open_windows: diagnostics.open_windows,
         retained_windows: diagnostics.retained_windows,
@@ -476,15 +481,23 @@ fn story_status_view(diagnostics: StoryCompilerDiagnostics) -> StoryStatusView {
         published_stories: diagnostics.published_stories,
         rejected_stories: diagnostics.rejected_stories,
         deduped_stories: diagnostics.deduped_stories,
-        last_decision: diagnostics.last_decision.map(|decision| StoryDecisionView {
-            at: decision.at,
-            action: story_decision_action_label(decision.action).to_string(),
-            reason: decision.reason,
-            agent: decision.agent,
-            family: story_family_status_label(decision.family).to_string(),
-            score: decision.score,
-            context_score: decision.context_score,
-        }),
+        last_decision: diagnostics.last_decision.map(story_decision_view),
+        recent_decisions,
+    }
+}
+
+fn story_decision_view(decision: agent_feed_story::StoryDecision) -> StoryDecisionView {
+    StoryDecisionView {
+        at: decision.at,
+        action: story_decision_action_label(decision.action).to_string(),
+        reason: decision.reason,
+        agent: decision.agent,
+        project: decision.project,
+        session_id: decision.session_id,
+        turn_id: decision.turn_id,
+        family: story_family_status_label(decision.family).to_string(),
+        score: decision.score,
+        context_score: decision.context_score,
     }
 }
 

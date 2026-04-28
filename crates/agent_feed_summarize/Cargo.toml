@@ -1,6 +1,6 @@
 [package]
 name = "agent_feed_summarize"
-version = "0.1.22"
+version = "0.1.23"
 edition.workspace = true
 license.workspace = true
 description.workspace = true
@@ -15,6 +15,7 @@ regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 time = { workspace = true }

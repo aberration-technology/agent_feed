@@ -405,6 +405,17 @@ pub enum PublishAction {
     SkipProcessor,
 }
 
+impl PublishAction {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Publish => "publish",
+            Self::SkipDuplicate => "skip_duplicate",
+            Self::SkipProcessor => "skip_processor",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentSummary {
     pub headline: String,
@@ -1043,8 +1054,20 @@ fn summarize_feed_inner(
     recent_summaries: &[RecentSummary],
 ) -> Result<Vec<FeedSummary>, SummaryError> {
     if stories.is_empty() {
+        tracing::debug!(%feed_id, "summary skipped empty story batch");
         return Ok(Vec::new());
     }
+
+    tracing::info!(
+        %feed_id,
+        mode = ?config.mode,
+        processor = summary_processor_name(config, processor),
+        stories = stories.len(),
+        recent_summaries = recent_summaries.len(),
+        max_rollup_stories = config.budget.max_feed_rollup_stories,
+        publish_policy_enabled = config.publish.enabled,
+        "summary evaluation started"
+    );
 
     let batches: Vec<Vec<CompiledStory>> = match config.mode {
         FeedSummaryMode::PerStory => stories.iter().cloned().map(|story| vec![story]).collect(),
@@ -1074,6 +1097,11 @@ fn summarize_feed_inner(
                 );
             }
             Err(SummaryError::GuardrailRejected(_)) if batch.len() > 1 => {
+                tracing::info!(
+                    %feed_id,
+                    batch_stories = batch.len(),
+                    "summary rollup rejected by guardrails; retrying per-story"
+                );
                 for story in batch {
                     let mut single_request =
                         SummaryRequest::new(feed_id, FeedSummaryMode::PerStory, vec![story]);
@@ -1091,15 +1119,31 @@ fn summarize_feed_inner(
                             &mut recent,
                             &mut summaries,
                         ),
-                        Err(SummaryError::GuardrailRejected(_)) => {}
+                        Err(SummaryError::GuardrailRejected(_)) => {
+                            tracing::info!(
+                                %feed_id,
+                                "summary story rejected by guardrails"
+                            );
+                        }
                         Err(err) => return Err(err),
                     }
                 }
             }
-            Err(SummaryError::GuardrailRejected(_)) => {}
+            Err(SummaryError::GuardrailRejected(_)) => {
+                tracing::info!(
+                    %feed_id,
+                    batch_stories = batch.len(),
+                    "summary batch rejected by guardrails"
+                );
+            }
             Err(err) => return Err(err),
         }
     }
+    tracing::info!(
+        %feed_id,
+        summaries = summaries.len(),
+        "summary evaluation completed"
+    );
     Ok(summaries)
 }
 
@@ -1111,13 +1155,62 @@ fn push_publishable_summary(
     summaries: &mut Vec<FeedSummary>,
 ) {
     if !apply_publish_decision(&mut summary, request, policy) {
+        tracing::info!(
+            feed_id = %request.feed_id,
+            action = summary.metadata.publish_action.as_str(),
+            reason = %summary.metadata.publish_reason,
+            processor = %summary.metadata.processor,
+            story_family = ?summary.story_family,
+            score = summary.score,
+            input_stories = summary.metadata.input_stories,
+            output_chars = summary.metadata.output_chars,
+            headline_similarity = summary.metadata.max_headline_similarity,
+            deck_similarity = summary.metadata.max_deck_similarity,
+            violations = summary.metadata.violations.len(),
+            headline_fingerprint = %summary.metadata.headline_fingerprint,
+            "summary publish decision skipped"
+        );
         return;
     }
+    tracing::info!(
+        feed_id = %request.feed_id,
+        action = summary.metadata.publish_action.as_str(),
+        reason = %summary.metadata.publish_reason,
+        processor = %summary.metadata.processor,
+        story_family = ?summary.story_family,
+        score = summary.score,
+        input_stories = summary.metadata.input_stories,
+        output_chars = summary.metadata.output_chars,
+        headline_similarity = summary.metadata.max_headline_similarity,
+        deck_similarity = summary.metadata.max_deck_similarity,
+        violations = summary.metadata.violations.len(),
+        image_enabled = summary.metadata.image_enabled,
+        image_attached = summary.image.is_some(),
+        headline_fingerprint = %summary.metadata.headline_fingerprint,
+        "summary publish decision accepted"
+    );
     recent.push_front(RecentSummary::from(&summary));
     while recent.len() > policy.recent_window.max(1) {
         recent.pop_back();
     }
     summaries.push(summary);
+}
+
+fn summary_processor_name(
+    config: &SummaryConfig,
+    processor: Option<&dyn SummaryProcessor>,
+) -> &'static str {
+    if processor.is_some() {
+        return "custom";
+    }
+    match &config.processor {
+        SummaryProcessorConfig::Deterministic => "deterministic",
+        SummaryProcessorConfig::CodexExec => "codex-exec",
+        SummaryProcessorConfig::CodexSessionMemory { .. } => "codex-memory",
+        SummaryProcessorConfig::ClaudeCodeExec => "claude-code",
+        SummaryProcessorConfig::Process { .. } => "process",
+        SummaryProcessorConfig::HttpEndpoint { .. } => "http-endpoint",
+    }
 }
 
 pub fn summarize_request(
@@ -1150,6 +1243,16 @@ fn summarize_request_inner(
     processor: Option<&dyn SummaryProcessor>,
     image_processor: Option<&dyn ImageProcessor>,
 ) -> Result<FeedSummary, SummaryError> {
+    tracing::debug!(
+        feed_id = %request.feed_id,
+        mode = ?request.mode,
+        processor = summary_processor_name(config, processor),
+        stories = request.stories.len(),
+        recent_summaries = request.recent_summaries.len(),
+        prompt_chars = config.prompt.max_prompt_chars,
+        external_cost_allowed = !matches!(&config.processor, SummaryProcessorConfig::Deterministic),
+        "summary processor preparing candidate"
+    );
     let processor_output = if let Some(processor) = processor {
         let processor_request = request_for_external_processor(request, config)?;
         processor.summarize(&processor_request)?
@@ -1210,6 +1313,18 @@ fn summarize_request_inner(
 
     let mut summary = build_summary(request, processor_output, config)?;
     attach_optional_image(&mut summary, request, config, image_processor)?;
+    tracing::debug!(
+        feed_id = %request.feed_id,
+        processor = %summary.metadata.processor,
+        story_family = ?summary.story_family,
+        score = summary.score,
+        input_stories = summary.metadata.input_stories,
+        output_chars = summary.metadata.output_chars,
+        violations = summary.metadata.violations.len(),
+        image_enabled = summary.metadata.image_enabled,
+        image_attached = summary.image.is_some(),
+        "summary processor produced candidate"
+    );
     Ok(summary)
 }
 

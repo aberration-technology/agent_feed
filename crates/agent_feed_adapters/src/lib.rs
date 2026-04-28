@@ -1,7 +1,10 @@
 use agent_feed_core::{AgentEvent, EventKind, Severity, SourceKind};
 use agent_feed_ingest::{IngestError, normalize_value};
 use serde_json::Value;
-use std::path::Path;
+use std::{
+    collections::{HashMap, VecDeque},
+    path::Path,
+};
 use time::OffsetDateTime;
 
 #[derive(Debug, thiserror::Error)]
@@ -204,7 +207,9 @@ pub mod codex {
 
     pub fn normalize_exec_json(value: Value) -> Result<AgentEvent, AdapterError> {
         let mut event = normalize_value(value, SourceKind::Codex)?;
-        event.adapter = "codex.exec-json".to_string();
+        if event.adapter == "codex-generic" || event.adapter.is_empty() {
+            event.adapter = "codex.exec-json".to_string();
+        }
         if event.kind == EventKind::AgentMessage {
             event.kind = infer_codex_kind(&event.title);
         }
@@ -229,6 +234,53 @@ pub mod codex {
         pub cwd: Option<String>,
         pub project: Option<String>,
         pub model: Option<String>,
+        active_calls: HashMap<String, TranscriptToolContext>,
+        recent_messages: VecDeque<String>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TranscriptToolContext {
+        command: Option<String>,
+        cwd: Option<String>,
+        tool: Option<String>,
+    }
+
+    impl TranscriptState {
+        fn remember_message(&mut self, summary: &str) -> bool {
+            let fingerprint = normalized_message_fingerprint(summary);
+            if fingerprint.is_empty() {
+                return true;
+            }
+            if self
+                .recent_messages
+                .iter()
+                .any(|existing| existing == &fingerprint)
+            {
+                return false;
+            }
+            self.recent_messages.push_back(fingerprint);
+            while self.recent_messages.len() > 64 {
+                self.recent_messages.pop_front();
+            }
+            true
+        }
+
+        fn insert_call_context(&mut self, payload: &Value, context: TranscriptToolContext) {
+            let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
+                return;
+            };
+            self.active_calls.insert(call_id.to_string(), context);
+            if self.active_calls.len() > 256
+                && let Some(first) = self.active_calls.keys().next().cloned()
+            {
+                self.active_calls.remove(&first);
+            }
+        }
+
+        fn take_call_context(&mut self, payload: &Value) -> Option<TranscriptToolContext> {
+            let call_id = payload.get("call_id").and_then(Value::as_str)?;
+            self.active_calls.remove(call_id)
+        }
     }
 
     pub fn normalize_transcript(
@@ -345,7 +397,7 @@ pub mod codex {
     }
 
     fn agent_message_event(
-        state: &TranscriptState,
+        state: &mut TranscriptState,
         timestamp: Option<&str>,
         payload: &Value,
     ) -> Option<AgentEvent> {
@@ -366,6 +418,9 @@ pub mod codex {
             .or_else(|| payload.get("content"))
             .and_then(display_safe_content_sentence)
             .unwrap_or_else(|| "assistant message recorded without raw content.".to_string());
+        if !state.remember_message(&summary) {
+            return None;
+        }
         Some(build_event(
             state,
             timestamp,
@@ -455,17 +510,21 @@ pub mod codex {
     }
 
     fn command_end_event(
-        state: &TranscriptState,
+        state: &mut TranscriptState,
         timestamp: Option<&str>,
         payload: &Value,
     ) -> Option<AgentEvent> {
+        let context = state.take_call_context(payload);
         let status = payload
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or_default();
         let exit_code = payload.get("exit_code").and_then(Value::as_i64);
         let success = status == "completed" && exit_code.unwrap_or(0) == 0;
-        let command = command_from_payload(payload);
+        let command = command_from_payload(payload)
+            .or_else(|| context.as_ref().and_then(|context| context.command.clone()));
+        let cwd = cwd_from_payload(payload)
+            .or_else(|| context.as_ref().and_then(|context| context.cwd.clone()));
         let duration = payload.get("duration").and_then(Value::as_str);
         let summary = if command.as_deref().is_some_and(is_test_command) {
             match (success, duration) {
@@ -522,19 +581,24 @@ pub mod codex {
             timestamp,
             TranscriptEvent::new(kind, title, score, severity)
                 .summary(summary)
-                .optional_command(command),
+                .optional_command(command)
+                .optional_tool(context.and_then(|context| context.tool))
+                .optional_cwd(cwd),
         ))
     }
 
     fn patch_event(
-        state: &TranscriptState,
+        state: &mut TranscriptState,
         timestamp: Option<&str>,
         payload: &Value,
     ) -> Option<AgentEvent> {
+        let context = state.take_call_context(payload);
         let success = payload
             .get("success")
             .and_then(Value::as_bool)
             .unwrap_or_else(|| payload.get("status").and_then(Value::as_str) == Some("completed"));
+        let cwd = cwd_from_payload(payload)
+            .or_else(|| context.as_ref().and_then(|context| context.cwd.clone()));
         let files = files_from_changes(payload.get("changes"));
         let summary = if files.is_empty() {
             "patch applied without exposing raw diff.".to_string()
@@ -564,16 +628,28 @@ pub mod codex {
             )
             .summary(summary)
             .command("apply_patch")
+            .optional_tool(context.and_then(|context| context.tool))
+            .optional_cwd(cwd)
             .files(files),
         ))
     }
 
     fn tool_start_event(
-        state: &TranscriptState,
+        state: &mut TranscriptState,
         timestamp: Option<&str>,
         payload: &Value,
     ) -> Option<AgentEvent> {
         let name = payload.get("name").and_then(Value::as_str)?;
+        let command = command_from_arguments(payload.get("arguments"));
+        let cwd = cwd_from_arguments(payload.get("arguments"));
+        state.insert_call_context(
+            payload,
+            TranscriptToolContext {
+                command: command.clone(),
+                cwd: cwd.clone(),
+                tool: Some(name.to_string()),
+            },
+        );
         if name == "exec_command" {
             return Some(build_event(
                 state,
@@ -585,7 +661,9 @@ pub mod codex {
                     Severity::Info,
                 )
                 .summary("command lifecycle captured without command output.")
-                .optional_command(command_from_arguments(payload.get("arguments"))),
+                .optional_command(command)
+                .optional_tool(Some(name.to_string()))
+                .optional_cwd(cwd),
             ));
         }
         if name == "apply_patch" {
@@ -599,7 +677,9 @@ pub mod codex {
                     Severity::Info,
                 )
                 .summary("patch activity captured without raw diff.")
-                .command("apply_patch"),
+                .command("apply_patch")
+                .tool(name)
+                .optional_cwd(cwd),
             ));
         }
         if let Some(summary) = mcp_tool_summary(name) {
@@ -614,7 +694,8 @@ pub mod codex {
                 )
                 .summary(summary)
                 .command(mcp_command_label(name))
-                .tool(mcp_tool_label(name)),
+                .tool(mcp_tool_label(name))
+                .optional_cwd(cwd),
             ));
         }
         Some(build_event(
@@ -628,7 +709,8 @@ pub mod codex {
             )
             .summary("tool call started.")
             .command(name)
-            .tool(name),
+            .tool(name)
+            .optional_cwd(cwd),
         ))
     }
 
@@ -639,6 +721,7 @@ pub mod codex {
         summary: Option<String>,
         command: Option<String>,
         tool: Option<String>,
+        cwd: Option<String>,
         files: Vec<String>,
         score_hint: u8,
         severity: Severity,
@@ -657,6 +740,7 @@ pub mod codex {
                 summary: None,
                 command: None,
                 tool: None,
+                cwd: None,
                 files: Vec::new(),
                 score_hint,
                 severity,
@@ -683,8 +767,18 @@ pub mod codex {
             self
         }
 
+        fn optional_tool(mut self, tool: Option<String>) -> Self {
+            self.tool = tool;
+            self
+        }
+
         fn optional_command(mut self, command: Option<String>) -> Self {
             self.command = command;
+            self
+        }
+
+        fn optional_cwd(mut self, cwd: Option<String>) -> Self {
+            self.cwd = cwd;
             self
         }
 
@@ -704,8 +798,12 @@ pub mod codex {
         event.adapter = "codex.transcript".to_string();
         event.session_id = state.session_id.clone();
         event.turn_id = state.turn_id.clone();
-        event.project = state.project.clone();
-        event.cwd = state.cwd.clone();
+        event.cwd = draft.cwd.or_else(|| state.cwd.clone());
+        event.project = event
+            .cwd
+            .as_deref()
+            .and_then(project_from_cwd)
+            .or_else(|| state.project.clone());
         event.occurred_at = timestamp.and_then(parse_timestamp);
         event.summary = draft.summary;
         event.command = draft.command;
@@ -741,6 +839,14 @@ pub mod codex {
             .or_else(|| payload.get("command").and_then(command_value_to_string))
     }
 
+    fn cwd_from_payload(payload: &Value) -> Option<String> {
+        payload
+            .get("cwd")
+            .or_else(|| payload.get("workdir"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    }
+
     fn command_from_arguments(arguments: Option<&Value>) -> Option<String> {
         let arguments = arguments?;
         if let Some(command) = arguments.get("cmd").and_then(Value::as_str) {
@@ -755,6 +861,40 @@ pub mod codex {
             return command_from_arguments(Some(&parsed));
         }
         None
+    }
+
+    fn cwd_from_arguments(arguments: Option<&Value>) -> Option<String> {
+        let arguments = arguments?;
+        if let Some(cwd) = arguments
+            .get("workdir")
+            .or_else(|| arguments.get("cwd"))
+            .or_else(|| arguments.get("working_dir"))
+            .and_then(Value::as_str)
+        {
+            return Some(cwd.to_string());
+        }
+        if let Some(value) = arguments.as_str()
+            && let Ok(parsed) = serde_json::from_str::<Value>(value)
+        {
+            return cwd_from_arguments(Some(&parsed));
+        }
+        None
+    }
+
+    fn normalized_message_fingerprint(input: &str) -> String {
+        input
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch.is_whitespace() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ' '
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn mcp_tool_summary(name: &str) -> Option<&'static str> {
@@ -1570,6 +1710,54 @@ mod tests {
         assert_eq!(
             events[1].summary.as_deref(),
             Some("Browser feed auth now returns to the CLI callback.")
+        );
+    }
+
+    #[test]
+    fn codex_transcript_deduplicates_paired_agent_messages() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/burn_p2p"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/burn_p2p","turn_id":"turn_1"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"agent_message","message":{"role":"assistant","content":[{"type":"output_text","text":"Burn_p2p browser training receipts now flush reliably."}]}}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Burn_p2p browser training receipts now flush reliably."}]}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+        let messages = events
+            .iter()
+            .filter(|event| event.kind == EventKind::AgentMessage)
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].summary.as_deref(),
+            Some("Burn_p2p browser training receipts now flush reliably.")
+        );
+    }
+
+    #[test]
+    fn codex_transcript_uses_tool_workdir_for_project_tags() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":{"cmd":"cargo test -p burn_p2p_browser","workdir":"/home/mosure/repos/burn_p2p"}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:04.000Z","payload":{"type":"exec_command_end","call_id":"call_1","turn_id":"turn_1","status":"completed","exit_code":0,"duration":"4s","command":["cargo","test","-p","burn_p2p_browser"],"cwd":"/home/mosure/repos/burn_p2p"}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events[0].project.as_deref(), Some("repos"));
+        assert_eq!(events[1].kind, EventKind::CommandExec);
+        assert_eq!(events[1].project.as_deref(), Some("burn_p2p"));
+        assert_eq!(
+            events[1].cwd.as_deref(),
+            Some("/home/mosure/repos/burn_p2p")
+        );
+        assert_eq!(events[2].kind, EventKind::TestPass);
+        assert_eq!(events[2].project.as_deref(), Some("burn_p2p"));
+        assert_eq!(
+            events[2].cwd.as_deref(),
+            Some("/home/mosure/repos/burn_p2p")
         );
     }
 

@@ -43,6 +43,8 @@ pub struct StoryStatusView {
     pub rejected_stories: usize,
     pub deduped_stories: usize,
     pub last_decision: Option<StoryDecisionView>,
+    #[serde(default)]
+    pub recent_decisions: Vec<StoryDecisionView>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +54,9 @@ pub struct StoryDecisionView {
     pub action: String,
     pub reason: String,
     pub agent: String,
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
     pub family: String,
     pub score: u8,
     pub context_score: u8,

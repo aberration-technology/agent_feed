@@ -12,6 +12,8 @@ const URGENT_DWELL_MS: u64 = 20_000;
 const DEFAULT_MIN_SCORE: u8 = 65;
 const DEFAULT_MIN_CONTEXT_SCORE: u8 = 70;
 const DEFAULT_DEDUPE_WINDOW: usize = 32;
+const DEFAULT_DECISION_HISTORY: usize = 40;
+const STARTUP_CONTEXT_TAG: &str = "startup-context";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoryCompilerConfig {
@@ -80,6 +82,9 @@ pub struct StoryDecision {
     pub action: StoryDecisionAction,
     pub reason: String,
     pub agent: String,
+    pub project: Option<String>,
+    pub session_id: Option<String>,
+    pub turn_id: Option<String>,
     pub family: StoryFamily,
     pub score: u8,
     pub context_score: u8,
@@ -94,6 +99,7 @@ pub struct StoryCompilerDiagnostics {
     pub rejected_stories: usize,
     pub deduped_stories: usize,
     pub last_decision: Option<StoryDecision>,
+    pub recent_decisions: Vec<StoryDecision>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -132,6 +138,8 @@ pub struct StoryWindow {
     pub counters: StoryCounters,
     pub signals: StorySignals,
     pub state: StoryWindowState,
+    #[serde(default)]
+    pub publishable_events: usize,
 }
 
 impl StoryWindow {
@@ -144,13 +152,25 @@ impl StoryWindow {
             counters: StoryCounters::default(),
             signals: StorySignals::default(),
             state: StoryWindowState::Open,
+            publishable_events: 0,
         }
     }
 
     fn observe(&mut self, event: &AgentEvent) {
+        self.observe_with_publishable(event, true);
+    }
+
+    fn observe_context(&mut self, event: &AgentEvent) {
+        self.observe_with_publishable(event, false);
+    }
+
+    fn observe_with_publishable(&mut self, event: &AgentEvent, publishable: bool) {
         self.last_event_at = event.occurred_at.unwrap_or(event.received_at);
         self.events.push(event.id.clone());
         self.counters.events += 1;
+        if publishable {
+            self.publishable_events += 1;
+        }
         self.signals.highest_score = self.signals.highest_score.max(score_event(event));
         if severity_rank(event.severity) > severity_rank(self.signals.highest_severity) {
             self.signals.highest_severity = event.severity;
@@ -308,8 +328,22 @@ impl StoryCompiler {
     #[must_use]
     pub fn ingest(&mut self, event: AgentEvent) -> Vec<CompiledStory> {
         let primary_key = story_key(&event);
+        let context_only = is_startup_context(&event);
         if primary_key.family != StoryFamily::Turn {
-            self.touch_turn_rollup(&event);
+            self.touch_turn_rollup(&event, !context_only);
+        }
+
+        if context_only {
+            self.record_event_decision(
+                &event,
+                primary_key.family,
+                StoryDecisionAction::Waiting,
+                "startup context is waiting for future activity",
+            );
+            if primary_key.family == StoryFamily::Turn {
+                self.touch_window_with_key(primary_key, event, false);
+            }
+            return Vec::new();
         }
 
         if is_never_publish_event(&event) {
@@ -319,7 +353,7 @@ impl StoryCompiler {
                 StoryDecisionAction::Waiting,
                 "waiting for a completion, test, edit, or incident signal",
             );
-            self.touch_window_with_key(primary_key, event);
+            self.touch_window_with_key(primary_key, event, true);
             return Vec::new();
         }
 
@@ -369,6 +403,16 @@ impl StoryCompiler {
         let windows = std::mem::take(&mut self.windows);
         let mut stories = Vec::new();
         for (key, mut window) in windows {
+            if window.publishable_events == 0 {
+                self.diagnostics.retained_windows += 1;
+                self.record_window_decision(
+                    &window,
+                    StoryDecisionAction::Retained,
+                    "startup context is waiting for future activity",
+                );
+                self.windows.insert(key, window);
+                continue;
+            }
             if let Some(rejection) = self.compile_rejection(&window) {
                 if rejection.score < self.config.min_score && should_retain_open_window(&window) {
                     self.diagnostics.retained_windows += 1;
@@ -404,15 +448,20 @@ impl StoryCompiler {
         stories
     }
 
-    fn touch_window_with_key(&mut self, key: StoryKey, event: AgentEvent) {
+    fn touch_window_with_key(&mut self, key: StoryKey, event: AgentEvent, publishable: bool) {
         let now = event.occurred_at.unwrap_or(event.received_at);
-        self.windows
+        let window = self
+            .windows
             .entry(key.clone())
-            .or_insert_with(|| StoryWindow::new(key, now))
-            .observe(&event);
+            .or_insert_with(|| StoryWindow::new(key, now));
+        if publishable {
+            window.observe(&event);
+        } else {
+            window.observe_context(&event);
+        }
     }
 
-    fn touch_turn_rollup(&mut self, event: &AgentEvent) {
+    fn touch_turn_rollup(&mut self, event: &AgentEvent, publishable: bool) {
         if event.session_id.is_none() && event.turn_id.is_none() {
             return;
         }
@@ -425,10 +474,15 @@ impl StoryCompiler {
             family: StoryFamily::Turn,
         };
         let now = event.occurred_at.unwrap_or(event.received_at);
-        self.windows
+        let window = self
+            .windows
             .entry(key.clone())
-            .or_insert_with(|| StoryWindow::new(key, now))
-            .observe(event);
+            .or_insert_with(|| StoryWindow::new(key, now));
+        if publishable {
+            window.observe(event);
+        } else {
+            window.observe_context(event);
+        }
     }
 
     fn compile_window(&self, window: StoryWindow) -> Option<CompiledStory> {
@@ -521,12 +575,11 @@ impl StoryCompiler {
 
     fn accept_story(&mut self, story: &CompiledStory) -> bool {
         let fingerprint = format!(
-            "{}:{}:{}:{}:{:?}",
+            "{}:{}:{:?}:{}",
             story.agent,
             story.project.as_deref().unwrap_or("local"),
-            story.key.session_id.as_deref().unwrap_or("session"),
-            story.key.turn_id.as_deref().unwrap_or("turn"),
-            story.family
+            story.family,
+            semantic_story_fingerprint(&story.headline, &story.deck)
         );
         if self
             .recent_fingerprints
@@ -542,6 +595,16 @@ impl StoryCompiler {
         true
     }
 
+    fn record_decision(&mut self, decision: StoryDecision) {
+        self.diagnostics.last_decision = Some(decision.clone());
+        self.diagnostics.recent_decisions.insert(0, decision);
+        if self.diagnostics.recent_decisions.len() > DEFAULT_DECISION_HISTORY {
+            self.diagnostics
+                .recent_decisions
+                .truncate(DEFAULT_DECISION_HISTORY);
+        }
+    }
+
     fn record_event_decision(
         &mut self,
         event: &AgentEvent,
@@ -549,11 +612,14 @@ impl StoryCompiler {
         action: StoryDecisionAction,
         reason: &'static str,
     ) {
-        self.diagnostics.last_decision = Some(StoryDecision {
+        self.record_decision(StoryDecision {
             at: event.occurred_at.unwrap_or(event.received_at),
             action,
             reason: reason.to_string(),
             agent: event.agent.clone(),
+            project: event.project.clone(),
+            session_id: event.session_id.clone(),
+            turn_id: event.turn_id.clone(),
             family,
             score: score_event(event),
             context_score: 0,
@@ -566,11 +632,14 @@ impl StoryCompiler {
         action: StoryDecisionAction,
         reason: &'static str,
     ) {
-        self.diagnostics.last_decision = Some(StoryDecision {
+        self.record_decision(StoryDecision {
             at: window.last_event_at,
             action,
             reason: reason.to_string(),
             agent: window.key.agent.clone(),
+            project: window.key.project_hash.clone(),
+            session_id: window.key.session_id.clone(),
+            turn_id: window.key.turn_id.clone(),
             family: window.key.family,
             score: story_score(window),
             context_score: context_score(window),
@@ -579,11 +648,14 @@ impl StoryCompiler {
 
     fn record_window_rejection(&mut self, window: &StoryWindow, rejection: StoryCompileRejection) {
         self.diagnostics.rejected_stories += 1;
-        self.diagnostics.last_decision = Some(StoryDecision {
+        self.record_decision(StoryDecision {
             at: window.last_event_at,
             action: StoryDecisionAction::Rejected,
             reason: rejection.reason.to_string(),
             agent: window.key.agent.clone(),
+            project: window.key.project_hash.clone(),
+            session_id: window.key.session_id.clone(),
+            turn_id: window.key.turn_id.clone(),
             family: window.key.family,
             score: rejection.score,
             context_score: rejection.context_score,
@@ -596,11 +668,14 @@ impl StoryCompiler {
         action: StoryDecisionAction,
         reason: &'static str,
     ) {
-        self.diagnostics.last_decision = Some(StoryDecision {
+        self.record_decision(StoryDecision {
             at: story.created_at,
             action,
             reason: reason.to_string(),
             agent: story.agent.clone(),
+            project: story.project.clone(),
+            session_id: story.key.session_id.clone(),
+            turn_id: story.key.turn_id.clone(),
             family: story.family,
             score: story.score,
             context_score: story.context_score,
@@ -686,9 +761,15 @@ fn is_never_publish_event(event: &AgentEvent) -> bool {
             | EventKind::ToolStart
             | EventKind::McpCall
             | EventKind::WebSearch
-            | EventKind::AgentMessage
             | EventKind::AdapterHealth
-    )
+    ) || (event.kind == EventKind::AgentMessage
+        && event.summary.as_deref().is_none_or(|summary| {
+            !meaningful_summary(summary) || !summary_has_work_context(summary)
+        }))
+}
+
+fn is_startup_context(event: &AgentEvent) -> bool {
+    event.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG)
 }
 
 fn context_score(window: &StoryWindow) -> u8 {
@@ -724,6 +805,15 @@ fn context_score(window: &StoryWindow) -> u8 {
 
 fn story_score(window: &StoryWindow) -> u8 {
     let mut score = window.signals.highest_score;
+    if window.key.family == StoryFamily::Turn
+        && window
+            .signals
+            .latest_summary
+            .as_deref()
+            .is_some_and(meaningful_summary)
+    {
+        score = score.max(74);
+    }
     if has_command_burst(window) {
         score = score.max(68 + window.counters.commands.min(8) as u8);
     }
@@ -1218,6 +1308,7 @@ fn outcome_label(window: &StoryWindow) -> Option<&'static str> {
         Some(EventKind::McpFail) => Some("mcp failed"),
         Some(EventKind::PlanUpdate) => Some("plan updated"),
         Some(EventKind::SummaryCreated) => Some("summary created"),
+        Some(EventKind::AgentMessage) => Some("progress update"),
         _ => None,
     }
 }
@@ -1402,6 +1493,36 @@ fn normalized_story_text(input: &str) -> String {
         .join(" ")
 }
 
+fn semantic_story_fingerprint(headline: &str, deck: &str) -> String {
+    normalized_story_text(&format!("{headline} {deck}"))
+        .split_whitespace()
+        .filter(|word| {
+            !matches!(
+                *word,
+                "a" | "an"
+                    | "and"
+                    | "are"
+                    | "as"
+                    | "by"
+                    | "codex"
+                    | "claude"
+                    | "for"
+                    | "from"
+                    | "in"
+                    | "is"
+                    | "it"
+                    | "of"
+                    | "on"
+                    | "the"
+                    | "to"
+                    | "with"
+            )
+        })
+        .take(18)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn summary_is_redundant(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
     let trimmed = lowered.trim_start();
@@ -1581,6 +1702,71 @@ mod tests {
     }
 
     #[test]
+    fn meaningful_agent_message_publishes_after_flush() {
+        let mut compiler = StoryCompiler::default();
+        let mut message = event(EventKind::AgentMessage, "codex posted an update");
+        message.summary =
+            Some("Burn_p2p browser training receipts now flush reliably.".to_string());
+
+        assert!(compiler.ingest(message).is_empty());
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].family, StoryFamily::Turn);
+        assert!(
+            stories[0]
+                .headline
+                .contains("burn_p2p browser training receipts")
+        );
+        assert!(stories[0].score >= DEFAULT_MIN_SCORE);
+    }
+
+    #[test]
+    fn same_turn_can_publish_meaningfully_changed_updates() {
+        let mut compiler = StoryCompiler::default();
+        let mut first = event(EventKind::AgentMessage, "codex posted an update");
+        first.summary = Some("Burn_p2p browser training receipts now flush reliably.".to_string());
+        assert!(compiler.ingest(first).is_empty());
+        assert_eq!(compiler.flush().len(), 1);
+
+        let mut second = event(EventKind::AgentMessage, "codex posted an update");
+        second.summary =
+            Some("Burn_dragon WebGPU training publishes browser receipts again.".to_string());
+        assert!(compiler.ingest(second).is_empty());
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert!(
+            stories[0]
+                .headline
+                .contains("burn_dragon WebGPU training publishes")
+        );
+    }
+
+    #[test]
+    fn same_turn_repeated_update_is_deduped_semantically() {
+        let mut compiler = StoryCompiler::default();
+        let mut first = event(EventKind::AgentMessage, "codex posted an update");
+        first.summary = Some("Burn_p2p browser training receipts now flush reliably.".to_string());
+        assert!(compiler.ingest(first).is_empty());
+        assert_eq!(compiler.flush().len(), 1);
+
+        let mut repeat = event(EventKind::AgentMessage, "codex posted an update");
+        repeat.summary = Some("Burn_p2p browser training receipts now flush reliably.".to_string());
+        assert!(compiler.ingest(repeat).is_empty());
+
+        assert!(compiler.flush().is_empty());
+        assert_eq!(
+            compiler
+                .diagnostics()
+                .last_decision
+                .as_ref()
+                .map(|decision| decision.action),
+            Some(StoryDecisionAction::Deduped)
+        );
+    }
+
+    #[test]
     fn file_change_rolls_up_without_standalone_story() {
         let mut compiler = StoryCompiler::default();
         let mut start = event(EventKind::CommandExec, "codex started a command");
@@ -1635,6 +1821,29 @@ mod tests {
         assert_eq!(turn.chips[0], "agent_feed");
         assert_eq!(turn.chips[1], "codex");
         assert!(turn.lower_third.starts_with("agent_feed · codex"));
+    }
+
+    #[test]
+    fn startup_context_does_not_flush_until_future_activity() {
+        let mut compiler = StoryCompiler::default();
+        let mut context = event(EventKind::AgentMessage, "codex posted an update");
+        context.summary =
+            Some("Browser feed discovery now follows signed story streams.".to_string());
+        context.tags.push(STARTUP_CONTEXT_TAG.to_string());
+
+        assert!(compiler.ingest(context).is_empty());
+        assert!(compiler.flush().is_empty());
+
+        let mut complete = event(EventKind::TurnComplete, "codex turn completed");
+        complete.summary = Some("turn completed in 30s.".to_string());
+        complete.score_hint = Some(82);
+        let stories = compiler.ingest(complete);
+
+        let turn = stories
+            .iter()
+            .find(|story| story.family == StoryFamily::Turn)
+            .expect("future activity publishes with context");
+        assert!(turn.headline.contains("browser feed discovery"));
     }
 
     #[test]
