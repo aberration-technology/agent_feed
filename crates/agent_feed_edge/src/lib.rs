@@ -31,9 +31,17 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
-const SNAPSHOT_HEADLINE_LIMIT: usize = 64;
+const SNAPSHOT_HEADLINE_LIMIT: usize = 48;
 const MAX_PUBLISH_CAPSULES: usize = 16;
 type HmacSha256 = Hmac<Sha256>;
+
+fn snapshot_headline_ttl() -> Duration {
+    Duration::minutes(45)
+}
+
+fn snapshot_feed_ttl() -> Duration {
+    Duration::minutes(15)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeConfig {
@@ -635,7 +643,7 @@ impl SnapshotStore {
     }
 
     fn from_path(path: PathBuf) -> Self {
-        let persisted = fs::read_to_string(&path)
+        let mut persisted = fs::read_to_string(&path)
             .ok()
             .and_then(|input| serde_json::from_str::<PersistedSnapshotDisk>(&input).ok())
             .map(|disk| match disk {
@@ -646,6 +654,7 @@ impl SnapshotStore {
                 },
             })
             .unwrap_or_default();
+        prune_persisted_snapshot(&mut persisted);
         Self {
             feeds: Arc::new(Mutex::new(VecDeque::from(persisted.feeds))),
             headlines: Arc::new(Mutex::new(VecDeque::from(persisted.headlines))),
@@ -659,6 +668,8 @@ impl SnapshotStore {
                 tracing::warn!("network snapshot feed store lock poisoned");
                 return;
             };
+            let now = OffsetDateTime::now_utc();
+            feeds.retain(|existing| feed_is_within_retention(existing, now));
             upsert_feed_view(&mut feeds, feed);
             while feeds.len() > SNAPSHOT_HEADLINE_LIMIT {
                 feeds.pop_front();
@@ -669,7 +680,17 @@ impl SnapshotStore {
         self.persist_snapshot(feeds, headlines);
     }
 
-    fn push(&self, headline: RemoteHeadlineView) {
+    fn push(&self, headline: RemoteHeadlineView) -> bool {
+        let now = OffsetDateTime::now_utc();
+        if !headline_is_within_retention(&headline, now) {
+            tracing::warn!(
+                feed_id = %headline.feed_id,
+                publisher = %headline.publisher_login,
+                created_at = ?headline.created_at,
+                "stale network headline ignored"
+            );
+            return false;
+        }
         if let Some(feed) = feed_views_from_headlines(vec![headline.clone()])
             .into_iter()
             .next()
@@ -678,14 +699,15 @@ impl SnapshotStore {
         }
         let Ok(mut headlines) = self.headlines.lock() else {
             tracing::warn!("network snapshot headline store lock poisoned");
-            return;
+            return false;
         };
+        headlines.retain(|existing| headline_is_within_retention(existing, now));
         if headlines.iter().any(|existing| {
             existing.feed_id == headline.feed_id
                 && existing.headline == headline.headline
                 && existing.deck == headline.deck
         }) {
-            return;
+            return false;
         }
         headlines.push_back(headline);
         while headlines.len() > SNAPSHOT_HEADLINE_LIMIT {
@@ -697,15 +719,18 @@ impl SnapshotStore {
             .map(|feeds| feeds.iter().cloned().collect())
             .unwrap_or_default();
         self.persist_snapshot(feeds, headlines.iter().cloned().collect());
+        true
     }
 
     fn headlines(&self) -> Vec<RemoteHeadlineView> {
+        let now = OffsetDateTime::now_utc();
         self.headlines
             .lock()
             .map(|headlines| {
                 headlines
                     .iter()
                     .filter(|headline| public_headline_is_visible(headline))
+                    .filter(|headline| headline_is_within_retention(headline, now))
                     .cloned()
                     .collect()
             })
@@ -713,6 +738,7 @@ impl SnapshotStore {
     }
 
     fn feeds(&self) -> Vec<ResolveFeedView> {
+        let now = OffsetDateTime::now_utc();
         let mut feeds = self
             .feeds
             .lock()
@@ -720,6 +746,7 @@ impl SnapshotStore {
                 feeds
                     .iter()
                     .filter(|feed| public_feed_is_visible(feed))
+                    .filter(|feed| feed_is_within_retention(feed, now))
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -732,6 +759,15 @@ impl SnapshotStore {
         let Some(path) = &self.path else {
             return;
         };
+        let now = OffsetDateTime::now_utc();
+        let feeds = feeds
+            .into_iter()
+            .filter(|feed| feed_is_within_retention(feed, now))
+            .collect();
+        let headlines = headlines
+            .into_iter()
+            .filter(|headline| headline_is_within_retention(headline, now))
+            .collect();
         if let Some(parent) = path.parent()
             && let Err(err) = fs::create_dir_all(parent)
         {
@@ -752,6 +788,27 @@ impl SnapshotStore {
             }
         }
     }
+}
+
+fn prune_persisted_snapshot(snapshot: &mut PersistedSnapshot) {
+    let now = OffsetDateTime::now_utc();
+    snapshot
+        .feeds
+        .retain(|feed| feed_is_within_retention(feed, now));
+    snapshot
+        .headlines
+        .retain(|headline| headline_is_within_retention(headline, now));
+}
+
+fn headline_is_within_retention(headline: &RemoteHeadlineView, now: OffsetDateTime) -> bool {
+    headline
+        .created_at
+        .map(|created_at| now - created_at <= snapshot_headline_ttl())
+        .unwrap_or(true)
+}
+
+fn feed_is_within_retention(feed: &ResolveFeedView, now: OffsetDateTime) -> bool {
+    now - feed.last_seen_at <= snapshot_feed_ttl()
 }
 
 fn upsert_feed_view(feeds: &mut VecDeque<ResolveFeedView>, feed: ResolveFeedView) {
@@ -1401,8 +1458,9 @@ async fn network_publish_verified(
             score: capsule.value.score,
             image: capsule.value.image.clone(),
         };
-        state.snapshot.push(view);
-        accepted += 1;
+        if state.snapshot.push(view) {
+            accepted += 1;
+        }
     }
     tracing::info!(
         github_user_id = session.github_user_id,
@@ -2506,6 +2564,51 @@ mod tests {
             snapshot["feeds"][0]["publisher_login"],
             serde_json::json!("mosure")
         );
+    }
+
+    #[test]
+    fn network_snapshot_store_prunes_stale_headlines_and_feeds() {
+        let store = SnapshotStore::default();
+        let stale_time = OffsetDateTime::now_utc() - Duration::hours(2);
+        let stale_headline = RemoteHeadlineView {
+            feed_id: "github:123:workstation".to_string(),
+            feed_label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            created_at: Some(stale_time),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            verified: true,
+            headline: "old release pass loops forever".to_string(),
+            deck: "this stale story should not remain display material.".to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["verified".to_string()],
+            score: 84,
+            image: None,
+        };
+        let stale_feed = ResolveFeedView {
+            feed_id: "github:123:workstation".to_string(),
+            label: "workstation".to_string(),
+            visibility: "public".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            publisher_verified: true,
+            last_seen_at: stale_time,
+        };
+
+        assert!(!store.push(stale_headline));
+        store.upsert_feed(stale_feed);
+        let snapshot = network_snapshot_value(&config(), &store);
+
+        assert_eq!(
+            snapshot["headlines"].as_array().expect("headlines").len(),
+            0
+        );
+        assert_eq!(snapshot["feeds"].as_array().expect("feeds").len(), 0);
     }
 
     #[test]

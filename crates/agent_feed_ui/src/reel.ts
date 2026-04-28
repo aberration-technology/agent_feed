@@ -34,9 +34,13 @@ let activeStartedAt = 0;
 let activeDwellMs = 14000;
 
 const MAX_STAGE_BULLETINS = 12;
+const MAX_SEEN_BULLETINS = 512;
+const STAGE_HEADLINE_MAX_AGE_MS = 30 * 60 * 1000;
 const MIN_QUEUED_ADVANCE_MS = 2500;
 const LOCAL_SNAPSHOT_REFRESH_MS = 5000;
 const REMOTE_SNAPSHOT_REFRESH_MS = 5000;
+const SEEN_BULLETIN_STORAGE_KEY = "feed.seenBulletins.v1";
+const seenBulletinIds = loadSeenBulletinIds();
 
 const FEED_COMPATIBILITY = window.FEED_COMPATIBILITY || {};
 const FEED_PROTOCOL_VERSION = 1;
@@ -600,6 +604,75 @@ function queueIds() {
   return new Set(bulletins.map(bulletinId).filter(Boolean));
 }
 
+function loadSeenBulletinIds() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SEEN_BULLETIN_STORAGE_KEY) || "[]");
+    if (!Array.isArray(parsed)) {
+      return new Set();
+    }
+    return new Set(parsed.map(String).filter(Boolean).slice(-MAX_SEEN_BULLETINS));
+  } catch (error) {
+    logWarn("feed.seen.load_failed", error);
+    return new Set();
+  }
+}
+
+function persistSeenBulletinIds() {
+  try {
+    const ids = Array.from(seenBulletinIds).slice(-MAX_SEEN_BULLETINS);
+    window.localStorage.setItem(SEEN_BULLETIN_STORAGE_KEY, JSON.stringify(ids));
+  } catch (error) {
+    logWarn("feed.seen.persist_failed", error);
+  }
+}
+
+function markBulletinSeen(bulletin, source = "stage") {
+  const id = bulletinId(bulletin);
+  if (!id || seenBulletinIds.has(id)) {
+    return;
+  }
+  seenBulletinIds.add(id);
+  while (seenBulletinIds.size > MAX_SEEN_BULLETINS) {
+    const oldest = seenBulletinIds.values().next().value;
+    if (!oldest) {
+      break;
+    }
+    seenBulletinIds.delete(oldest);
+  }
+  persistSeenBulletinIds();
+  logDebug("feed.bulletin.seen", { source, bulletin_id: id, seen: seenBulletinIds.size });
+}
+
+function bulletinCreatedAtMs(bulletin) {
+  const value = bulletin?.created_at || bulletin?.createdAt || bulletin?.published_at || bulletin?.publishedAt;
+  if (!value) {
+    return Date.now();
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : Date.now();
+}
+
+function bulletinIsFreshForStage(bulletin) {
+  const ageMs = Date.now() - bulletinCreatedAtMs(bulletin);
+  return ageMs <= STAGE_HEADLINE_MAX_AGE_MS;
+}
+
+function stageCandidateBulletins(items, previousIds = new Set()) {
+  return uniqueBulletins(items)
+    .filter((item) => {
+      const id = bulletinId(item);
+      if (!id || previousIds.has(id)) {
+        return true;
+      }
+      if (seenBulletinIds.has(id)) {
+        return false;
+      }
+      return bulletinIsFreshForStage(item);
+    })
+    .slice()
+    .reverse();
+}
+
 function uniqueBulletins(items) {
   const seen = new Set();
   const output = [];
@@ -687,13 +760,55 @@ function showQueuedBulletin(bulletin, source, interrupted = false) {
   });
 }
 
+function renderQueueDrained(source) {
+  activeIndex = 0;
+  stopStageProgress();
+  clearStoryTime();
+  if (remoteRoute) {
+    renderRemoteState(remoteRoute, "waiting", [
+      "waiting for new settled stories",
+      "older stories stay in the timeline",
+    ]);
+  } else {
+    setText(liveState, "wait");
+    setText(eyebrow, "feed / waiting");
+    setText(headline, "waiting for new story");
+    setText(deck, "settled headlines will appear as fresh agent work completes.");
+    renderChips(["watching", "story-gated"]);
+    renderTicker([]);
+  }
+  logInfo("feed.bulletin.queue.drained", { source, seen: seenBulletinIds.size });
+}
+
+function completeActiveBulletin(source) {
+  const current = activeBulletin();
+  if (current) {
+    markBulletinSeen(current, source);
+    const currentId = bulletinId(current);
+    bulletins = bulletins.filter((item) => bulletinId(item) !== currentId);
+  }
+  if (!bulletins.length) {
+    renderQueueDrained(source);
+    return;
+  }
+  activeIndex = Math.min(activeIndex, bulletins.length - 1);
+  const next = activeBulletin();
+  renderBulletin(next);
+  scheduleNext(bulletinDwellMs(next));
+}
+
 function applyBulletinQueueUpdate(nextBulletins, source) {
   const previousActiveId = bulletinId(activeBulletin());
   const previousIds = queueIds();
-  const incoming = uniqueBulletins(nextBulletins);
+  const incoming = stageCandidateBulletins(nextBulletins, previousIds);
   const interrupt = latestInterruptBulletin(incoming, previousIds);
 
-  bulletins = trimBulletinQueue(incoming, previousActiveId);
+  const existing = bulletins.filter((item) => {
+    const id = bulletinId(item);
+    return !seenBulletinIds.has(id) && (id === previousActiveId || bulletinIsFreshForStage(item));
+  });
+  const additions = incoming.filter((item) => !previousIds.has(bulletinId(item)));
+  bulletins = trimBulletinQueue([...existing, ...additions], previousActiveId);
   if (interrupt && !bulletins.some((item) => bulletinId(item) === bulletinId(interrupt))) {
     bulletins = trimBulletinQueue([...bulletins, interrupt], previousActiveId);
   }
@@ -707,7 +822,7 @@ function applyBulletinQueueUpdate(nextBulletins, source) {
     ? bulletins.findIndex((item) => bulletinId(item) === previousActiveId)
     : -1;
   const preserved = preservedIndex >= 0;
-  activeIndex = preserved ? preservedIndex : bulletins.length - 1;
+  activeIndex = preserved ? preservedIndex : 0;
 
   if (interrupt) {
     showQueuedBulletin(interrupt, source, true);
@@ -724,7 +839,8 @@ function applyBulletinQueueUpdate(nextBulletins, source) {
     preserve_active: preserved,
     active_id: previousActiveId,
     queued: bulletins.length,
-    new_items: incoming.filter((item) => !previousIds.has(bulletinId(item))).length,
+    new_items: additions.length,
+    skipped_seen_or_stale: uniqueBulletins(nextBulletins).length - incoming.length,
   });
   return { active: activeBulletin(), rendered: false, preserved: true, interrupted: false };
 }
@@ -732,6 +848,14 @@ function applyBulletinQueueUpdate(nextBulletins, source) {
 function queueIncomingBulletin(bulletin, source) {
   if (!bulletin || !bulletinId(bulletin)) {
     logWarn("incoming bulletin missing id", bulletin);
+    return;
+  }
+  if (seenBulletinIds.has(bulletinId(bulletin))) {
+    logDebug("feed.bulletin.seen_ignored", { source, bulletin_id: bulletinId(bulletin) });
+    return;
+  }
+  if (!bulletinIsFreshForStage(bulletin)) {
+    logDebug("feed.bulletin.stale_ignored", { source, bulletin_id: bulletinId(bulletin) });
     return;
   }
   const previousActiveId = bulletinId(activeBulletin());
@@ -771,7 +895,7 @@ function queueIncomingBulletin(bulletin, source) {
 function scheduleNext(dwellMs) {
   window.clearTimeout(dwellTimer);
   dwellTimer = undefined;
-  if (bulletins.length <= 1) {
+  if (!bulletins.length) {
     stopStageProgress();
     return;
   }
@@ -779,13 +903,10 @@ function scheduleNext(dwellMs) {
   dwellTimer = window.setTimeout(() => {
     dwellTimer = undefined;
     if (bulletins.length <= 1) {
-      stopStageProgress();
+      completeActiveBulletin("dwell");
       return;
     }
-    activeIndex = (activeIndex + 1) % bulletins.length;
-    const next = bulletins[activeIndex];
-    renderBulletin(next);
-    scheduleNext(bulletinDwellMs(next));
+    completeActiveBulletin("dwell");
   }, duration);
 }
 

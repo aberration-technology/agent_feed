@@ -398,16 +398,24 @@ mod tests {
         let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("const MAX_STAGE_BULLETINS = 12;"));
+        assert!(html.contains("const MAX_SEEN_BULLETINS = 512;"));
+        assert!(html.contains("const STAGE_HEADLINE_MAX_AGE_MS = 30 * 60 * 1000;"));
+        assert!(html.contains("const SEEN_BULLETIN_STORAGE_KEY = \"feed.seenBulletins.v1\";"));
         assert!(html.contains("const MIN_QUEUED_ADVANCE_MS = 2500;"));
         assert!(html.contains("function applyBulletinQueueUpdate"));
         assert!(html.contains("function queueIncomingBulletin"));
+        assert!(html.contains("function completeActiveBulletin"));
+        assert!(html.contains("function markBulletinSeen"));
         assert!(html.contains("function shouldInterruptBulletin"));
         assert!(html.contains(
             "priority >= 95 || (priority >= 90 && [\"breaking\", \"incident\"].includes(mode))"
         ));
         assert!(html.contains("feed.bulletin.queued"));
         assert!(html.contains("feed.bulletin.queue.advance_scheduled"));
+        assert!(html.contains("feed.bulletin.queue.drained"));
+        assert!(html.contains("completeActiveBulletin(\"dwell\");"));
         assert!(html.contains("queueIncomingBulletin(bulletin, \"sse\");"));
+        assert!(!html.contains("activeIndex = (activeIndex + 1) % bulletins.length;"));
         assert!(
             !html.contains("activeIndex = bulletins.length - 1;\n      renderBulletin(bulletin);")
         );
