@@ -247,6 +247,7 @@ jobs:
           rm -rf "$validate_dir"
           mkdir -p "$validate_dir"
           cp -R "$TF_ROOT"/. "$validate_dir"/
+          rm -rf "$validate_dir/.terraform" "$validate_dir/terraform.tfstate" "$validate_dir/terraform.tfstate.backup"
           terraform -chdir="$validate_dir" init -backend=false -input=false
           terraform -chdir="$validate_dir" validate
 
