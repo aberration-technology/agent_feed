@@ -451,8 +451,6 @@ body.controls-visible .stage-actions,
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior-y: contain;
-  scroll-padding-block-start: var(--history-toolbar);
-  scroll-snap-type: y proximity;
   scrollbar-width: none;
   touch-action: pan-y;
   -webkit-overflow-scrolling: touch;
@@ -548,17 +546,17 @@ body.controls-visible .stage-actions,
 .timeline-card {
   min-width: 0;
   max-width: 100%;
-  min-height: calc(100% - var(--history-toolbar));
+  min-height: auto;
   display: flex;
   flex-direction: column;
   justify-content: center;
   gap: clamp(14px, 2.3vh, 26px);
   overflow: visible;
-  scroll-snap-align: start;
-  padding: var(--pad);
-  contain: layout paint;
-  content-visibility: auto;
-  contain-intrinsic-size: 760px;
+  padding: clamp(40px, 8vh, 96px) var(--pad);
+}
+
+.timeline-card + .timeline-card {
+  border-top: 1px solid var(--line);
 }
 
 .timeline-card:focus-visible {
@@ -816,9 +814,9 @@ body[data-mode="breaking"] .chips span {
   }
 
   .timeline-card {
-    min-height: calc(100% - var(--history-toolbar));
+    min-height: auto;
     gap: 14px;
-    padding: var(--pad);
+    padding: 34px var(--pad);
   }
 
   .timeline-card h2,

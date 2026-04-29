@@ -217,25 +217,28 @@ mod tests {
     }
 
     #[test]
-    fn history_uses_browsing_scale_and_native_scroll() {
+    fn history_uses_browsing_scale_and_continuous_scroll() {
         let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("--history-headline: clamp(30px, 4.7vw, 72px);"));
         assert!(html.contains("--history-headline-leading: 1.18;"));
         assert!(html.contains("--history-deck: clamp(17px, 2vw, 28px);"));
         assert!(html.contains("--history-deck-leading: 1.32;"));
-        assert!(html.contains("scroll-snap-type: y proximity;"));
         assert!(html.contains("overscroll-behavior-y: contain;"));
         assert!(html.contains("-webkit-overflow-scrolling: touch;"));
         assert!(html.contains("scroll-behavior: auto;"));
-        assert!(html.contains("min-height: calc(100% - var(--history-toolbar));"));
+        assert!(html.contains("min-height: auto;"));
+        assert!(html.contains("padding: clamp(40px, 8vh, 96px) var(--pad);"));
+        assert!(html.contains(".timeline-card + .timeline-card"));
         assert!(html.contains("font-size: var(--history-headline);"));
         assert!(html.contains("line-height: var(--history-headline-leading);"));
         assert!(html.contains("font-size: var(--history-deck);"));
         assert!(html.contains("line-height: var(--history-deck-leading);"));
         assert!(!html.contains(".timeline-card h2 {\n  width: 100%;\n  min-width: 0;\n  max-width: min(100%, 28ch);\n  margin: 0;\n  color: var(--fg);\n  font-size: var(--headline);"));
-        assert!(!html.contains("scroll-snap-type: y mandatory;"));
-        assert!(!html.contains("scroll-snap-stop: always;"));
+        assert!(!html.contains("scroll-snap-type"));
+        assert!(!html.contains("scroll-snap-align"));
+        assert!(!html.contains("scroll-snap-stop"));
+        assert!(!html.contains("content-visibility: auto;"));
     }
 
     #[test]
