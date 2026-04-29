@@ -14,9 +14,13 @@
   --mono: ui-monospace, monospace;
   --pad: clamp(28px, 4vw, 72px);
   --headline: clamp(56px, 7.5vw, 128px);
-  --headline-leading: 1.04;
+  --headline-leading: 1.08;
   --deck: clamp(24px, 2.7vw, 44px);
+  --deck-leading: 1.16;
   --label: clamp(11px, 1vw, 15px);
+  --stage-gap: clamp(18px, 3vh, 34px);
+  --headline-max: min(100%, 28ch);
+  --deck-max: min(100%, 38ch);
 }
 
 * {
@@ -35,9 +39,13 @@ body {
 }
 
 .reel {
+  height: 100vh;
+  height: 100dvh;
   min-height: 100vh;
+  max-height: 100vh;
   display: grid;
-  grid-template-rows: minmax(56px, 8vh) 1fr minmax(48px, 8vh);
+  grid-template-rows: minmax(56px, 8vh) minmax(0, 1fr) minmax(48px, 8vh);
+  overflow: hidden;
   background:
     linear-gradient(90deg, transparent 0, transparent calc(100% - 1px), rgba(255, 255, 255, 0.06) 100%) 0 0 / 50% 100%,
     var(--bg);
@@ -132,8 +140,10 @@ body.controls-visible .mode-switcher,
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: clamp(18px, 3vh, 34px);
-  padding: var(--pad);
+  gap: var(--stage-gap-fit, var(--stage-gap));
+  min-height: 0;
+  overflow: hidden;
+  padding: var(--stage-pad-fit, var(--pad));
   opacity: 1;
   transition: opacity 180ms ease;
 }
@@ -212,7 +222,7 @@ body.controls-visible .mode-switcher,
   font-size: var(--label);
   letter-spacing: 0;
   line-height: 1.35;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .publisher {
@@ -263,27 +273,32 @@ body.controls-visible .mode-switcher,
 }
 
 h1 {
-  max-width: 14ch;
+  width: 100%;
+  min-width: 0;
+  max-width: var(--headline-max-fit, var(--headline-max));
   margin: 0;
   color: var(--fg);
-  font-size: var(--headline);
+  font-size: var(--headline-fit, var(--headline));
   font-weight: 620;
   letter-spacing: 0;
   line-height: var(--headline-leading);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   text-wrap: balance;
+  word-break: normal;
 }
 
 .deck {
   width: 100%;
-  max-width: 38ch;
+  max-width: var(--deck-max-fit, var(--deck-max));
   min-width: 0;
   margin: 0;
   color: var(--fg);
-  font-size: var(--deck);
+  font-size: var(--deck-fit, var(--deck));
   font-weight: 360;
-  line-height: 1.12;
-  overflow-wrap: anywhere;
+  line-height: var(--deck-leading);
+  overflow-wrap: break-word;
+  text-wrap: pretty;
+  word-break: normal;
 }
 
 .headline-image {
@@ -525,6 +540,7 @@ body.controls-visible .stage-actions,
   flex-direction: column;
   justify-content: center;
   gap: clamp(18px, 3vh, 34px);
+  overflow: hidden;
   scroll-snap-align: start;
   scroll-snap-stop: always;
   padding: var(--pad);
@@ -538,15 +554,16 @@ body.controls-visible .stage-actions,
 .timeline-card h2 {
   width: 100%;
   min-width: 0;
-  max-width: 14ch;
+  max-width: min(100%, 28ch);
   margin: 0;
   color: var(--fg);
   font-size: var(--headline);
   font-weight: 620;
   letter-spacing: 0;
   line-height: var(--headline-leading);
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   text-wrap: balance;
+  word-break: normal;
 }
 
 .timeline-meta {
@@ -564,8 +581,10 @@ body.controls-visible .stage-actions,
   color: var(--fg);
   font-size: var(--deck);
   font-weight: 360;
-  line-height: 1.12;
+  line-height: var(--deck-leading);
   overflow-wrap: anywhere;
+  text-wrap: pretty;
+  word-break: normal;
 }
 
 .timeline-card .publisher {
@@ -661,8 +680,11 @@ body[data-mode="breaking"] .chips span {
 
 @media (max-width: 720px) {
   :root {
-    --headline: 52px;
-    --deck: 22px;
+    --pad: 28px;
+    --headline: 28px;
+    --headline-leading: 1.22;
+    --deck: 16px;
+    --deck-leading: 1.26;
   }
 
   .reel {
@@ -703,8 +725,30 @@ body[data-mode="breaking"] .chips span {
     display: none;
   }
 
+  .stage {
+    --stage-gap: 16px;
+    --headline-max: 100%;
+    --deck-max: 100%;
+    justify-content: center;
+    padding: var(--stage-pad-fit, var(--pad));
+  }
+
+  .eyebrow,
+  .publisher,
+  .chips,
+  .stage-actions,
+  .story-time {
+    flex-shrink: 0;
+  }
+
   h1 {
     max-width: 100%;
+    display: block;
+    max-height: none;
+    overflow: visible;
+    overflow-wrap: break-word;
+    text-wrap: wrap;
+    white-space: normal;
   }
 
   .headline-image {
@@ -728,13 +772,33 @@ body[data-mode="breaking"] .chips span {
 
   .timeline-card {
     min-height: calc(100vh - 116px - 56px);
-    padding: 28px;
+    gap: 16px;
+    padding: var(--pad);
   }
 
   .timeline-card h2,
   .timeline-card p,
   .deck {
     max-width: 100%;
+  }
+
+  .timeline-card h2,
+  .deck,
+  .timeline-card p {
+    display: block;
+    overflow: visible;
+    overflow-wrap: break-word;
+    text-wrap: wrap;
+    white-space: normal;
+  }
+
+  .timeline-card h2 {
+    max-height: none;
+  }
+
+  .deck,
+  .timeline-card p {
+    max-height: none;
   }
 
   .timeline-status {

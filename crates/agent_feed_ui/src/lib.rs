@@ -162,10 +162,86 @@ mod tests {
     fn headline_typography_keeps_safe_line_spacing() {
         let html = render_index_with_config(Some("stage"), &config(false));
 
-        assert!(html.contains("--headline-leading: 1.04;"));
+        assert!(html.contains("--headline-leading: 1.08;"));
+        assert!(html.contains("--deck-leading: 1.16;"));
+        assert!(html.contains("h1 {\n  width: 100%;\n  min-width: 0;"));
+        assert!(html.contains("--headline-max: min(100%, 28ch);"));
+        assert!(html.contains("max-width: var(--headline-max-fit, var(--headline-max));"));
+        assert!(html.contains("max-width: var(--deck-max-fit, var(--deck-max));"));
+        assert!(html.contains("font-size: var(--headline-fit, var(--headline));"));
+        assert!(html.contains("font-size: var(--deck-fit, var(--deck));"));
         assert!(html.contains("line-height: var(--headline-leading);"));
+        assert!(html.contains("line-height: var(--deck-leading);"));
         assert!(html.contains("text-wrap: balance;"));
+        assert!(html.contains("text-wrap: pretty;"));
+        assert!(html.contains("overflow-wrap: break-word;"));
+        assert!(html.contains("word-break: normal;"));
+        assert!(!html.contains("h1 {\n  max-width: 14ch;\n  margin: 0;\n  color: var(--fg);\n  font-size: var(--headline);\n  font-weight: 620;\n  letter-spacing: 0;\n  line-height: var(--headline-leading);\n  overflow-wrap: anywhere;"));
         assert!(!html.contains("line-height: 0.94;"));
+    }
+
+    #[test]
+    fn mobile_headlines_keep_room_for_large_text_blobs() {
+        let html = render_index_with_config(Some("stage"), &config(false));
+
+        let mobile = html
+            .split("@media (max-width: 720px)")
+            .nth(1)
+            .expect("mobile breakpoint is embedded");
+
+        assert!(mobile.contains("--headline: 28px;"));
+        assert!(mobile.contains("--headline-leading: 1.22;"));
+        assert!(mobile.contains("--deck: 16px;"));
+        assert!(mobile.contains("--deck-leading: 1.26;"));
+        assert!(mobile.contains("--headline-max: 100%;"));
+        assert!(mobile.contains("--deck-max: 100%;"));
+        assert!(mobile.contains("display: block;"));
+        assert!(mobile.contains("max-height: none;"));
+        assert!(mobile.contains("overflow: visible;"));
+        assert!(mobile.contains("overflow-wrap: break-word;"));
+        assert!(mobile.contains("text-wrap: wrap;"));
+        assert!(mobile.contains("white-space: normal;"));
+        assert!(!mobile.contains("-webkit-line-clamp"));
+        assert!(!mobile.contains("-webkit-box-orient"));
+        assert!(mobile.contains(".stage {\n    --stage-gap: 16px;"));
+        assert!(mobile.contains("padding: var(--stage-pad-fit, var(--pad));"));
+    }
+
+    #[test]
+    fn stage_typography_fits_overflowing_desktop_headlines() {
+        let html = render_index_with_config(Some("stage"), &config(false));
+
+        assert!(html.contains("let stageFitFrame = undefined;"));
+        assert!(html.contains("function scheduleStageFit()"));
+        assert!(html.contains("function fitStageTypography()"));
+        assert!(html.contains("function stageOverflows()"));
+        assert!(html.contains("const STAGE_FIT_VARIABLES = ["));
+        assert!(html.contains("function clearStageFit()"));
+        assert!(html.contains("height: 100dvh;"));
+        assert!(
+            html.contains(
+                "grid-template-rows: minmax(56px, 8vh) minmax(0, 1fr) minmax(48px, 8vh);"
+            )
+        );
+        assert!(html.contains(".reel {\n  height: 100vh;"));
+        assert!(html.contains("overflow: hidden;"));
+        assert!(html.contains("stage.scrollHeight > stage.clientHeight + 1"));
+        assert!(html.contains("headline.scrollWidth > headline.clientWidth + 1"));
+        assert!(html.contains("headline.scrollHeight > headline.clientHeight + 1"));
+        assert!(html.contains("deck.scrollHeight > deck.clientHeight + 1"));
+        assert!(html.contains("stage.style.setProperty(\"--headline-fit\""));
+        assert!(html.contains("stage.style.setProperty(\"--deck-fit\""));
+        assert!(html.contains("stage.style.setProperty(\"--stage-gap-fit\""));
+        assert!(html.contains("stage.style.setProperty(\"--stage-pad-fit\""));
+        assert!(html.contains("stage.style.setProperty(\"--headline-max-fit\""));
+        assert!(html.contains("function stageMinHeadlinePx()"));
+        assert!(
+            html.contains("return window.matchMedia(\"(max-width: 720px)\").matches ? 16 : 24;")
+        );
+        assert!(html.contains("function stageMinGapPx()"));
+        assert!(html.contains("function stageMinPadPx()"));
+        assert!(html.contains("headlineImageImg.onload = scheduleStageFit;"));
+        assert!(html.contains("window.addEventListener(\"resize\", scheduleStageFit);"));
     }
 
     #[test]
