@@ -288,8 +288,17 @@ pub mod codex {
             let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) else {
                 return;
             };
+            let project = project_from_cwd(cwd);
+            if project.as_deref().is_some_and(is_generic_root_project)
+                && self
+                    .active_project
+                    .as_deref()
+                    .is_some_and(|project| !is_generic_root_project(project))
+            {
+                return;
+            }
             self.active_cwd = Some(cwd.to_string());
-            self.active_project = project_from_cwd(cwd);
+            self.active_project = project;
         }
 
         fn reset_turn_work_context(&mut self) {
@@ -1976,6 +1985,37 @@ mod tests {
         let summary = message.summary.as_deref().expect("summary present");
         assert!(summary.starts_with("burn_p2p` Release Readiness is green"));
         assert!(summary.contains("burn_dragon"));
+    }
+
+    #[test]
+    fn codex_root_workspace_polling_keeps_last_concrete_project_context() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos","turn_id":"turn_1"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:00.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":{"cmd":"gh run view 25086337252 --repo aberration-technology/burn_dragon","workdir":"/home/mosure/repos/burn_dragon"}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:17:04.000Z","payload":{"type":"exec_command_end","call_id":"call_1","turn_id":"turn_1","status":"completed","exit_code":0,"duration":"4s","command":["gh","run","view"],"cwd":"/home/mosure/repos/burn_dragon"}}
+{"type":"response_item","timestamp":"2026-04-24T03:17:08.000Z","payload":{"type":"function_call","name":"exec_command","call_id":"call_2","arguments":{"cmd":"sleep 300","workdir":"/home/mosure/repos"}}}
+{"type":"event_msg","timestamp":"2026-04-24T03:22:08.000Z","payload":{"type":"exec_command_end","call_id":"call_2","turn_id":"turn_1","status":"completed","exit_code":0,"duration":"300s","command":["sleep","300"],"cwd":"/home/mosure/repos"}}
+{"type":"event_msg","timestamp":"2026-04-24T03:22:12.000Z","payload":{"type":"agent_message","message":"The deploy has moved past binary builds and is now in terraform apply."}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+        let message = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::AgentMessage
+                    && event
+                        .summary
+                        .as_deref()
+                        .is_some_and(|summary| summary.contains("terraform apply"))
+            })
+            .expect("agent message event");
+
+        assert_eq!(message.project.as_deref(), Some("burn_dragon"));
+        assert_eq!(
+            message.cwd.as_deref(),
+            Some("/home/mosure/repos/burn_dragon")
+        );
     }
 
     #[test]

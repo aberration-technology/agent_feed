@@ -319,13 +319,21 @@ mod tests {
         let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("function startFollowingRoute"));
-        assert!(html.contains("window.localStorage.getItem(\"feed.following\")"));
+        assert!(html.contains("const FOLLOWING_STORAGE_KEY_V2 = \"feed.following.v2\";"));
+        assert!(html.contains("function storedFollowEntries"));
+        assert!(html.contains("function normalizeFollowEntry"));
+        assert!(html.contains("window.localStorage.getItem(FOLLOWING_STORAGE_KEY_V2)"));
+        assert!(html.contains("window.localStorage.setItem(FOLLOWING_STORAGE_KEY_V2"));
         assert!(html.contains("window.localStorage.setItem(\"feed.following\""));
         assert!(html.contains("function fetchFollowingTarget"));
+        assert!(html.contains("function fetchFollowingTagTargets"));
+        assert!(html.contains("function headlineMatchesFollowTarget"));
         assert!(html.contains("function renderFollowingTimeline"));
         assert!(html.contains("function toolbarFollowButton"));
-        assert!(html.contains("inactive: wildcard ? \"follow all\" : \"follow feed\""));
+        assert!(html.contains("inactive: wildcard ? `follow @${route.login}` : \"follow feed\""));
         assert!(html.contains("button.dataset.kind = \"follow\";"));
+        assert!(html.contains("button.dataset.followTarget = normalizeFollowTarget(target);"));
+        assert!(html.contains("function refreshAfterFollowingChange"));
         assert!(html.contains("const follow = toolbarFollowButton(route);"));
         assert!(html.contains("feed.following.target.directory_fallback"));
         assert!(html.contains("copyReelFilterParams(route, params);"));
@@ -339,9 +347,11 @@ mod tests {
 
         assert!(html.contains("function projectFilterLink"));
         assert!(html.contains("function projectFilterUrl"));
+        assert!(html.contains("function tagFollowButton"));
         assert!(html.contains("params.set(\"projects\", project);"));
         assert!(html.contains("filter timeline to project ${project}"));
         assert!(html.contains("actions.appendChild(projectFilterLink(project, route));"));
+        assert!(html.contains("actions.appendChild(tagFollowButton(project));"));
     }
 
     #[test]
@@ -351,10 +361,11 @@ mod tests {
         assert!(html.contains("id=\"stage-actions\" hidden"));
         assert!(html.contains("function renderStageActions"));
         assert!(html.contains("function followTargetForBulletin"));
-        assert!(html.contains("stageActions.appendChild(followButton(target));"));
+        assert!(html.contains("function personFollowTargetForBulletin"));
+        assert!(html.contains("followButton(personTarget"));
         assert!(html.contains("following.textContent = \"open following\";"));
         assert!(html.contains("body.controls-visible .stage-actions"));
-        assert!(html.contains("button.setAttribute(\"aria-label\", `${active ? \"unfollow\" : \"follow\"} ${target}`);"));
+        assert!(html.contains("button.setAttribute(\"aria-label\", `${active ? \"unfollow\" : \"follow\"} ${followTargetLabel(target)}`);"));
         assert!(!html.contains("activity is reduced before display"));
     }
 
@@ -368,11 +379,12 @@ mod tests {
             "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : \"feeds\";"
         ));
         assert!(html.contains("params.set(\"all\", \"true\");"));
+        assert!(!html.contains("params.set(\"following\", route.followingTargets.join(\",\"));"));
         assert!(
             html.contains("[\"discovery\", \"discover\", \"hero\", \"public\"].includes(explicit)")
         );
         assert!(html.contains("hosted feed pages do not link to loopback reels"));
-        assert!(html.contains("modeFollowing.textContent = \"following\";"));
+        assert!(html.contains("modeFollowing.textContent = route.kind === \"user\" ? `following @${route.login}` : \"following\";"));
         assert!(html.contains("timelineModeLink(route, \"following\", \"following\""));
         assert!(html.contains("return `${login}/*`;"));
         assert!(html.contains("link.dataset.kind = \"mode\";"));
@@ -382,6 +394,27 @@ mod tests {
         assert!(html.contains("/network/snapshot${directoryFallbackQuery(route)}"));
         assert!(html.contains(".timeline-feeds a[data-kind=\"mode\"]"));
         assert!(html.contains(".timeline-feeds .feed-action[data-kind=\"follow\"]"));
+    }
+
+    #[test]
+    fn following_is_person_first_with_feed_and_tag_refinements() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("return feed === \"*\""));
+        assert!(html.contains("return `${clean.login}/*`;"));
+        assert!(html.contains("return `${clean.login}/${clean.feed}`;"));
+        assert!(html.contains("return tag ? { kind: \"tag\""));
+        assert!(html.contains("return feed === \"*\" ? `@${login}` : `@${login}/${feed}`;"));
+        assert!(html.contains(
+            "const streamTargets = targets.filter((target) => !isTagFollowTarget(target));"
+        ));
+        assert!(html.contains("const tagTargets = targets.filter(isTagFollowTarget);"));
+        assert!(html.contains("followTargetMatchesLogin(target, login)"));
+        assert!(html.contains("followButton(personTarget"));
+        assert!(html.contains("followButton(target, {\n        inactive: \"follow feed\""));
+        assert!(html.contains("privateFeedPill(visibility)"));
+        assert!(!html.contains("request access"));
+        assert!(!html.contains("access pending"));
     }
 
     #[test]

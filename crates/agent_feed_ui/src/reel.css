@@ -621,6 +621,17 @@ body.controls-visible .stage-actions,
   color: var(--secondary);
 }
 
+.feed-action-muted {
+  cursor: default;
+  color: color-mix(in srgb, var(--muted), transparent 18%);
+}
+
+.feed-action-muted:hover,
+.feed-action-muted:focus-visible {
+  border-color: var(--line);
+  color: color-mix(in srgb, var(--muted), transparent 18%);
+}
+
 .timeline-empty h2 {
   color: var(--muted);
 }

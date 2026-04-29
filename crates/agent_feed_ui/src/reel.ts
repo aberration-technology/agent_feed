@@ -41,6 +41,12 @@ const MIN_QUEUED_ADVANCE_MS = 2500;
 const LOCAL_SNAPSHOT_REFRESH_MS = 5000;
 const REMOTE_SNAPSHOT_REFRESH_MS = 5000;
 const SEEN_BULLETIN_STORAGE_KEY = "feed.seenBulletins.v1";
+const FOLLOWING_STORAGE_KEY_V2 = "feed.following.v2";
+const FOLLOWING_LEGACY_STORAGE_KEYS = [
+  "feed.following",
+  "feed.subscriptions",
+  "agent_feed.subscriptions",
+];
 const seenBulletinIds = loadSeenBulletinIds();
 
 const FEED_COMPATIBILITY = window.FEED_COMPATIBILITY || {};
@@ -172,17 +178,33 @@ function renderStageActions(bulletin) {
     return;
   }
   stageActions.replaceChildren();
-  const target = followTargetForBulletin(bulletin);
-  if (!target || !p2pEnabled()) {
+  const personTarget = personFollowTargetForBulletin(bulletin);
+  const feedTarget = followTargetForBulletin(bulletin);
+  if ((!personTarget && !feedTarget) || !p2pEnabled()) {
     stageActions.hidden = true;
     return;
   }
-  stageActions.appendChild(followButton(target));
+  if (personTarget) {
+    stageActions.appendChild(
+      followButton(personTarget, {
+        inactive: `follow ${followTargetLabel(personTarget)}`,
+        active: `following ${followTargetLabel(personTarget)}`,
+      }),
+    );
+  }
+  if (feedTarget && feedTarget !== personTarget) {
+    stageActions.appendChild(
+      followButton(feedTarget, {
+        inactive: "follow feed",
+        active: "following feed",
+      }),
+    );
+  }
   const following = document.createElement("a");
   following.className = "feed-action";
-  following.href = followingTargetUrl(target);
+  following.href = followingTargetUrl(personTarget || feedTarget);
   following.textContent = "open following";
-  following.setAttribute("aria-label", `open followed feed ${target}`);
+  following.setAttribute("aria-label", `open followed feed ${followTargetLabel(personTarget || feedTarget)}`);
   stageActions.appendChild(following);
   stageActions.hidden = false;
 }
@@ -1190,33 +1212,40 @@ function routeFollowingTargets(login, params) {
     .split(",")
     .map((target) => target.trim())
     .filter(Boolean)
-    .filter(isSafeSubscriptionTarget);
+    .filter(isSafeFollowTarget);
   if (explicit.length) {
     return dedupeTargets(explicit.map(normalizeFollowTarget).filter(Boolean));
   }
-  const stored = storedFollowingTargets().filter(isSafeSubscriptionTarget);
+  const stored = storedFollowingTargets().filter(isSafeFollowTarget);
   if (!login) {
     return stored;
   }
-  return stored.filter((target) => target.replace(/^@/, "").split("/")[0] === login);
+  return stored.filter((target) => followTargetMatchesLogin(target, login));
 }
 
 function storedFollowingTargets() {
+  return storedFollowEntries().map(followEntryToTarget).filter(Boolean);
+}
+
+function storedFollowEntries() {
   try {
-    const raw =
-      window.localStorage.getItem("feed.following") ||
-      window.localStorage.getItem("feed.subscriptions") ||
-      window.localStorage.getItem("agent_feed.subscriptions") ||
-      "";
-    if (!raw) {
-      return [];
+    const rawV2 = window.localStorage.getItem(FOLLOWING_STORAGE_KEY_V2) || "";
+    if (rawV2) {
+      const entries = parseFollowEntries(rawV2);
+      if (entries.length) {
+        return entries;
+      }
     }
-    const value = JSON.parse(raw);
-    if (Array.isArray(value)) {
-      return dedupeTargets(value.map(String).map(normalizeFollowTarget).filter(Boolean));
-    }
-    if (typeof value === "string") {
-      return dedupeTargets(value.split(",").map(normalizeFollowTarget).filter(Boolean));
+    for (const key of FOLLOWING_LEGACY_STORAGE_KEYS) {
+      const raw = window.localStorage.getItem(key) || "";
+      if (!raw) {
+        continue;
+      }
+      const entries = parseFollowEntries(raw);
+      if (entries.length) {
+        saveFollowEntries(entries);
+        return entries;
+      }
     }
   } catch (error) {
     logError("following list read failed", error);
@@ -1224,9 +1253,108 @@ function storedFollowingTargets() {
   return [];
 }
 
+function parseFollowEntries(raw) {
+  try {
+    const value = JSON.parse(raw);
+    if (Array.isArray(value)) {
+      return dedupeFollowEntries(value.map(normalizeFollowEntry).filter(Boolean));
+    }
+    if (typeof value === "string") {
+      return parseFollowEntriesFromCsv(value);
+    }
+  } catch (_error) {
+    return parseFollowEntriesFromCsv(raw);
+  }
+  return [];
+}
+
+function parseFollowEntriesFromCsv(value) {
+  return dedupeFollowEntries(
+    String(value || "")
+      .split(",")
+      .map((target) => normalizeFollowEntry(target.trim()))
+      .filter(Boolean),
+  );
+}
+
+function normalizeFollowEntry(value) {
+  if (typeof value === "string") {
+    return followEntryFromTarget(normalizeFollowTarget(value));
+  }
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const kind = String(value.kind || "").toLowerCase();
+  if (kind === "tag") {
+    const tag = normalizeTag(value.tag || value.value || value.target || "");
+    return tag ? { kind: "tag", tag, created_at: value.created_at || value.createdAt || new Date().toISOString() } : undefined;
+  }
+  const login = normalizeGithubLogin(value.login || value.github_login || value.githubLogin || "");
+  if (!login) {
+    return undefined;
+  }
+  const feed = normalizeFeedFollowLabel(value.feed || value.feed_label || value.feedLabel || value.stream || "*");
+  if (kind === "person" || feed === "*") {
+    return { kind: "person", login, created_at: value.created_at || value.createdAt || new Date().toISOString() };
+  }
+  return { kind: "feed", login, feed, created_at: value.created_at || value.createdAt || new Date().toISOString() };
+}
+
+function followEntryFromTarget(target) {
+  if (!target) {
+    return undefined;
+  }
+  if (isTagFollowTarget(target)) {
+    return { kind: "tag", tag: normalizeTag(target), created_at: new Date().toISOString() };
+  }
+  const [login, feed = "*"] = target.split("/");
+  if (!login) {
+    return undefined;
+  }
+  return feed === "*"
+    ? { kind: "person", login, created_at: new Date().toISOString() }
+    : { kind: "feed", login, feed, created_at: new Date().toISOString() };
+}
+
+function followEntryToTarget(entry) {
+  const clean = normalizeFollowEntry(entry);
+  if (!clean) {
+    return "";
+  }
+  if (clean.kind === "tag") {
+    return `#${clean.tag}`;
+  }
+  if (clean.kind === "person") {
+    return `${clean.login}/*`;
+  }
+  return `${clean.login}/${clean.feed}`;
+}
+
+function dedupeFollowEntries(entries) {
+  const seen = new Set();
+  const output = [];
+  for (const entry of entries || []) {
+    const clean = normalizeFollowEntry(entry);
+    const key = followEntryToTarget(clean);
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(clean);
+  }
+  return output;
+}
+
 function saveFollowingTargets(targets) {
-  const clean = dedupeTargets(targets.map(normalizeFollowTarget).filter(Boolean));
-  window.localStorage.setItem("feed.following", JSON.stringify(clean));
+  const clean = dedupeFollowEntries(targets.map((target) => followEntryFromTarget(normalizeFollowTarget(target))).filter(Boolean));
+  return saveFollowEntries(clean).map(followEntryToTarget).filter(Boolean);
+}
+
+function saveFollowEntries(entries) {
+  const clean = dedupeFollowEntries(entries);
+  const targets = clean.map(followEntryToTarget).filter(Boolean);
+  window.localStorage.setItem(FOLLOWING_STORAGE_KEY_V2, JSON.stringify(clean));
+  window.localStorage.setItem("feed.following", JSON.stringify(targets));
   logInfo("feed.following.saved", { targets: clean });
   return clean;
 }
@@ -1236,12 +1364,19 @@ function dedupeTargets(targets) {
 }
 
 function normalizeFollowTarget(value) {
-  const clean = String(value || "").trim().replace(/^@/, "");
-  if (!isSafeSubscriptionTarget(clean)) {
+  const raw = String(value || "").trim();
+  if (raw.startsWith("#")) {
+    const tag = normalizeTag(raw);
+    return tag ? `#${tag}` : "";
+  }
+  const clean = raw.replace(/^@/, "");
+  if (!isSafeFollowTarget(clean)) {
     return "";
   }
   const [login, feed = "*"] = clean.split("/");
-  return `${login}/${feed || "*"}`;
+  const normalizedLogin = normalizeGithubLogin(login);
+  const normalizedFeed = normalizeFeedFollowLabel(feed || "*");
+  return normalizedLogin && normalizedFeed ? `${normalizedLogin}/${normalizedFeed}` : "";
 }
 
 function isFollowingTarget(target) {
@@ -1265,9 +1400,56 @@ function toggleFollowTarget(target) {
 }
 
 function isSafeSubscriptionTarget(value) {
+  return isSafeFollowTarget(value);
+}
+
+function isSafeFollowTarget(value) {
+  const clean = String(value || "").trim();
+  if (clean.startsWith("#")) {
+    return /^#[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(clean);
+  }
   return /^@?[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\/(?:\*|[A-Za-z0-9][A-Za-z0-9_.-]{0,63}))?$/.test(
     value,
   );
+}
+
+function isTagFollowTarget(target) {
+  return String(target || "").trim().startsWith("#");
+}
+
+function normalizeGithubLogin(value) {
+  const clean = String(value || "").trim().replace(/^@/, "");
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(clean)) {
+    return "";
+  }
+  return clean;
+}
+
+function normalizeFeedFollowLabel(value) {
+  const clean = String(value || "").trim() || "*";
+  if (clean === "*") {
+    return "*";
+  }
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(clean) ? clean : "";
+}
+
+function followTargetMatchesLogin(target, login) {
+  if (isTagFollowTarget(target)) {
+    return false;
+  }
+  return normalizeRouteLogin(target.split("/")[0]) === normalizeRouteLogin(login);
+}
+
+function followTargetLabel(target) {
+  const clean = normalizeFollowTarget(target);
+  if (!clean) {
+    return "feed";
+  }
+  if (isTagFollowTarget(clean)) {
+    return clean;
+  }
+  const [login, feed = "*"] = clean.split("/");
+  return feed === "*" ? `@${login}` : `@${login}/${feed}`;
 }
 
 function decodeFeedSegment(segment) {
@@ -1320,7 +1502,7 @@ function setupModeSwitcher(route) {
     return;
   }
   modeDiscovery.textContent = route.kind === "global" ? "discover" : "feeds";
-  modeFollowing.textContent = "following";
+  modeFollowing.textContent = route.kind === "user" ? `following @${route.login}` : "following";
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
   modeFollowing.setAttribute("href", modeUrl(route, "following"));
   modeDiscovery.toggleAttribute(
@@ -1361,9 +1543,6 @@ function modeUrl(route, mode) {
   params.set("feed_mode", mode);
   if (route.network && route.network !== "mainnet") {
     params.set("network", route.network);
-  }
-  if (mode === "following" && !params.has("following") && route.followingTargets.length) {
-    params.set("following", route.followingTargets.join(","));
   }
   if (mode === "discovery") {
     params.delete("subscriptions");
@@ -2014,6 +2193,8 @@ function networkCompatibilityStatus(route, payload) {
 
 async function startFollowingRoute(route, refresh = false) {
   const targets = route.followingTargets.map(normalizeFollowTarget).filter(Boolean);
+  const streamTargets = targets.filter((target) => !isTagFollowTarget(target));
+  const tagTargets = targets.filter(isTagFollowTarget);
   logInfo("feed.following.selected", {
     network: route.network,
     targets,
@@ -2027,16 +2208,18 @@ async function startFollowingRoute(route, refresh = false) {
 
   if (!refresh) {
     renderRemoteState(route, "resolving", [
-      `checking ${targets.length} followed ${targets.length === 1 ? "feed" : "feeds"}`,
+      `checking ${followTargetCountLabel(targets.length)}`,
       "requesting accessible story snapshots",
       "showing settled story streams",
     ]);
   }
-  const results = await Promise.all(targets.map((target) => fetchFollowingTarget(route, target)));
+  const results = [
+    ...(await Promise.all(streamTargets.map((target) => fetchFollowingTarget(route, target)))),
+    ...(await fetchFollowingTagTargets(route, tagTargets)),
+  ];
   const tickets = results.filter((result) => result.ticket).map((result) => result.ticket);
-  const headlines = results
-    .flatMap((result) => result.headlines)
-    .sort((a, b) => Date.parse(a.created_at || a.createdAt || 0) - Date.parse(b.created_at || b.createdAt || 0));
+  const headlines = dedupeHeadlines(results.flatMap((result) => result.headlines))
+    .sort((a, b) => Date.parse(b.created_at || b.createdAt || 0) - Date.parse(a.created_at || a.createdAt || 0));
   const feeds = tickets.flatMap(ticketFeeds);
   logInfo("feed.following.snapshot", {
     targets: targets.length,
@@ -2051,15 +2234,66 @@ async function startFollowingRoute(route, refresh = false) {
     return;
   }
   if (headlines.length) {
+    remoteFeedCount = targets.length;
     applyRemoteHeadlines(route, headlines);
     return;
   }
   renderRemoteState(route, "waiting", [
-    `following ${targets.length} ${targets.length === 1 ? "feed" : "feeds"}`,
+    `following ${followTargetCountLabel(targets.length)}`,
     "connected · waiting for first story",
     "move mouse for controls",
   ]);
   setText(sourceCount, `${targets.length} following`);
+}
+
+async function fetchFollowingTagTargets(route, tagTargets) {
+  if (!tagTargets.length) {
+    return [];
+  }
+  const endpoint = `${edgeBaseUrl()}/network/snapshot${followingTagSnapshotQuery(route)}`;
+  try {
+    logInfo("feed.following.tags.request", { targets: tagTargets, endpoint });
+    const response = await fetch(endpoint, {
+      cache: "no-store",
+      headers: githubAuthHeaders(),
+    });
+    logInfo("feed.following.tags.response", {
+      status: response.status,
+      ok: response.ok,
+    });
+    if (!response.ok) {
+      if (response.status === 426) {
+        const message = await responseErrorMessage(response, "update your peer to the latest version");
+        return tagTargets.map((target) => ({ target, ticket: undefined, headlines: [], error: message }));
+      }
+      throw new Error(`following tag snapshot failed: ${response.status}`);
+    }
+    const snapshot = await response.json();
+    const status = compatibilityStatus(snapshot.compatibility || snapshot.browser_seed?.compatibility);
+    if (!status.compatible) {
+      logWarn("feed.following.tags.version_mismatch", { message: status.message });
+      return tagTargets.map((target) => ({ target, ticket: snapshot, headlines: [], error: status.message }));
+    }
+    const networkStatus = networkCompatibilityStatus(route, snapshot);
+    if (!networkStatus.compatible) {
+      logWarn("feed.following.tags.network_mismatch", {
+        expected: networkStatus.expected,
+        actual: networkStatus.actual,
+      });
+      return tagTargets.map((target) => ({ target, ticket: snapshot, headlines: [], error: networkStatus.message }));
+    }
+    const allHeadlines = snapshotHeadlines(snapshot)
+      .filter((item) => compatibilityStatus(item.compatibility || snapshot.compatibility).compatible);
+    return tagTargets.map((target) => ({
+      target,
+      ticket: snapshot,
+      headlines: allHeadlines.filter((item) => headlineMatchesFollowTarget(item, target)),
+      error: undefined,
+    }));
+  } catch (error) {
+    logError("following tag snapshot failed", error);
+    return tagTargets.map((target) => ({ target, ticket: undefined, headlines: [], error: String(error) }));
+  }
 }
 
 async function fetchFollowingTarget(route, target) {
@@ -2137,6 +2371,35 @@ async function fetchFollowingTarget(route, target) {
     logError("following target resolution failed", error);
     return { target: clean, ticket: undefined, headlines: [], error: String(error) };
   }
+}
+
+function followingTagSnapshotQuery(route) {
+  const params = new URLSearchParams();
+  params.set("network", route.network || "mainnet");
+  params.set("feed_mode", "discovery");
+  params.set("story_only", "true");
+  params.set("settled_only", "true");
+  copyReelFilterParams(route, params);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function dedupeHeadlines(headlines) {
+  const seen = new Set();
+  const output = [];
+  for (const item of headlines || []) {
+    const key = item?.capsule_id || item?.id || `${item?.publisher_login || item?.github_login || ""}:${item?.headline || item?.title || ""}:${item?.created_at || item?.createdAt || ""}`;
+    if (!item || !key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    output.push(item);
+  }
+  return output;
+}
+
+function followTargetCountLabel(count) {
+  return `${count} ${count === 1 ? "target" : "targets"}`;
 }
 
 async function fetchDirectoryTicketForUser(route) {
@@ -2383,6 +2646,25 @@ function headlineMatchesRoute(item, route) {
     }
   }
   return headlineMatchesReelFilters(item, route);
+}
+
+function headlineMatchesFollowTarget(item, target) {
+  const clean = normalizeFollowTarget(target);
+  if (!clean) {
+    return false;
+  }
+  if (isTagFollowTarget(clean)) {
+    return headlineTagTerms(item).includes(normalizeTag(clean));
+  }
+  const [login, feed = "*"] = clean.split("/");
+  const publisherLogin = normalizeRouteLogin(publisherLoginFromHeadline(item));
+  if (normalizeRouteLogin(login) !== publisherLogin) {
+    return false;
+  }
+  if (feed === "*") {
+    return true;
+  }
+  return headlineFeedLabels(item).includes(normalizeFeedLabel(feed));
 }
 
 function headlineMatchesReelFilters(item, route) {
@@ -2792,14 +3074,14 @@ function renderFollowingEmpty(route) {
   setText(headline, "nothing followed yet");
   setText(
     deck,
-    "open discovery, choose a feed, and follow it here. private access still requires a signed grant.",
+    "open discovery and follow a person. feed and tag follows can narrow the view later.",
   );
   renderPublisher(undefined);
   renderHeadlineImage(undefined);
   clearAuthAction();
   clearStageActions();
-  renderChips(["following", "local selection", route.network, "redacted"]);
-  renderTicker(["discovery finds feeds", "following is your explicit list"]);
+  renderChips(["following", "local filter", route.network, "story-only"]);
+  renderTicker(["discovery finds people", "following filters the projection"]);
   stopStageProgress();
   if (route.interactive) {
     renderFollowingTimeline(route, [], []);
@@ -2830,7 +3112,9 @@ function renderFollowingTimeline(route, targets, results) {
   const toolbar = document.createElement("div");
   toolbar.className = "timeline-toolbar";
   const label = document.createElement("span");
-  label.textContent = `following / ${route.network}`;
+  label.textContent = route.kind === "user"
+    ? `following @${route.login} / ${route.network}`
+    : `following / ${route.network}`;
   toolbar.appendChild(label);
   const nav = document.createElement("nav");
   nav.className = "timeline-feeds";
@@ -2839,7 +3123,7 @@ function renderFollowingTimeline(route, targets, results) {
   for (const target of targets) {
     const link = document.createElement("a");
     link.href = followingTargetUrl(target);
-    link.textContent = target;
+    link.textContent = followTargetLabel(target);
     nav.appendChild(link);
   }
   toolbar.appendChild(nav);
@@ -2872,16 +3156,16 @@ function renderFollowingTimeline(route, targets, results) {
     card.tabIndex = 0;
     const meta = document.createElement("div");
     meta.className = "timeline-meta";
-    meta.textContent = `${target} / following`;
+    meta.textContent = `${followTargetLabel(target)} / following`;
     const title = document.createElement("h2");
-    title.textContent = "waiting for story";
+    title.textContent = `waiting for ${followTargetLabel(target)}`;
     const copy = document.createElement("p");
     copy.textContent =
       "only followed settled story capsules appear here. discovery results are not mixed in.";
     const status = document.createElement("div");
     status.className = "timeline-status";
-    status.append(statusItem("target", target), statusItem("mode", "following only"));
-    card.append(meta, title, copy, status, timelineActions({ feed_label: target.split("/")[1] || "*", publisher_login: target.split("/")[0] }, route));
+    status.append(statusItem("target", followTargetLabel(target)), statusItem("mode", "following only"));
+    card.append(meta, title, copy, status, timelineActions(followPlaceholderItem(target), route));
     timeline.appendChild(card);
   }
   if (!targets.length) {
@@ -2895,7 +3179,7 @@ function renderFollowingTimeline(route, targets, results) {
     title.textContent = "nothing followed yet";
     const copy = document.createElement("p");
     copy.textContent =
-      "use discovery to follow visible feeds. private feeds can request access after sign-in.";
+      "use discovery to follow people, feeds, or tags. private feed access is handled separately.";
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
@@ -2903,9 +3187,16 @@ function renderFollowingTimeline(route, targets, results) {
 }
 
 function followingTargetUrl(target) {
-  const clean = target.replace(/^@/, "");
+  const clean = normalizeFollowTarget(target);
+  if (isTagFollowTarget(clean)) {
+    const params = new URLSearchParams();
+    params.set("feed_mode", "following");
+    params.set("view", "timeline");
+    params.set("following", clean);
+    return `/?${params.toString()}`;
+  }
   const [login, feed = "*"] = clean.split("/");
-  return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=following&view=timeline&following=${encodeURIComponent(target)}`;
+  return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=following&view=timeline`;
 }
 
 function userFeedPath(login, label) {
@@ -2927,8 +3218,8 @@ function toolbarFollowButton(route) {
   }
   const wildcard = target.endsWith("/*");
   const button = followButton(target, {
-    inactive: wildcard ? "follow all" : "follow feed",
-    active: "saved",
+    inactive: wildcard ? `follow @${route.login}` : "follow feed",
+    active: wildcard ? `following @${route.login}` : "following feed",
   });
   button.dataset.kind = "follow";
   return button;
@@ -2940,16 +3231,38 @@ function timelineActions(feed, route) {
   const project = primaryProjectTag(feed);
   if (project) {
     actions.appendChild(projectFilterLink(project, route));
+    actions.appendChild(tagFollowButton(project));
+  }
+  const personTarget = personFollowTargetFor(feed, route);
+  if (personTarget) {
+    actions.appendChild(
+      followButton(personTarget, {
+        inactive: `follow ${followTargetLabel(personTarget)}`,
+        active: `following ${followTargetLabel(personTarget)}`,
+      }),
+    );
   }
   const target = followTargetFor(feed, route);
-  if (target) {
-    actions.appendChild(followButton(target));
+  if (target && target !== personTarget) {
+    actions.appendChild(
+      followButton(target, {
+        inactive: "follow feed",
+        active: "following feed",
+      }),
+    );
   }
   const visibility = String(feed.visibility || "").toLowerCase();
   if (visibility && visibility !== "public") {
-    actions.appendChild(requestAccessButton(target || route.selection));
+    actions.appendChild(privateFeedPill(visibility));
   }
   return actions;
+}
+
+function tagFollowButton(project) {
+  return followButton(`#${normalizeTag(project)}`, {
+    inactive: `follow #${normalizeTag(project)}`,
+    active: `following #${normalizeTag(project)}`,
+  });
 }
 
 function projectFilterLink(project, route) {
@@ -3006,6 +3319,14 @@ function followTargetFor(feed, route) {
   return normalizeFollowTarget(`${login}/${label || "*"}`);
 }
 
+function personFollowTargetFor(feed, route) {
+  const login =
+    publisherLoginForProfile(feed, { profile: { login: route.login } }) ||
+    route.login ||
+    "";
+  return login ? normalizeFollowTarget(`${login}/*`) : "";
+}
+
 function followTargetForBulletin(bulletin) {
   const login = publisherLoginFromHeadline(bulletin);
   if (!login) {
@@ -3013,6 +3334,20 @@ function followTargetForBulletin(bulletin) {
   }
   const label = bulletinFeedLabel(bulletin);
   return normalizeFollowTarget(`${login}/${label || "*"}`);
+}
+
+function personFollowTargetForBulletin(bulletin) {
+  const login = publisherLoginFromHeadline(bulletin);
+  return login ? normalizeFollowTarget(`${login}/*`) : "";
+}
+
+function followPlaceholderItem(target) {
+  const clean = normalizeFollowTarget(target);
+  if (isTagFollowTarget(clean)) {
+    return { chips: [clean], project_tag: clean.replace(/^#/, "") };
+  }
+  const [login, feed = "*"] = clean.split("/");
+  return { feed_label: feed, publisher_login: login };
 }
 
 function bulletinFeedLabel(bulletin) {
@@ -3037,36 +3372,59 @@ function followButton(target, labels = {}) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "feed-action";
+  button.dataset.followTarget = normalizeFollowTarget(target);
   const applyState = () => {
     const active = isFollowingTarget(target);
     button.textContent = active
-      ? labels.active || "following"
-      : labels.inactive || "follow";
+      ? labels.active || `following ${followTargetLabel(target)}`
+      : labels.inactive || `follow ${followTargetLabel(target)}`;
     button.setAttribute("aria-pressed", active ? "true" : "false");
-    button.setAttribute("aria-label", `${active ? "unfollow" : "follow"} ${target}`);
+    button.setAttribute("aria-label", `${active ? "unfollow" : "follow"} ${followTargetLabel(target)}`);
   };
   applyState();
   button.addEventListener("click", () => {
     const next = toggleFollowTarget(target);
-    applyState();
+    refreshFollowButtons();
+    refreshAfterFollowingChange();
     logInfo("feed.following.toggle", { target, following: next });
   });
   return button;
 }
 
-function requestAccessButton(target) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "feed-action";
-  button.textContent = "request access";
-  button.addEventListener("click", () => {
-    logInfo("feed.access.request.pending", {
-      target,
-      message: "private subscription grants are protocol-level and require edge support",
-    });
-    button.textContent = "access pending";
-  });
-  return button;
+function refreshFollowButtons() {
+  for (const button of document.querySelectorAll("[data-follow-target]")) {
+    const target = button.dataset.followTarget || "";
+    const active = isFollowingTarget(target);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+    button.setAttribute("aria-label", `${active ? "unfollow" : "follow"} ${followTargetLabel(target)}`);
+    if (button.textContent?.startsWith("follow")) {
+      button.textContent = active ? `following ${followTargetLabel(target)}` : `follow ${followTargetLabel(target)}`;
+    }
+  }
+}
+
+function refreshAfterFollowingChange() {
+  if (!remoteRoute || !p2pEnabled()) {
+    return;
+  }
+  const params = new URLSearchParams(
+    window.location.hash && window.location.hash.length > 1
+      ? window.location.hash.slice(1)
+      : window.location.search,
+  );
+  remoteRoute.followingTargets = routeFollowingTargets(remoteRoute.login, params);
+  if (remoteRoute.feedMode === "following") {
+    window.clearTimeout(remoteRefreshTimer);
+    refreshRemoteRoute(remoteRoute, "following-toggle");
+  }
+}
+
+function privateFeedPill(visibility) {
+  const pill = document.createElement("span");
+  pill.className = "feed-action feed-action-muted";
+  pill.textContent = `${visibility || "private"} · grant required`;
+  pill.setAttribute("aria-disabled", "true");
+  return pill;
 }
 
 function feedLink(login, label, text, current = false) {
@@ -3215,7 +3573,11 @@ function updateClock() {
 
 function updateSourceCount() {
   if (remoteRoute && remoteFeedCount !== undefined) {
-    setText(sourceCount, feedCountLabel(remoteFeedCount));
+    if (remoteRoute.feedMode === "following") {
+      setText(sourceCount, followTargetCountLabel(remoteFeedCount));
+    } else {
+      setText(sourceCount, feedCountLabel(remoteFeedCount));
+    }
     return;
   }
   const sources = new Set();

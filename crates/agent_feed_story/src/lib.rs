@@ -1365,6 +1365,24 @@ fn story_impact_rewrite(
             "the current head clears the browser smoke lane before final repository checks",
         ))
     } else if is_burn_dragon
+        && (combined.contains("terraform apply") || combined.contains("infrastructure rollout"))
+        && (combined.contains("deploy") || combined.contains("deployment"))
+    {
+        Some((
+            "burn_dragon p2p deploy reaches terraform apply",
+            "the edge rollout has moved past runner-side builds and is applying infrastructure changes",
+        ))
+    } else if is_burn_dragon
+        && (combined.contains("edge binary")
+            || combined.contains("binary build")
+            || combined.contains("runner-side edge"))
+        && (combined.contains("deploy") || combined.contains("deployment"))
+    {
+        Some((
+            "burn_dragon p2p deploy is building edge binaries",
+            "the production workflow is past ci dispatch and is preparing the edge artifacts for rollout",
+        ))
+    } else if is_burn_dragon
         && combined.contains("version surfaces")
         && combined.contains("line up")
     {
@@ -1858,12 +1876,23 @@ fn summary_is_operator_chatter(normalized: &str) -> bool {
         "the live edge now has",
         "the daemon is now actually",
         "the fixed daemon is running",
+        "the new binary started",
+        "startup lines",
+        "dead daemon",
+        "existing 7777 daemon",
         "publish interval",
         "listening on 127.0.0.1",
         "127.0.0.1:7777",
         "the fixed binary is installed",
         "restart the local daemon",
         "live daemon capture",
+        "the local story",
+        "after the restart",
+        "correctly declined",
+        "full workspace test pass",
+        "runtime check",
+        "installed binary on path",
+        "stability bug",
         "user-facing story",
     ]
     .iter()
@@ -1879,6 +1908,9 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
         "complete",
         "completed",
         "degraded",
+        "deploy",
+        "deployed",
+        "deployment",
         "failed",
         "failure",
         "fixed",
@@ -1900,6 +1932,7 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
         "remaining",
         "rerun",
         "running",
+        "rollout",
         "shipped",
         "success",
         "support",
@@ -2043,26 +2076,30 @@ mod tests {
 
     #[test]
     fn operator_chatter_does_not_publish_as_story() {
-        let mut compiler = StoryCompiler::default();
-        let mut message = event(EventKind::AgentMessage, "codex posted an update");
-        message.summary = Some(
-            "The live edge now has five accepted headlines from your workstation feed. I’m tightening the final story gate."
-                .to_string(),
-        );
+        for summary in [
+            "The live edge now has five accepted headlines from your workstation feed. I’m tightening the final story gate.",
+            "The new binary started and then exited without writing an error after the startup lines. That is a separate stability bug in the publish daemon.",
+            "The full workspace test pass is green. I’m doing one last runtime check now: installed binary on PATH, live daemon.",
+            "The local story after the restart is now from the active `burn_dragon` session, and the p2p publisher correctly declined to republish it.",
+        ] {
+            let mut compiler = StoryCompiler::default();
+            let mut message = event(EventKind::AgentMessage, "codex posted an update");
+            message.summary = Some(summary.to_string());
 
-        assert!(compiler.ingest(message).is_empty());
-        assert!(compiler.flush().is_empty());
-        let decision = compiler
-            .diagnostics()
-            .last_decision
-            .expect("decision recorded");
-        assert!(
-            matches!(
-                decision.action,
-                StoryDecisionAction::Waiting | StoryDecisionAction::Retained
-            ),
-            "operator chatter should remain unpublished"
-        );
+            assert!(compiler.ingest(message).is_empty());
+            assert!(compiler.flush().is_empty());
+            let decision = compiler
+                .diagnostics()
+                .last_decision
+                .expect("decision recorded");
+            assert!(
+                matches!(
+                    decision.action,
+                    StoryDecisionAction::Waiting | StoryDecisionAction::Retained
+                ),
+                "operator chatter should remain unpublished"
+            );
+        }
     }
 
     #[test]
@@ -2244,6 +2281,27 @@ mod tests {
         );
         assert!(stories[0].deck.contains("browser smoke lane"));
         assert!(!stories[0].deck.contains("I’m"));
+    }
+
+    #[test]
+    fn active_burn_dragon_deploy_stage_publishes_project_specific_headline() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("burn_dragon".to_string());
+        update.summary = Some(
+            "The deploy has moved past binary builds and is now in terraform apply.".to_string(),
+        );
+        assert!(compiler.ingest(update).is_empty());
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(
+            stories[0].headline,
+            "burn_dragon p2p deploy reaches terraform apply"
+        );
+        assert!(stories[0].deck.contains("edge rollout"));
+        assert!(!stories[0].headline.contains("feed deployment paths"));
     }
 
     #[test]

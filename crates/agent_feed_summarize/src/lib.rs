@@ -821,6 +821,15 @@ fn run_process_with_options(
     stdin_text: &str,
     options: ProcessOptions,
 ) -> Result<String, SummaryError> {
+    let processor_model = processor_model_arg(args).unwrap_or("default");
+    tracing::info!(
+        command = %command,
+        model = %processor_model,
+        codex_resume = processor_is_codex_resume(args),
+        stdin_chars = stdin_text.len(),
+        current_dir_configured = options.current_dir.is_some(),
+        "summary processor process starting"
+    );
     let mut command_builder = Command::new(command);
     command_builder
         .args(args)
@@ -882,7 +891,28 @@ fn run_process_with_options(
             String::from_utf8_lossy(&output.stderr)
         )));
     }
+    tracing::info!(
+        command = %command,
+        model = %processor_model,
+        stdout_bytes = output.stdout.len(),
+        stderr_bytes = output.stderr.len(),
+        "summary processor process completed"
+    );
     String::from_utf8(output.stdout).map_err(SummaryError::from)
+}
+
+fn processor_model_arg(args: &[String]) -> Option<&str> {
+    args.windows(2)
+        .find(|window| window.first().is_some_and(|arg| arg == "--model"))
+        .and_then(|window| window.get(1))
+        .map(String::as_str)
+}
+
+fn processor_is_codex_resume(args: &[String]) -> bool {
+    args.windows(2).any(|window| {
+        window.first().is_some_and(|arg| arg == "exec")
+            && window.get(1).is_some_and(|arg| arg == "resume")
+    })
 }
 
 pub struct HttpEndpointProcessor {
@@ -2422,6 +2452,12 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
         "hit command",
         "tool failures",
         "settled stories",
+        "new binary started",
+        "startup lines",
+        "dead daemon",
+        "7777 daemon",
+        "self referential",
+        "self-referential",
     ]
     .iter()
     .any(|needle| combined.contains(needle))
@@ -3832,6 +3868,10 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             (
                 "codex verifies tests, confirms pass state",
                 "tests passed after the two-file change.",
+            ),
+            (
+                "agent_feed daemon restart restored publishing while exposing one self-referential story",
+                "the new binary started after an earlier dead daemon and the startup lines showed a local 7777 daemon issue.",
             ),
         ];
 
