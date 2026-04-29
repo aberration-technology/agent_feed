@@ -1,6 +1,9 @@
 name: deploy feed pages
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       environment:
@@ -35,7 +38,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: deploy-feed-pages-${{ github.event.inputs.environment }}
+  group: deploy-feed-pages-${{ inputs.environment || 'agent-feed-p2p-production' }}
   cancel-in-progress: false
 
 env:
@@ -44,7 +47,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment: ${{ inputs.environment || 'agent-feed-p2p-production' }}
     outputs:
       site_base_url: ${{ steps.settings.outputs.site_base_url }}
       edge_base_url: ${{ steps.settings.outputs.edge_base_url }}
@@ -70,10 +73,10 @@ jobs:
         id: settings
         shell: bash
         env:
-          INPUT_EDGE_BASE_URL: ${{ github.event.inputs.edge_base_url }}
-          INPUT_BROWSER_APP_BASE_URL: ${{ github.event.inputs.browser_app_base_url }}
-          INPUT_NETWORK_ID: ${{ github.event.inputs.network_id }}
-          INPUT_CANARY_GITHUB_LOGIN: ${{ github.event.inputs.canary_github_login }}
+          INPUT_EDGE_BASE_URL: ${{ inputs.edge_base_url || '' }}
+          INPUT_BROWSER_APP_BASE_URL: ${{ inputs.browser_app_base_url || '' }}
+          INPUT_NETWORK_ID: ${{ inputs.network_id || '' }}
+          INPUT_CANARY_GITHUB_LOGIN: ${{ inputs.canary_github_login || '' }}
           VAR_EDGE_BASE_URL: ${{ vars.AGENT_FEED_P2P_EDGE_BASE_URL }}
           VAR_EDGE_DOMAIN_NAME: ${{ vars.AGENT_FEED_P2P_EDGE_DOMAIN_NAME }}
           VAR_BROWSER_APP_BASE_URL: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_BASE_URL }}

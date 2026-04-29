@@ -1,6 +1,9 @@
 name: deploy feed p2p aws
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       environment:
@@ -30,20 +33,22 @@ permissions:
   actions: write
 
 concurrency:
-  group: deploy-feed-p2p-aws-${{ github.event.inputs.environment }}-${{ github.event.inputs.terraform_workspace }}
+  group: deploy-feed-p2p-aws-${{ inputs.environment || 'agent-feed-p2p-production' }}-${{ inputs.terraform_workspace || 'mainnet' }}
   cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'agent-feed-p2p-production' }}
+  TF_WORKSPACE_NAME: ${{ inputs.terraform_workspace || 'mainnet' }}
+  APPLY_TERRAFORM: ${{ github.event_name == 'push' && 'true' || inputs.apply && 'true' || 'false' }}
+  DEPLOY_PAGES_AFTER_APPLY: ${{ github.event_name == 'push' && 'false' || inputs.deploy_pages_after_apply && 'true' || 'false' }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment: ${{ inputs.environment || 'agent-feed-p2p-production' }}
     env:
       TF_ROOT: crates/agent_feed_p2p/deploy/terraform/aws
-      TF_WORKSPACE_NAME: ${{ github.event.inputs.terraform_workspace }}
-      DEPLOY_ENVIRONMENT: ${{ github.event.inputs.environment }}
 
     steps:
       - name: checkout repository
@@ -239,7 +244,7 @@ jobs:
         run: terraform validate
 
       - name: import existing production stack
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         working-directory: ${{ env.TF_ROOT }}
         shell: bash
         run: |
@@ -321,12 +326,12 @@ jobs:
         run: terraform plan -out=tfplan
 
       - name: terraform apply
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         working-directory: ${{ env.TF_ROOT }}
         run: terraform apply -auto-approve tfplan
 
       - name: terraform outputs
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         id: terraform_outputs
         working-directory: ${{ env.TF_ROOT }}
         run: |
@@ -337,14 +342,14 @@ jobs:
           terraform output -json > "$RUNNER_TEMP/feed-terraform-outputs.json"
 
       - name: upload terraform outputs
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: feed-terraform-outputs
           path: ${{ runner.temp }}/feed-terraform-outputs.json
 
       - name: edge health canary
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -360,7 +365,7 @@ jobs:
           exit 1
 
       - name: p2p fabric canary
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -393,7 +398,7 @@ jobs:
           fi
 
       - name: browser and resolver canary
-        if: ${{ github.event.inputs.apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -426,13 +431,13 @@ jobs:
           grep -q '<title>feed</title>' "$route_body"
 
       - name: dispatch pages publish
-        if: ${{ github.event.inputs.apply == 'true' && github.event.inputs.deploy_pages_after_apply == 'true' }}
+        if: ${{ env.APPLY_TERRAFORM == 'true' && env.DEPLOY_PAGES_AFTER_APPLY == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh workflow run deploy-pages.yml \
             --repo "$GITHUB_REPOSITORY" \
-            -f environment="${{ github.event.inputs.environment }}" \
+            -f environment="$DEPLOY_ENVIRONMENT" \
             -f edge_base_url="${{ steps.terraform_outputs.outputs.edge_url }}" \
             -f browser_app_base_url="${{ steps.terraform_outputs.outputs.browser_app_url }}"
