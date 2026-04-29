@@ -193,6 +193,15 @@ mod tests {
         assert!(mobile.contains("--headline-leading: 1.22;"));
         assert!(mobile.contains("--deck: 16px;"));
         assert!(mobile.contains("--deck-leading: 1.26;"));
+        assert!(mobile.contains("height: 100svh;"));
+        assert!(mobile.contains(
+            "grid-template-rows: 64px minmax(0, 1fr) calc(58px + env(safe-area-inset-bottom, 0px));"
+        ));
+        assert!(mobile.contains("@supports (height: 100dvh)"));
+        assert!(mobile.contains("min-height: calc(58px + env(safe-area-inset-bottom, 0px));"));
+        assert!(mobile.contains("padding-bottom: env(safe-area-inset-bottom, 0px);"));
+        assert!(mobile.contains("#ticker {\n    display: none;"));
+        assert!(mobile.contains(".footer-rev {\n    display: inline-block;"));
         assert!(mobile.contains("--headline-max: 100%;"));
         assert!(mobile.contains("--deck-max: 100%;"));
         assert!(mobile.contains("display: block;"));

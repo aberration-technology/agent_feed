@@ -42,7 +42,9 @@ body {
   height: 100vh;
   height: 100dvh;
   min-height: 100vh;
+  min-height: 100dvh;
   max-height: 100vh;
+  max-height: 100dvh;
   display: grid;
   grid-template-rows: minmax(56px, 8vh) minmax(0, 1fr) minmax(48px, 8vh);
   overflow: hidden;
@@ -688,7 +690,18 @@ body[data-mode="breaking"] .chips span {
   }
 
   .reel {
-    grid-template-rows: 64px 1fr 56px;
+    height: 100svh;
+    min-height: 100svh;
+    max-height: 100svh;
+    grid-template-rows: 64px minmax(0, 1fr) calc(58px + env(safe-area-inset-bottom, 0px));
+  }
+
+  @supports (height: 100dvh) {
+    .reel {
+      height: 100dvh;
+      min-height: 100dvh;
+      max-height: 100dvh;
+    }
   }
 
   .topbar,
@@ -696,12 +709,26 @@ body[data-mode="breaking"] .chips span {
     padding: 0 28px;
   }
 
+  .ticker {
+    min-height: calc(58px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    position: relative;
+    z-index: 2;
+  }
+
+  #ticker {
+    display: none;
+  }
+
   .footer-links {
     gap: 12px;
   }
 
   .footer-rev {
-    display: none;
+    display: inline-block;
+    max-width: 12ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .story-time {
