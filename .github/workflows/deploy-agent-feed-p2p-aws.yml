@@ -240,8 +240,15 @@ jobs:
         run: terraform workspace select "$TF_WORKSPACE_NAME" || terraform workspace new "$TF_WORKSPACE_NAME"
 
       - name: terraform validate
-        working-directory: ${{ env.TF_ROOT }}
-        run: terraform validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          validate_dir="$RUNNER_TEMP/feed-terraform-validate"
+          rm -rf "$validate_dir"
+          mkdir -p "$validate_dir"
+          cp -R "$TF_ROOT"/. "$validate_dir"/
+          terraform -chdir="$validate_dir" init -backend=false -input=false
+          terraform -chdir="$validate_dir" validate
 
       - name: import existing production stack
         if: ${{ env.APPLY_TERRAFORM == 'true' }}
