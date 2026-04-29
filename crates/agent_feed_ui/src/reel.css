@@ -107,7 +107,8 @@ body {
   display: none;
 }
 
-body[data-view="timeline"] .mode-switcher {
+body[data-view="timeline"] .mode-switcher,
+body[data-view="history"] .mode-switcher {
   display: none;
 }
 

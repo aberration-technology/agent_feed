@@ -21,6 +21,7 @@ const timeline = document.querySelector("#timeline");
 const modeSwitcher = document.querySelector("#mode-switcher");
 const modeDiscovery = document.querySelector("#mode-discovery");
 const modeFollowing = document.querySelector("#mode-following");
+const modeHistory = document.querySelector("#mode-history");
 const footerRev = document.querySelector("#footer-rev");
 
 let bulletins = [];
@@ -329,10 +330,11 @@ function renderStageActions(bulletin) {
   stageActions.replaceChildren();
   const personTarget = personFollowTargetForBulletin(bulletin);
   const feedTarget = followTargetForBulletin(bulletin);
-  if ((!personTarget && !feedTarget) || !p2pEnabled()) {
+  if (!p2pEnabled()) {
     stageActions.hidden = true;
     return;
   }
+  let added = false;
   if (personTarget) {
     stageActions.appendChild(
       followButton(personTarget, {
@@ -340,6 +342,7 @@ function renderStageActions(bulletin) {
         active: `following ${followTargetLabel(personTarget)}`,
       }),
     );
+    added = true;
   }
   if (feedTarget && feedTarget !== personTarget) {
     stageActions.appendChild(
@@ -348,14 +351,22 @@ function renderStageActions(bulletin) {
         active: "following feed",
       }),
     );
+    added = true;
   }
-  const following = document.createElement("a");
-  following.className = "feed-action";
-  following.href = followingTargetUrl(personTarget || feedTarget);
-  following.textContent = "open following";
-  following.setAttribute("aria-label", `open followed feed ${followTargetLabel(personTarget || feedTarget)}`);
-  stageActions.appendChild(following);
-  stageActions.hidden = false;
+  if (personTarget || feedTarget) {
+    const following = document.createElement("a");
+    following.className = "feed-action";
+    following.href = followingTargetUrl(personTarget || feedTarget);
+    following.textContent = "open following";
+    following.setAttribute("aria-label", `open followed feed ${followTargetLabel(personTarget || feedTarget)}`);
+    stageActions.appendChild(following);
+    added = true;
+  }
+  if (remoteRoute) {
+    stageActions.appendChild(historyAction(remoteRoute));
+    added = true;
+  }
+  stageActions.hidden = !added;
 }
 
 function showStage() {
@@ -627,6 +638,83 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
   stopStageProgress();
 }
 
+function renderQuietConnected(route, classification = {}, nextPublisher = undefined) {
+  const feedCount = Number(classification.feedCount ?? classification.feeds?.length ?? remoteFeedCount ?? 0);
+  const detail = quietDetail(route, classification);
+  logInfo("feed.remote.quiet", {
+    reason: classification.kind || "quiet",
+    scope: route.kind || "user",
+    login: route.login,
+    selection: route.selection,
+    feed_mode: route.feedMode,
+    network: route.network,
+    feeds: feedCount,
+    headlines: classification.headlineCount ?? classification.headlines?.length ?? 0,
+    fresh_unseen: classification.freshUnseenCount ?? 0,
+  });
+  showStage();
+  document.body.dataset.mode = "dispatch";
+  setText(liveState, route.feedMode === "following" ? "follow" : "quiet");
+  setText(eyebrow, routeEyebrow(route));
+  setText(headline, "quiet right now");
+  setText(deck, detail.join(" · "));
+  renderPublisher(nextPublisher || classification.profile || (route.kind === "global" ? undefined : { login: route.login }));
+  renderHeadlineImage(undefined);
+  clearStoryTime();
+  clearAuthAction();
+  renderQuietStageActions(route, classification);
+  renderChips([
+    route.feedMode === "following" ? "following" : routeDisplayMode(route),
+    feedCount > 0 ? feedCountLabel(feedCount) : route.network,
+    "quiet",
+  ]);
+  renderTicker(detail);
+  stopStageProgress();
+}
+
+function quietDetail(route, classification = {}) {
+  const feedCount = Number(classification.feedCount ?? classification.feeds?.length ?? remoteFeedCount ?? 0);
+  const parts = [];
+  if (route.feedMode === "following") {
+    parts.push(`following ${followTargetCountLabel(feedCount || route.followingTargets?.length || 0)}`);
+  } else if (route.kind === "global") {
+    parts.push(feedCount > 0 ? `${feedCountLabel(feedCount)} connected` : "network connected");
+  } else {
+    const stream = routeStreamLabel(route);
+    parts.push(stream && stream !== "visible feeds" ? `@${route.login} / ${stream}` : `@${route.login} connected`);
+  }
+  const lastStory = relativeTimeFromAny(classification.lastStoryAt);
+  const lastSeen = relativeTimeFromAny(classification.lastSeenAt);
+  if (lastStory) {
+    parts.push(`last story ${lastStory}`);
+  } else if (lastSeen) {
+    parts.push(`last seen ${lastSeen}`);
+  }
+  parts.push("new settled stories will appear live");
+  return uniqueTextParts(parts);
+}
+
+function renderQuietStageActions(route, classification = {}) {
+  if (!stageActions || !p2pEnabled()) {
+    clearStageActions();
+    return;
+  }
+  stageActions.replaceChildren();
+  if (classification.historyAvailable !== false) {
+    stageActions.appendChild(historyAction(route));
+  }
+  stageActions.hidden = stageActions.childElementCount === 0;
+}
+
+function historyAction(route) {
+  const link = document.createElement("a");
+  link.className = "feed-action";
+  link.href = historyUrl(route);
+  link.textContent = "history";
+  link.setAttribute("aria-label", "open feed history");
+  return link;
+}
+
 function routeEyebrow(route) {
   if (route.kind === "global") {
     return `feed / ${route.network} / ${routeDisplayMode(route)}`;
@@ -673,7 +761,7 @@ function remoteHeadlineForState(state) {
     case "no-feeds":
       return "no visible streams";
     case "waiting":
-      return "waiting for stories";
+      return "quiet right now";
     case "version-mismatch":
       return "update your peer";
     case "live":
@@ -681,7 +769,7 @@ function remoteHeadlineForState(state) {
     case "failed":
       return "feed unavailable";
     default:
-      return "waiting for stories";
+      return "quiet right now";
   }
 }
 
@@ -943,10 +1031,11 @@ function renderQueueDrained(source) {
   stopStageProgress();
   clearStoryTime();
   if (remoteRoute) {
-    renderRemoteState(remoteRoute, "waiting", [
-      "waiting for new settled stories",
-      "older stories stay in the timeline",
-    ]);
+    renderQuietConnected(remoteRoute, {
+      kind: "all_seen",
+      feedCount: remoteFeedCount ?? 0,
+      historyAvailable: true,
+    });
   } else {
     setText(liveState, "wait");
     setText(eyebrow, "feed / waiting");
@@ -1275,10 +1364,7 @@ function parseRemoteRoute(location) {
     selection: feedSegment ? `${login}/${feedSegment}` : routeSelection(login, params),
     feedMode: routeFeedMode(params, "user"),
     followingTargets: routeFollowingTargets(login, params),
-    interactive:
-      params.get("view") === "timeline" ||
-      params.get("mode") === "timeline" ||
-      ["1", "true", "on"].includes(params.get("timeline") || ""),
+    interactive: routeHistoryRequested(params),
     query: location.search,
   };
 }
@@ -1298,10 +1384,7 @@ function parseGlobalRoute(location) {
     selection: "network/*",
     feedMode: routeFeedMode(params, "global"),
     followingTargets: routeFollowingTargets("", params),
-    interactive:
-      params.get("view") === "timeline" ||
-      params.get("mode") === "timeline" ||
-      ["1", "true", "on"].includes(params.get("timeline") || ""),
+    interactive: routeHistoryRequested(params),
     query: location.search,
   };
 }
@@ -1317,7 +1400,21 @@ function rootNetworkRouteRequested(location) {
     params.has("subscribed") ||
     params.has("following") ||
     params.has("discover") ||
-    params.has("discovery")
+    params.has("discovery") ||
+    routeHistoryRequested(params)
+  );
+}
+
+function routeHistoryRequested(params) {
+  const view = String(params.get("view") || "").toLowerCase();
+  const mode = String(params.get("mode") || "").toLowerCase();
+  return (
+    view === "history" ||
+    view === "timeline" ||
+    mode === "history" ||
+    mode === "timeline" ||
+    ["1", "true", "on"].includes(params.get("history") || "") ||
+    ["1", "true", "on"].includes(params.get("timeline") || "")
   );
 }
 
@@ -1652,23 +1749,29 @@ function p2pEnabled() {
 }
 
 function setupModeSwitcher(route) {
-  if (!modeSwitcher || !modeDiscovery || !modeFollowing || !p2pEnabled()) {
+  if (!modeSwitcher || !modeDiscovery || !modeFollowing || !modeHistory || !p2pEnabled()) {
     hideModeSwitcher();
     return;
   }
   modeDiscovery.textContent = route.kind === "global" ? "discover" : "feeds";
   modeFollowing.textContent = route.kind === "user" ? `following @${route.login}` : "following";
+  modeHistory.textContent = "history";
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
   modeFollowing.setAttribute("href", modeUrl(route, "following"));
+  modeHistory.setAttribute("href", historyUrl(route));
   modeDiscovery.toggleAttribute(
     "aria-current",
-    (route.kind === "global" && route.feedMode === "discovery") ||
-      (route.kind === "user" && route.feedMode !== "following"),
+    !route.interactive &&
+      ((route.kind === "global" && route.feedMode === "discovery") ||
+        (route.kind === "user" && route.feedMode !== "following")),
   );
-  modeFollowing.toggleAttribute("aria-current", route.feedMode === "following");
+  modeFollowing.toggleAttribute("aria-current", !route.interactive && route.feedMode === "following");
+  modeHistory.toggleAttribute("aria-current", route.interactive);
   modeSwitcher.hidden = false;
   const reveal = () => revealControls();
   window.addEventListener("pointermove", reveal, { passive: true });
+  window.addEventListener("pointerdown", reveal, { passive: true });
+  window.addEventListener("touchstart", reveal, { passive: true });
   window.addEventListener("keydown", reveal);
   modeSwitcher.addEventListener("focusin", reveal);
 }
@@ -1696,6 +1799,12 @@ function revealControls() {
 function modeUrl(route, mode) {
   const params = new URLSearchParams(route.query);
   params.set("feed_mode", mode);
+  params.delete("history");
+  params.delete("timeline");
+  params.delete("view");
+  if (params.get("mode") === "history" || params.get("mode") === "timeline") {
+    params.delete("mode");
+  }
   if (route.network && route.network !== "mainnet") {
     params.set("network", route.network);
   }
@@ -1735,6 +1844,21 @@ function modeUrl(route, mode) {
       ? `/${encodeURIComponent(route.login)}/${encodeURIComponent(userFeed)}`
       : `/${encodeURIComponent(route.login)}${userFeed === "*" ? "/*" : ""}`;
   return nextQuery ? `${path}?${nextQuery}` : path;
+}
+
+function historyUrl(route) {
+  const params = new URLSearchParams(route.query || "");
+  params.set("view", "history");
+  params.delete("history");
+  params.delete("timeline");
+  if (params.get("mode") === "history" || params.get("mode") === "timeline") {
+    params.delete("mode");
+  }
+  for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
+    params.delete(key);
+  }
+  const query = params.toString();
+  return `${routePath(route)}${query ? `?${query}` : ""}`;
 }
 
 function parseGithubAuthCallback(location) {
@@ -2062,17 +2186,20 @@ async function startGlobalDiscoveryRoute(route, refresh = false) {
       renderGlobalTimeline(route, snapshot);
       return;
     }
-    if (headlines.length) {
+    const classification = classifyRemoteSnapshot(route, feeds, headlines);
+    logInfo("feed.network.discovery.classified", {
+      classification: classification.kind,
+      feeds: classification.feedCount,
+      headlines: classification.headlineCount,
+      fresh_unseen: classification.freshUnseenCount,
+    });
+    if (classification.kind === "fresh_unseen") {
       updateSourceCountFromFeeds(feeds);
-      applyRemoteHeadlines(route, headlines);
+      applyRemoteHeadlines(route, headlines, classification);
       return;
     }
-    if (feeds.length) {
-      renderRemoteState(route, "waiting", [
-        `network directory found ${feeds.length} feeds`,
-        "connected · waiting for first story",
-        "showing settled story streams",
-      ]);
+    if (classification.historyAvailable) {
+      renderQuietConnected(route, classification);
       updateSourceCountFromFeeds(feeds);
       return;
     }
@@ -2221,9 +2348,19 @@ async function startUserRoute(route, refresh = false) {
       ], ticket.profile);
       return;
     }
-    if (headlines.length && !route.interactive) {
+    const classification = classifyRemoteSnapshot(route, compatibleFeeds, headlines, {
+      profile: ticket.profile,
+    });
+    logInfo("feed.user.classified", {
+      login: ticket.profile?.login || route.login,
+      classification: classification.kind,
+      feeds: classification.feedCount,
+      headlines: classification.headlineCount,
+      fresh_unseen: classification.freshUnseenCount,
+    });
+    if (classification.kind === "fresh_unseen" && !route.interactive) {
       updateSourceCountFromFeeds(compatibleFeeds);
-      applyRemoteHeadlines(route, headlines);
+      applyRemoteHeadlines(route, headlines, classification);
       return;
     }
     if (feedCount === 0 && headlines.length === 0) {
@@ -2240,17 +2377,13 @@ async function startUserRoute(route, refresh = false) {
     }
     if (route.interactive) {
       renderTimeline(route, ticket);
-      logInfo("feed.timeline.ready", {
+      logInfo("feed.history.ready", {
         selection: route.selection,
         feeds: feedCount,
       });
       return;
     }
-    renderRemoteState(route, "waiting", [
-      "github identity found",
-      "searching mainnet",
-      "connected · waiting for first story",
-    ], ticket.profile);
+    renderQuietConnected(route, classification, ticket.profile);
   } catch (error) {
     renderRemoteState(route, "failed", [
       "edge snapshot mode unavailable",
@@ -2388,16 +2521,20 @@ async function startFollowingRoute(route, refresh = false) {
     renderFollowingTimeline(route, targets, results);
     return;
   }
-  if (headlines.length) {
+  const classification = classifyRemoteSnapshot(route, feeds, headlines, { targets });
+  logInfo("feed.following.classified", {
+    classification: classification.kind,
+    targets: targets.length,
+    feeds: classification.feedCount,
+    headlines: classification.headlineCount,
+    fresh_unseen: classification.freshUnseenCount,
+  });
+  if (classification.kind === "fresh_unseen") {
     remoteFeedCount = targets.length;
-    applyRemoteHeadlines(route, headlines);
+    applyRemoteHeadlines(route, headlines, classification);
     return;
   }
-  renderRemoteState(route, "waiting", [
-    `following ${followTargetCountLabel(targets.length)}`,
-    "connected · waiting for first story",
-    "move mouse for controls",
-  ]);
+  renderQuietConnected(route, { ...classification, feedCount: targets.length });
   setText(sourceCount, `${targets.length} following`);
 }
 
@@ -2710,29 +2847,87 @@ function resolverQuery(route) {
   return query ? `?${query}` : "";
 }
 
-function applyRemoteHeadlines(route, headlines) {
-  const nextSignature = remoteSnapshotSignature(headlines);
+function classifyRemoteSnapshot(route, feeds = [], headlines = [], context = {}) {
+  const routeHeadlines = (headlines || []).filter((item) => headlineMatchesRoute(item, route));
+  const feedList = Array.isArray(feeds) ? feeds : [];
+  const stageBulletins = routeHeadlines
+    .map((item, index) => remoteHeadlineToBulletin(route, item, index))
+    .filter(Boolean);
+  const freshUnseen = stageBulletins.filter(
+    (item) => !seenBulletinIds.has(bulletinId(item)) && bulletinIsFreshForStage(item),
+  );
+  const allSeen =
+    stageBulletins.length > 0 &&
+    stageBulletins.every((item) => seenBulletinIds.has(bulletinId(item)));
+  const allStale =
+    stageBulletins.length > 0 &&
+    stageBulletins.every((item) => !bulletinIsFreshForStage(item));
+  const kind = freshUnseen.length
+    ? "fresh_unseen"
+    : allSeen
+      ? "all_seen"
+      : allStale
+        ? "all_stale"
+        : routeHeadlines.length
+          ? "seen_or_stale_available"
+          : feedList.length
+            ? "feeds_only"
+            : "nothing_visible";
+  return {
+    kind,
+    feeds: feedList,
+    feedCount: feedList.length,
+    headlines: routeHeadlines,
+    headlineCount: routeHeadlines.length,
+    freshBulletins: freshUnseen,
+    freshUnseenCount: freshUnseen.length,
+    historyAvailable: routeHeadlines.length > 0 || feedList.length > 0,
+    lastStoryAt: latestTimeValue(routeHeadlines, ["created_at", "createdAt", "published_at", "publishedAt"]),
+    lastSeenAt: latestTimeValue(feedList, ["last_seen_at", "lastSeenAt", "updated_at", "updatedAt"]),
+    profile: context.profile,
+    targets: context.targets || [],
+  };
+}
+
+function latestTimeValue(items, keys) {
+  let latest = 0;
+  for (const item of items || []) {
+    for (const key of keys) {
+      const value = item?.[key];
+      const timestamp = Date.parse(value || "");
+      if (Number.isFinite(timestamp) && timestamp > latest) {
+        latest = timestamp;
+      }
+    }
+  }
+  return latest > 0 ? new Date(latest).toISOString() : "";
+}
+
+function applyRemoteHeadlines(route, headlines, classification = undefined) {
+  const state = classification || classifyRemoteSnapshot(route, [], headlines);
+  const nextHeadlines = state.headlines || headlines || [];
+  const nextSignature = remoteSnapshotSignature(nextHeadlines);
   if (nextSignature && nextSignature === remoteHeadlinesSignature && bulletins.length) {
     logDebug("feed.network.discovery.headlines.unchanged", {
       signature: nextSignature,
-      headlines: headlines.length,
+      headlines: nextHeadlines.length,
     });
     return;
   }
   remoteHeadlinesSignature = nextSignature;
-  const nextBulletins = headlines
-    .map((item, index) => remoteHeadlineToBulletin(route, item, index))
-    .filter(Boolean);
+  const nextBulletins = Array.isArray(state.freshBulletins)
+    ? state.freshBulletins
+    : nextHeadlines
+      .map((item, index) => remoteHeadlineToBulletin(route, item, index))
+      .filter(Boolean);
   const result = applyBulletinQueueUpdate(nextBulletins, "remote-snapshot");
   if (!bulletins.length) {
-    renderRemoteState(route, "waiting", [
-      "network directory connected",
-      "waiting for display-safe headlines",
-    ]);
+    renderQuietConnected(route, state, state.profile);
     return;
   }
   updateSourceCount();
   logInfo("feed.network.discovery.headlines.render", {
+    classification: state.kind,
     headlines: bulletins.length,
     rendered: result.rendered,
     preserved: result.preserved,
@@ -3006,12 +3201,12 @@ function publisherLoginFromHeadline(item) {
 
 function renderGlobalTimeline(route, snapshot) {
   if (!timeline) {
-    renderRemoteState(route, "failed", ["timeline surface unavailable"]);
+    renderRemoteState(route, "failed", ["history surface unavailable"]);
     return;
   }
   const feeds = snapshotFeeds(snapshot);
   const headlines = snapshotHeadlines(snapshot).filter((item) => headlineMatchesRoute(item, route));
-  logInfo("feed.network.timeline.render", {
+  logInfo("feed.network.history.render", {
     network: route.network,
     feeds: feeds.length,
     headlines: headlines.length,
@@ -3022,7 +3217,7 @@ function renderGlobalTimeline(route, snapshot) {
   stopStageProgress();
   clearStoryTime();
   timeline.hidden = false;
-  document.body.dataset.view = "timeline";
+  document.body.dataset.view = "history";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "browse");
   setText(sourceCount, `${Math.max(feeds.length, headlines.length)} net`);
@@ -3087,7 +3282,7 @@ function renderGlobalTimeline(route, snapshot) {
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
-  renderTicker(["interactive network discovery", "followed feeds stay explicit"]);
+  renderTicker(["history · network discovery", "followed feeds stay explicit"]);
 }
 
 function timelineModeLink(route, mode, label, current = false) {
@@ -3112,9 +3307,9 @@ function userDiscoveryUrl(login, route = undefined) {
   }
   if (
     route?.interactive ||
-    new URLSearchParams(window.location.search).get("view") === "timeline"
+    ["history", "timeline"].includes(new URLSearchParams(window.location.search).get("view") || "")
   ) {
-    params.set("view", "timeline");
+    params.set("view", "history");
   }
   const query = params.toString();
   return `/${encodeURIComponent(login)}/*${query ? `?${query}` : ""}`;
@@ -3122,14 +3317,14 @@ function userDiscoveryUrl(login, route = undefined) {
 
 function renderTimeline(route, ticket) {
   if (!timeline) {
-    renderRemoteState(route, "failed", ["timeline surface unavailable"]);
+    renderRemoteState(route, "failed", ["history surface unavailable"]);
     return;
   }
   const feeds = ticket.feeds || ticket.candidate_feeds || [];
   const headlines = snapshotHeadlines(ticket)
     .filter((item) => headlineMatchesRoute(item, route))
     .map((item) => enrichHeadlineFromTicket(item, ticket));
-  logInfo("feed.timeline.render", {
+  logInfo("feed.history.render", {
     login: ticket.profile?.login || route.login,
     selection: route.selection,
     feeds: feeds.length,
@@ -3142,7 +3337,7 @@ function renderTimeline(route, ticket) {
   stopStageProgress();
   clearStoryTime();
   timeline.hidden = false;
-  document.body.dataset.view = "timeline";
+  document.body.dataset.view = "history";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "browse");
   updateSourceCountFromFeeds(ticket.feeds || ticket.candidate_feeds || []);
@@ -3218,7 +3413,7 @@ function renderTimeline(route, ticket) {
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
-  renderTicker([`interactive timeline · ${routeStreamLabel(route)}`, "projection mode remains automatic"]);
+  renderTicker([`history · ${routeStreamLabel(route)}`, "projection mode remains automatic"]);
 }
 
 function renderFollowingEmpty(route) {
@@ -3245,10 +3440,10 @@ function renderFollowingEmpty(route) {
 
 function renderFollowingTimeline(route, targets, results) {
   if (!timeline) {
-    renderRemoteState(route, "failed", ["timeline surface unavailable"]);
+    renderRemoteState(route, "failed", ["history surface unavailable"]);
     return;
   }
-  logInfo("feed.following.timeline.render", {
+  logInfo("feed.following.history.render", {
     network: route.network,
     targets,
   });
@@ -3258,7 +3453,7 @@ function renderFollowingTimeline(route, targets, results) {
   stopStageProgress();
   clearStoryTime();
   timeline.hidden = false;
-  document.body.dataset.view = "timeline";
+  document.body.dataset.view = "history";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "follow");
   setText(sourceCount, `${targets.length} following`);
@@ -3338,7 +3533,7 @@ function renderFollowingTimeline(route, targets, results) {
     card.append(meta, title, copy);
     timeline.appendChild(card);
   }
-  renderTicker(["interactive following timeline", "move mouse for mode switcher"]);
+  renderTicker(["history · following", "tap or move pointer for controls"]);
 }
 
 function followingTargetUrl(target) {
@@ -3346,12 +3541,12 @@ function followingTargetUrl(target) {
   if (isTagFollowTarget(clean)) {
     const params = new URLSearchParams();
     params.set("feed_mode", "following");
-    params.set("view", "timeline");
+    params.set("view", "history");
     params.set("following", clean);
     return `/?${params.toString()}`;
   }
   const [login, feed = "*"] = clean.split("/");
-  return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=following&view=timeline`;
+  return `/${encodeURIComponent(login)}/${encodeURIComponent(feed)}?feed_mode=following&view=history`;
 }
 
 function userFeedPath(login, label) {
@@ -3427,7 +3622,7 @@ function projectFilterLink(project, route) {
   link.textContent = normalizeTag(project) === normalizeTag(routeProjectFilter(route))
     ? project
     : `project ${project}`;
-  link.setAttribute("aria-label", `filter timeline to project ${project}`);
+  link.setAttribute("aria-label", `filter history to project ${project}`);
   return link;
 }
 
@@ -3435,7 +3630,7 @@ function projectFilterUrl(project, route) {
   const params = new URLSearchParams(route.query || "");
   params.set("projects", project);
   params.delete("project");
-  params.set("view", "timeline");
+  params.set("view", "history");
   for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
     params.delete(key);
   }
@@ -3584,7 +3779,7 @@ function privateFeedPill(visibility) {
 
 function feedLink(login, label, text, current = false) {
   const link = document.createElement("a");
-  link.href = `${userFeedPath(login, label)}?view=timeline`;
+  link.href = `${userFeedPath(login, label)}?view=history`;
   link.textContent = text;
   link.dataset.kind = "feed";
   if (current) {
@@ -3660,6 +3855,13 @@ function relativeTime(value) {
     return `${hours}h ago`;
   }
   return `${Math.round(hours / 24)}d ago`;
+}
+
+function relativeTimeFromAny(value) {
+  if (!value) {
+    return "";
+  }
+  return relativeTime(value);
 }
 
 function publisherLoginForProfile(feed, ticket) {

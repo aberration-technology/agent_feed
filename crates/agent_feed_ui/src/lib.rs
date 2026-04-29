@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn timeline_uses_feed_labels_without_repeating_login() {
+    fn history_uses_feed_labels_without_repeating_login() {
         let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("feedLink(route.login, \"*\", \"all feeds\""));
@@ -292,7 +292,7 @@ mod tests {
         assert!(html.contains("meta.textContent = feedLabel;"));
         assert!(html.contains("function timelineMetaText"));
         assert!(html.contains("function primaryProjectTag"));
-        assert!(html.contains("interactive timeline · ${routeStreamLabel(route)}"));
+        assert!(html.contains("history · ${routeStreamLabel(route)}"));
         assert!(!html.contains("feedLink(route.login, \"*\", `${route.login}/*`"));
         assert!(
             !html.contains("meta.textContent = `${publisherText(feed, ticket)} / ${feedLabel}`;")
@@ -385,13 +385,17 @@ mod tests {
         assert!(html.contains("function parseGlobalRoute"));
         assert!(html.contains("function startGlobalDiscoveryRoute"));
         assert!(html.contains("/network/snapshot"));
-        assert!(html.contains("network directory found ${feeds.length} feeds"));
+        assert!(html.contains("function classifyRemoteSnapshot"));
+        assert!(html.contains("function renderQuietConnected"));
+        assert!(html.contains("quiet right now"));
+        assert!(html.contains("new settled stories will appear live"));
         assert!(
             html.contains(
                 "renderPublisher(nextPublisher || (route.kind === \"global\" ? undefined"
             )
         );
         assert!(html.contains("function timelineModeLink"));
+        assert!(html.contains("body[data-view=\"history\"] .mode-switcher"));
         assert!(html.contains("body[data-view=\"timeline\"] .mode-switcher"));
         assert!(html.contains(".timeline-toolbar > span"));
         assert!(html.contains("nav.appendChild(timelineModeLink(route, \"discovery\""));
@@ -427,14 +431,15 @@ mod tests {
     }
 
     #[test]
-    fn timeline_exposes_project_filter_actions() {
+    fn history_exposes_project_filter_actions() {
         let html = render_index_with_config(Some("remote"), &config(true));
 
         assert!(html.contains("function projectFilterLink"));
         assert!(html.contains("function projectFilterUrl"));
         assert!(html.contains("function tagFollowButton"));
         assert!(html.contains("params.set(\"projects\", project);"));
-        assert!(html.contains("filter timeline to project ${project}"));
+        assert!(html.contains("filter history to project ${project}"));
+        assert!(html.contains("params.set(\"view\", \"history\");"));
         assert!(html.contains("actions.appendChild(projectFilterLink(project, route));"));
         assert!(html.contains("actions.appendChild(tagFollowButton(project));"));
     }
@@ -449,6 +454,8 @@ mod tests {
         assert!(html.contains("function personFollowTargetForBulletin"));
         assert!(html.contains("followButton(personTarget"));
         assert!(html.contains("following.textContent = \"open following\";"));
+        assert!(html.contains("stageActions.appendChild(historyAction(remoteRoute));"));
+        assert!(html.contains("link.textContent = \"history\";"));
         assert!(html.contains("body.controls-visible .stage-actions"));
         assert!(html.contains("button.setAttribute(\"aria-label\", `${active ? \"unfollow\" : \"follow\"} ${followTargetLabel(target)}`);"));
         assert!(!html.contains("activity is reduced before display"));
@@ -463,6 +470,17 @@ mod tests {
         assert!(html.contains(
             "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : \"feeds\";"
         ));
+        assert!(html.contains("modeHistory.textContent = \"history\";"));
+        assert!(html.contains("modeHistory.setAttribute(\"href\", historyUrl(route));"));
+        assert!(html.contains("function routeHistoryRequested"));
+        assert!(html.contains("view === \"history\""));
+        assert!(html.contains("params.set(\"view\", \"history\");"));
+        assert!(
+            html.contains("window.addEventListener(\"pointerdown\", reveal, { passive: true });")
+        );
+        assert!(
+            html.contains("window.addEventListener(\"touchstart\", reveal, { passive: true });")
+        );
         assert!(html.contains("params.set(\"all\", \"true\");"));
         assert!(!html.contains("params.set(\"following\", route.followingTargets.join(\",\"));"));
         assert!(
@@ -471,6 +489,7 @@ mod tests {
         assert!(html.contains("hosted feed pages do not link to loopback reels"));
         assert!(html.contains("modeFollowing.textContent = route.kind === \"user\" ? `following @${route.login}` : \"following\";"));
         assert!(html.contains("timelineModeLink(route, \"following\", \"following\""));
+        assert!(html.contains("return `${routePath(route)}${query ? `?${query}` : \"\"}`;"));
         assert!(html.contains("return `${login}/*`;"));
         assert!(html.contains("link.dataset.kind = \"mode\";"));
         assert!(html.contains("link.dataset.kind = \"feed\";"));
@@ -515,6 +534,9 @@ mod tests {
         assert!(html.contains("await startFollowingRoute(route, true);"));
         assert!(html.contains("window.setInterval(hydrate, LOCAL_SNAPSHOT_REFRESH_MS);"));
         assert!(html.contains("feed.network.discovery.headlines.unchanged"));
+        assert!(html.contains("feed.network.discovery.classified"));
+        assert!(html.contains("feed.user.classified"));
+        assert!(html.contains("feed.following.classified"));
     }
 
     #[test]
@@ -537,6 +559,7 @@ mod tests {
         assert!(html.contains("feed.bulletin.queued"));
         assert!(html.contains("feed.bulletin.queue.advance_scheduled"));
         assert!(html.contains("feed.bulletin.queue.drained"));
+        assert!(html.contains("renderQuietConnected(remoteRoute"));
         assert!(html.contains("completeActiveBulletin(\"dwell\");"));
         assert!(html.contains("queueIncomingBulletin(bulletin, \"sse\");"));
         assert!(!html.contains("activeIndex = (activeIndex + 1) % bulletins.length;"));
