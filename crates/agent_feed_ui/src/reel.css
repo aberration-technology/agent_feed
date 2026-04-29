@@ -21,6 +21,11 @@
   --stage-gap: clamp(18px, 3vh, 34px);
   --headline-max: min(100%, 28ch);
   --deck-max: min(100%, 38ch);
+  --history-toolbar: 56px;
+  --history-headline: clamp(30px, 4.7vw, 72px);
+  --history-headline-leading: 1.18;
+  --history-deck: clamp(17px, 2vw, 28px);
+  --history-deck-leading: 1.32;
 }
 
 * {
@@ -442,15 +447,20 @@ body.controls-visible .stage-actions,
 }
 
 .timeline {
+  height: 100%;
   min-height: 0;
   overflow-y: auto;
-  scroll-snap-type: y mandatory;
+  overscroll-behavior-y: contain;
+  scroll-padding-block-start: var(--history-toolbar);
+  scroll-snap-type: y proximity;
   scrollbar-width: none;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
   background:
     linear-gradient(180deg, rgba(244, 241, 234, 0.05), transparent 22vh),
     var(--bg);
   border-top: 1px solid transparent;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
 }
 
 .timeline[hidden] {
@@ -538,15 +548,17 @@ body.controls-visible .stage-actions,
 .timeline-card {
   min-width: 0;
   max-width: 100%;
-  min-height: calc(100vh - 56px - 48px);
+  min-height: calc(100% - var(--history-toolbar));
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: clamp(18px, 3vh, 34px);
-  overflow: hidden;
+  gap: clamp(14px, 2.3vh, 26px);
+  overflow: visible;
   scroll-snap-align: start;
-  scroll-snap-stop: always;
   padding: var(--pad);
+  contain: layout paint;
+  content-visibility: auto;
+  contain-intrinsic-size: 760px;
 }
 
 .timeline-card:focus-visible {
@@ -557,13 +569,13 @@ body.controls-visible .stage-actions,
 .timeline-card h2 {
   width: 100%;
   min-width: 0;
-  max-width: min(100%, 28ch);
+  max-width: min(100%, 34ch);
   margin: 0;
   color: var(--fg);
-  font-size: var(--headline);
+  font-size: var(--history-headline);
   font-weight: 620;
   letter-spacing: 0;
-  line-height: var(--headline-leading);
+  line-height: var(--history-headline-leading);
   overflow-wrap: break-word;
   text-wrap: balance;
   word-break: normal;
@@ -578,13 +590,13 @@ body.controls-visible .stage-actions,
 
 .timeline-card p {
   width: 100%;
-  max-width: 38ch;
+  max-width: 52ch;
   min-width: 0;
   margin: 0;
   color: var(--fg);
-  font-size: var(--deck);
+  font-size: var(--history-deck);
   font-weight: 360;
-  line-height: var(--deck-leading);
+  line-height: var(--history-deck-leading);
   overflow-wrap: anywhere;
   text-wrap: pretty;
   word-break: normal;
@@ -688,6 +700,11 @@ body[data-mode="breaking"] .chips span {
     --headline-leading: 1.22;
     --deck: 16px;
     --deck-leading: 1.26;
+    --history-toolbar: 116px;
+    --history-headline: clamp(24px, 8vw, 36px);
+    --history-headline-leading: 1.24;
+    --history-deck: clamp(15px, 4.5vw, 18px);
+    --history-deck-leading: 1.36;
   }
 
   .reel {
@@ -799,8 +816,8 @@ body[data-mode="breaking"] .chips span {
   }
 
   .timeline-card {
-    min-height: calc(100vh - 116px - 56px);
-    gap: 16px;
+    min-height: calc(100% - var(--history-toolbar));
+    gap: 14px;
     padding: var(--pad);
   }
 
