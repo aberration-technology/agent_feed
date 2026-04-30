@@ -1,7 +1,7 @@
 use agent_feed_directory::{
     DirectoryError, DirectoryStore, GithubDiscoveryTicket, GithubProfileView, OrgDiscoveryTicket,
-    OrgRouteFilter, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute, SignedBrowserSeed,
-    ensure_current_compatibility, ensure_network_id,
+    OrgRouteFilter, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute, ResolveFeedView,
+    SignedBrowserSeed, ensure_current_compatibility, ensure_network_id,
 };
 use agent_feed_identity::{GithubLogin, GithubOrgName, GithubTeamSlug};
 use agent_feed_identity_github::{
@@ -9,7 +9,7 @@ use agent_feed_identity_github::{
     GithubUserResponse, StaticGithubResolver,
 };
 use agent_feed_p2p_proto::{
-    ProtocolCompatibility, PublisherIdentity, Signature, Signed, StoryCapsule,
+    FeedVisibility, ProtocolCompatibility, PublisherIdentity, Signature, Signed, StoryCapsule,
     github_org_provider_key, github_org_topic, github_provider_key, github_team_provider_key,
     github_team_topic, github_user_topic,
 };
@@ -336,22 +336,6 @@ pub struct ResolveGithubResponse {
     pub signature: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolveFeedView {
-    pub feed_id: String,
-    pub label: String,
-    pub compatibility: ProtocolCompatibility,
-    pub visibility: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub publisher_github_user_id: Option<u64>,
-    pub publisher_login: String,
-    pub publisher_display_name: Option<String>,
-    pub publisher_avatar: Option<String>,
-    pub publisher_verified: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    pub last_seen_at: OffsetDateTime,
-}
-
 impl From<&GithubDiscoveryTicket> for ResolveGithubResponse {
     fn from(ticket: &GithubDiscoveryTicket) -> Self {
         Self::from_ticket(ticket, &EdgeConfig::mainnet())
@@ -441,18 +425,10 @@ fn resolve_feed_view(
     feed: &agent_feed_directory::FeedDirectoryEntry,
     config: &EdgeConfig,
 ) -> ResolveFeedView {
-    ResolveFeedView {
-        feed_id: feed.feed_id.clone(),
-        label: feed.feed_label.clone(),
-        compatibility: feed.compatibility.clone(),
-        visibility: format!("{:?}", feed.visibility).to_ascii_lowercase(),
-        publisher_github_user_id: Some(feed.owner.github_user_id.get()),
-        publisher_login: feed.owner.current_login.clone(),
-        publisher_display_name: feed.owner.display_name.clone(),
-        publisher_avatar: Some(config.github_avatar_url(feed.owner.github_user_id.get())),
-        publisher_verified: true,
-        last_seen_at: feed.last_seen_at,
-    }
+    ResolveFeedView::from_entry(
+        feed,
+        Some(config.github_avatar_url(feed.owner.github_user_id.get())),
+    )
 }
 
 fn feed_views_from_headlines(headlines: Vec<RemoteHeadlineView>) -> Vec<ResolveFeedView> {
@@ -464,18 +440,10 @@ fn feed_views_from_headlines(headlines: Vec<RemoteHeadlineView>) -> Vec<ResolveF
         {
             continue;
         }
-        feeds.push(ResolveFeedView {
-            feed_id: headline.feed_id,
-            label: headline.feed_label,
-            compatibility: headline.compatibility,
-            visibility: "public".to_string(),
-            publisher_github_user_id: headline.publisher_github_user_id,
-            publisher_login: headline.publisher_login,
-            publisher_display_name: headline.publisher_display_name,
-            publisher_avatar: headline.publisher_avatar,
-            publisher_verified: headline.verified,
-            last_seen_at: OffsetDateTime::now_utc(),
-        });
+        feeds.push(ResolveFeedView::from_headline(
+            headline,
+            OffsetDateTime::now_utc(),
+        ));
     }
     feeds
 }
@@ -930,22 +898,7 @@ async fn spawn_udp_probe_listener(
 }
 
 fn fabric_probe_payload(edge: &EdgeConfig, transport: &str) -> String {
-    serde_json::json!({
-        "product": agent_feed_p2p_proto::AGENT_FEED_PRODUCT,
-        "protocol": agent_feed_p2p_proto::AGENT_FEED_EDGE_PROTOCOL,
-        "protocol_version": agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
-        "model_version": agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
-        "min_model_version": agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION,
-        "release_version": agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION,
-        "transport": transport,
-        "network_id": edge.network_id,
-        "edge": edge.edge_domain,
-        "bootstrap_topology": "single_bootstrap",
-        "data_plane": "edge_snapshot_fallback",
-        "state": "ready"
-    })
-    .to_string()
-        + "\n"
+    edge_status_payload(Some(edge), Some(transport)).to_string() + "\n"
 }
 
 fn env_bool(name: &str) -> bool {
@@ -966,16 +919,42 @@ async fn healthz() -> &'static str {
 }
 
 async fn readyz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+    Json(edge_status_payload(None, None))
+}
+
+fn edge_status_payload(edge: Option<&EdgeConfig>, transport: Option<&str>) -> serde_json::Value {
+    let compatibility = ProtocolCompatibility::current();
+    let mut payload = serde_json::json!({
         "state": "ready",
-        "product": "feed",
-        "protocol_version": agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
-        "model_version": agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
-        "min_model_version": agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION,
-        "release_version": agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION,
+        "product": compatibility.product,
+        "protocol": agent_feed_p2p_proto::AGENT_FEED_EDGE_PROTOCOL,
+        "protocol_version": compatibility.protocol_version,
+        "model_version": compatibility.model_version,
+        "min_model_version": compatibility.min_model_version,
+        "release_version": compatibility.release_version,
         "bootstrap_topology": "single_bootstrap",
         "data_plane": "edge_snapshot_fallback",
-    }))
+    });
+    let Some(object) = payload.as_object_mut() else {
+        return payload;
+    };
+    if let Some(edge) = edge {
+        object.insert(
+            "network_id".to_string(),
+            serde_json::Value::String(edge.network_id.clone()),
+        );
+        object.insert(
+            "edge".to_string(),
+            serde_json::Value::String(edge.edge_domain.clone()),
+        );
+    }
+    if let Some(transport) = transport {
+        object.insert(
+            "transport".to_string(),
+            serde_json::Value::String(transport.to_string()),
+        );
+    }
+    payload
 }
 
 async fn auth_github(
@@ -1484,26 +1463,14 @@ fn feed_view_from_publish(
     compatibility: &ProtocolCompatibility,
     publisher: &PublisherIdentity,
 ) -> ResolveFeedView {
-    let publisher_login =
-        publisher
-            .github_login
-            .clone()
-            .unwrap_or_else(|| match publisher.github_user_id {
-                Some(id) => format!("github:{id}"),
-                None => "verified-peer".to_string(),
-            });
-    ResolveFeedView {
-        feed_id: feed_id.to_string(),
-        label: feed_name.to_string(),
-        compatibility: compatibility.clone(),
-        visibility: "public".to_string(),
-        publisher_github_user_id: publisher.github_user_id,
-        publisher_login,
-        publisher_display_name: publisher.display_name.clone(),
-        publisher_avatar: publisher.avatar.clone(),
-        publisher_verified: publisher.verified,
-        last_seen_at: OffsetDateTime::now_utc(),
-    }
+    ResolveFeedView::from_publisher(
+        feed_id,
+        feed_name,
+        compatibility.clone(),
+        FeedVisibility::Public,
+        publisher,
+        OffsetDateTime::now_utc(),
+    )
 }
 
 fn headline_matches_github_route(

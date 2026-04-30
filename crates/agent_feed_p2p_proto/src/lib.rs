@@ -90,6 +90,16 @@ impl ProtocolCompatibility {
             message: compatibility_message(self, remote),
         }
     }
+
+    #[must_use]
+    pub fn to_json_string(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| compatibility_json_fallback(self))
+    }
+
+    #[must_use]
+    pub fn current_json_string() -> String {
+        Self::current().to_json_string()
+    }
 }
 
 impl Default for ProtocolCompatibility {
@@ -129,6 +139,33 @@ fn compatibility_message(local: &ProtocolCompatibility, remote: &ProtocolCompati
     } else {
         "incompatible feed data model".to_string()
     }
+}
+
+fn compatibility_json_fallback(value: &ProtocolCompatibility) -> String {
+    format!(
+        "{{\"product\":\"{}\",\"release_version\":\"{}\",\"protocol_version\":{},\"model_version\":{},\"min_model_version\":{}}}",
+        escape_json_str(&value.product),
+        escape_json_str(&value.release_version),
+        value.protocol_version,
+        value.model_version,
+        value.min_model_version
+    )
+}
+
+fn escape_json_str(value: &str) -> String {
+    let mut output = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch.is_control() => output.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => output.push(ch),
+        }
+    }
+    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +296,20 @@ pub enum FeedVisibility {
     GithubTeam,
     GithubRepo,
     Public,
+}
+
+impl FeedVisibility {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::GithubUser => "github_user",
+            Self::GithubOrg => "github_org",
+            Self::GithubTeam => "github_team",
+            Self::GithubRepo => "github_repo",
+            Self::Public => "public",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

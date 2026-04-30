@@ -25,24 +25,13 @@ pub fn render_index_with_config(view: Option<&str>, config: &UiConfig) -> String
         "window.FEED_P2P_ENABLED = {};\nwindow.FEED_BUILD_REV = {};\nwindow.FEED_COMPATIBILITY = {};",
         if config.p2p_enabled { "true" } else { "false" },
         js_string(&revision),
-        compatibility_js()
+        agent_feed_p2p_proto::ProtocolCompatibility::current_json_string()
     );
     INDEX_HTML
         .replace("/*__REEL_CSS__*/", REEL_CSS)
         .replace("/*__REEL_JS__*/", REEL_JS)
         .replace("/*__FEED_CONFIG__*/", &config_js)
         .replace("__REEL_VIEW__", view.unwrap_or("stage"))
-}
-
-fn compatibility_js() -> String {
-    format!(
-        "{{\"product\":{},\"release_version\":{},\"protocol_version\":{},\"model_version\":{},\"min_model_version\":{}}}",
-        js_string(agent_feed_p2p_proto::AGENT_FEED_PRODUCT),
-        js_string(agent_feed_p2p_proto::AGENT_FEED_RELEASE_VERSION),
-        agent_feed_p2p_proto::AGENT_FEED_PROTOCOL_VERSION,
-        agent_feed_p2p_proto::AGENT_FEED_MODEL_VERSION,
-        agent_feed_p2p_proto::AGENT_FEED_MIN_MODEL_VERSION
-    )
 }
 
 fn default_revision() -> Option<String> {

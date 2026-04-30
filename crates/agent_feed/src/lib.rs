@@ -7,8 +7,8 @@ pub use agent_feed_core::{
 #[cfg(feature = "p2p")]
 pub use agent_feed_directory::{
     DirectoryStore, FeedDirectoryEntry, GithubDiscoveryTicket, GithubPrincipal, NetworkSelector,
-    ReelLayout, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute, StreamDescriptor,
-    StreamFilter,
+    ReelLayout, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute, ResolveFeedView,
+    StreamDescriptor, StreamFilter,
 };
 pub use agent_feed_filter::EventFilter;
 pub use agent_feed_highlight::{bulletin_from_event, score_event};

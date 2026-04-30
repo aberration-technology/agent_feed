@@ -32,6 +32,21 @@ fn is_test_command(command: &str) -> bool {
         || lowered.contains("mvn test")
 }
 
+fn project_label_from_cwd(cwd: &str) -> Option<String> {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(normalized_project_label)
+}
+
+fn normalized_project_label(label: &str) -> String {
+    if label.to_ascii_lowercase().starts_with("agent_reel") {
+        "agent_feed".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
 fn display_safe_content_sentence(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => display_safe_agent_sentence(value),
@@ -882,10 +897,7 @@ pub mod codex {
     }
 
     fn project_from_cwd(cwd: &str) -> Option<String> {
-        Path::new(cwd)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
+        project_label_from_cwd(cwd)
     }
 
     fn is_generic_root_project(project: &str) -> bool {
@@ -964,7 +976,7 @@ pub mod codex {
             return Some("agent_feed".to_string());
         }
         if normalized.starts_with("agent_reel") {
-            return Some("agent_reel".to_string());
+            return Some("agent_feed".to_string());
         }
         None
     }
@@ -982,7 +994,7 @@ pub mod codex {
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
         {
-            return Some(normalized);
+            return Some(normalized_project_label(&normalized));
         }
         None
     }
@@ -1717,10 +1729,7 @@ pub mod claude {
     }
 
     fn project_from_cwd(cwd: &str) -> Option<String> {
-        Path::new(cwd)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(ToOwned::to_owned)
+        project_label_from_cwd(cwd)
     }
 
     fn session_id_from_path(path: Option<&Path>) -> Option<String> {
@@ -1854,6 +1863,19 @@ mod tests {
             events[2].summary.as_deref(),
             Some("interrupted by operator.")
         );
+    }
+
+    #[test]
+    fn codex_transcript_normalizes_legacy_agent_reel_workspace_name() {
+        let transcript = r#"
+{"type":"session_meta","timestamp":"2026-04-24T03:16:49.696Z","payload":{"id":"session","cwd":"/home/mosure/repos/agent_reel"}}
+{"type":"turn_context","timestamp":"2026-04-24T03:16:49.697Z","payload":{"cwd":"/home/mosure/repos/agent_reel","turn_id":"turn_1"}}
+"#;
+
+        let events = normalize_transcript(transcript, None).expect("transcript normalizes");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].project.as_deref(), Some("agent_feed"));
     }
 
     #[test]
