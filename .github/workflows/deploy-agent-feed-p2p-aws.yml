@@ -425,10 +425,11 @@ jobs:
               --query Command.CommandId \
               --output text
           )"
+          echo "edge host sync command: ${command_id}"
           aws ssm wait command-executed \
             --region "$AWS_REGION" \
             --instance-id "$instance_id" \
-            --command-id "$command_id"
+            --command-id "$command_id" || true
           invocation="$(aws ssm get-command-invocation \
             --region "$AWS_REGION" \
             --instance-id "$instance_id" \
