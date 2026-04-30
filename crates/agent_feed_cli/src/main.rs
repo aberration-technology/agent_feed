@@ -19,10 +19,9 @@ use agent_feed_p2p_proto::{
 };
 use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve_with_ready};
-use agent_feed_story::{
-    CompiledStory, StoryCompiler, StoryCompilerDiagnostics, StoryDecision, StoryDecisionAction,
-    compile_events,
-};
+use agent_feed_story::{CompiledStory, compile_events};
+#[cfg(test)]
+use agent_feed_story::StoryCompiler;
 use agent_feed_summarize::{
     DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
     GuardrailPattern, INTERNAL_SUMMARIZER_MARKER, ImageDecisionMode, ImageProcessorConfig,
@@ -814,7 +813,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     codex_history,
                     codex_sessions_dir,
                     claude_projects_dir,
-                    event_sink: publish_sink.as_ref().map(|(sender, _)| sender.clone()),
+                    event_sink: None,
                     processor_registry: publish_sink
                         .as_ref()
                         .map(|(_, registry)| registry.clone())
@@ -825,6 +824,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 ServerConfig {
                     security,
                     p2p_enabled,
+                    story_sink: publish_sink.as_ref().map(|(sender, _)| sender.clone()),
                 },
                 move |bind| {
                     println!("serving http://{bind}/reel");
@@ -2030,7 +2030,7 @@ struct ServeAgentCapture {
 }
 
 struct ServePublishConfig {
-    receiver: mpsc::Receiver<AgentEvent>,
+    receiver: mpsc::Receiver<CompiledStory>,
     server: String,
     edge: String,
     network_id: String,
@@ -2212,56 +2212,39 @@ fn run_serve_publisher(config: ServePublishConfig) {
         },
     );
 
-    let mut compiler = StoryCompiler::default();
     let mut pending = Vec::<CompiledStory>::new();
     let mut recent = VecDeque::<RecentSummary>::new();
     let mut next_seq = 1u64;
     let mut last_publish = Instant::now();
-    let mut last_flush = Instant::now();
     let mut last_presence = Instant::now() - Duration::from_secs(60);
 
     loop {
         match config.receiver.recv_timeout(Duration::from_millis(500)) {
-            Ok(event) => {
-                if config.processor_registry.drop_processor_event(&event) {
-                    continue;
-                }
-                debug!(
-                    event_id = %event.id,
-                    kind = ?event.kind,
-                    agent = %event.agent,
-                    project = event.project.as_deref().unwrap_or("local"),
-                    session_id = event.session_id.as_deref().unwrap_or("<none>"),
-                    turn_id = event.turn_id.as_deref().unwrap_or("<none>"),
-                    score_hint = event.score_hint.unwrap_or_default(),
-                    startup_context = event.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG),
-                    "p2p publisher received local event"
+            Ok(story) => {
+                info!(
+                    feed_name = %config.feed,
+                    project = story.project.as_deref().unwrap_or("local"),
+                    family = ?story.family,
+                    score = story.score,
+                    context_score = story.context_score,
+                    headline = %story.headline,
+                    "p2p publisher received settled local story"
                 );
-                let stories = compiler.ingest(event);
-                log_story_compiler_decision("ingest", &compiler.diagnostics());
-                if !stories.is_empty() {
-                    info!(
-                        stories = stories.len(),
-                        "p2p publisher queued story updates"
-                    );
-                    for story in &stories {
-                        log_compiled_story("queued", story);
-                    }
-                    pending.extend(stories);
-                    post_serve_publish_status(
-                        &config,
-                        PublishStatusPost {
-                            state: "queued",
-                            pending_stories: pending.len(),
-                            detail: Some("story updates queued for publish"),
-                            ..PublishStatusPost::default()
-                        },
-                    );
-                }
+                log_compiled_story("queued", &story);
+                pending.push(story);
+                post_serve_publish_status(
+                    &config,
+                    PublishStatusPost {
+                        state: "queued",
+                        pending_stories: pending.len(),
+                        detail: Some("settled local story queued for publish"),
+                        ..PublishStatusPost::default()
+                    },
+                );
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                warn!("p2p publisher event channel disconnected");
+                warn!("p2p publisher story channel disconnected");
                 return;
             }
         }
@@ -2299,31 +2282,6 @@ fn run_serve_publisher(config: ServePublishConfig) {
                         },
                     );
                 }
-            }
-        }
-
-        if last_flush.elapsed() >= config.publish_interval {
-            let flushed = compiler.flush();
-            log_story_compiler_decision("flush", &compiler.diagnostics());
-            last_flush = Instant::now();
-            if !flushed.is_empty() {
-                info!(
-                    stories = flushed.len(),
-                    "p2p publisher flushed story windows"
-                );
-                for story in &flushed {
-                    log_compiled_story("flushed", story);
-                }
-                pending.extend(flushed);
-                post_serve_publish_status(
-                    &config,
-                    PublishStatusPost {
-                        state: "queued",
-                        pending_stories: pending.len(),
-                        detail: Some("story compiler flushed publishable windows"),
-                        ..PublishStatusPost::default()
-                    },
-                );
             }
         }
 
@@ -2542,66 +2500,6 @@ fn publish_story_batch(
     })
 }
 
-fn log_story_compiler_decision(scope: &'static str, diagnostics: &StoryCompilerDiagnostics) {
-    let Some(decision) = diagnostics.last_decision.as_ref() else {
-        return;
-    };
-    match decision.action {
-        StoryDecisionAction::Published
-        | StoryDecisionAction::Rejected
-        | StoryDecisionAction::Deduped => log_story_decision_info(scope, decision, diagnostics),
-        StoryDecisionAction::Retained => {
-            debug!(
-                scope,
-                action = story_decision_action(decision.action),
-                reason = %decision.reason,
-                agent = %decision.agent,
-                family = ?decision.family,
-                score = decision.score,
-                context_score = decision.context_score,
-                open_windows = diagnostics.open_windows,
-                retained_windows = diagnostics.retained_windows,
-                "story compiler retained a window"
-            );
-        }
-        StoryDecisionAction::Waiting => {
-            debug!(
-                scope,
-                action = story_decision_action(decision.action),
-                reason = %decision.reason,
-                agent = %decision.agent,
-                family = ?decision.family,
-                score = decision.score,
-                context_score = decision.context_score,
-                open_windows = diagnostics.open_windows,
-                "story compiler waiting"
-            );
-        }
-    }
-}
-
-fn log_story_decision_info(
-    scope: &'static str,
-    decision: &StoryDecision,
-    diagnostics: &StoryCompilerDiagnostics,
-) {
-    info!(
-        scope,
-        action = story_decision_action(decision.action),
-        reason = %decision.reason,
-        agent = %decision.agent,
-        family = ?decision.family,
-        score = decision.score,
-        context_score = decision.context_score,
-        open_windows = diagnostics.open_windows,
-        settled_windows = diagnostics.settled_windows,
-        published_stories = diagnostics.published_stories,
-        rejected_stories = diagnostics.rejected_stories,
-        deduped_stories = diagnostics.deduped_stories,
-        "story compiler decision"
-    );
-}
-
 fn log_compiled_story(stage: &'static str, story: &CompiledStory) {
     info!(
         stage,
@@ -2616,16 +2514,6 @@ fn log_compiled_story(stage: &'static str, story: &CompiledStory) {
         deck_words = story.deck.split_whitespace().count(),
         "story queued for p2p summarization"
     );
-}
-
-fn story_decision_action(action: StoryDecisionAction) -> &'static str {
-    match action {
-        StoryDecisionAction::Waiting => "waiting",
-        StoryDecisionAction::Retained => "retained",
-        StoryDecisionAction::Rejected => "rejected",
-        StoryDecisionAction::Deduped => "deduped",
-        StoryDecisionAction::Published => "published",
-    }
 }
 
 fn summary_processor_label(config: &SummaryConfig) -> &'static str {

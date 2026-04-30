@@ -7,7 +7,9 @@ use agent_feed_security::{
     SecurityConfig, SecurityError, requires_display_token, token_matches, validate_bind,
 };
 use agent_feed_store::InMemoryStore;
-use agent_feed_story::{StoryCompiler, StoryCompilerDiagnostics, StoryDecisionAction, StoryFamily};
+use agent_feed_story::{
+    CompiledStory, StoryCompiler, StoryCompilerDiagnostics, StoryDecisionAction, StoryFamily,
+};
 use agent_feed_ui::UiConfig;
 use agent_feed_views::{
     AdaptersView, AgentsView, BulletinsView, CaptureWatchUpdate, CaptureWatchView, EventsView,
@@ -26,7 +28,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -40,6 +42,7 @@ use tower_http::trace::TraceLayer;
 pub struct ServerConfig {
     pub security: SecurityConfig,
     pub p2p_enabled: bool,
+    pub story_sink: Option<mpsc::Sender<CompiledStory>>,
 }
 
 const STORY_FLUSH_INTERVAL: Duration = Duration::from_secs(15);
@@ -69,6 +72,7 @@ struct AppState {
     tx: broadcast::Sender<Bulletin>,
     redactor: Redactor,
     story: Mutex<StoryCompiler>,
+    story_sink: Option<mpsc::Sender<CompiledStory>>,
     capture_watchers: Mutex<BTreeMap<(String, String, String), CaptureWatchView>>,
     publish_status: Mutex<Option<PublishStatusView>>,
     metrics: Metrics,
@@ -103,6 +107,7 @@ pub fn app_with_config(bind: SocketAddr, p2p_enabled: bool) -> Router {
             ..SecurityConfig::default()
         },
         p2p_enabled,
+        story_sink: None,
     })
 }
 
@@ -117,6 +122,7 @@ pub fn app_with_server_config(config: ServerConfig) -> Router {
         tx,
         redactor: Redactor::default(),
         story: Mutex::new(StoryCompiler::default()),
+        story_sink: config.story_sink,
         capture_watchers: Mutex::new(BTreeMap::new()),
         publish_status: Mutex::new(None),
         metrics: Metrics::default(),
@@ -779,6 +785,7 @@ async fn ingest_event(
             AppError::StatePoisoned
         })?
         .ingest(event.clone());
+    forward_stories(&state, &stories, "ingest");
     let bulletins = stories
         .iter()
         .map(agent_feed_story::CompiledStory::to_bulletin)
@@ -825,6 +832,7 @@ async fn flush_story_windows(state: Arc<AppState>) -> Result<usize, AppError> {
         .iter()
         .map(agent_feed_story::CompiledStory::to_bulletin)
         .collect::<Vec<_>>();
+    forward_stories(&state, &stories, "flush");
     let count = bulletins.len();
     emit_bulletins(&state, bulletins, "flush")?;
     tracing::info!(
@@ -833,6 +841,30 @@ async fn flush_story_windows(state: Arc<AppState>) -> Result<usize, AppError> {
         "story windows flushed"
     );
     Ok(count)
+}
+
+fn forward_stories(state: &Arc<AppState>, stories: &[CompiledStory], origin: &'static str) {
+    let Some(sink) = &state.story_sink else {
+        return;
+    };
+    for story in stories {
+        if let Err(err) = sink.send(story.clone()) {
+            tracing::warn!(
+                %origin,
+                story_headline = %story.headline,
+                error = %err,
+                "settled story publish sink disconnected"
+            );
+            return;
+        }
+        tracing::debug!(
+            %origin,
+            story_headline = %story.headline,
+            story_project = story.project.as_deref().unwrap_or("local"),
+            story_score = story.score,
+            "settled story forwarded to publish sink"
+        );
+    }
 }
 
 fn emit_bulletins(
@@ -920,10 +952,17 @@ mod tests {
     use agent_feed_core::{EventKind, PrivacyClass, Severity};
 
     fn test_state() -> Arc<AppState> {
-        test_state_with_p2p(false)
+        test_state_with_options(false, None)
     }
 
     fn test_state_with_p2p(p2p_enabled: bool) -> Arc<AppState> {
+        test_state_with_options(p2p_enabled, None)
+    }
+
+    fn test_state_with_options(
+        p2p_enabled: bool,
+        story_sink: Option<mpsc::Sender<CompiledStory>>,
+    ) -> Arc<AppState> {
         let (tx, _) = broadcast::channel(16);
         Arc::new(AppState {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -937,6 +976,7 @@ mod tests {
             tx,
             redactor: Redactor::default(),
             story: Mutex::new(StoryCompiler::default()),
+            story_sink,
             capture_watchers: Mutex::new(BTreeMap::new()),
             publish_status: Mutex::new(None),
             metrics: Metrics::default(),
@@ -1024,6 +1064,37 @@ mod tests {
                     !text.contains("sk-test_secret") && !text.contains("ghp_privateToken")
                 })
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_forwards_settled_story_to_publish_sink() {
+        let (sender, receiver) = mpsc::channel();
+        let state = test_state_with_options(true, Some(sender));
+        let mut event = AgentEvent::new(
+            SourceKind::Codex,
+            EventKind::TurnComplete,
+            "codex turn completed",
+        );
+        event.agent = "codex".to_string();
+        event.adapter = "codex.test".to_string();
+        event.project = Some("burn_p2p".to_string());
+        event.session_id = Some("session".to_string());
+        event.turn_id = Some("turn".to_string());
+        event.summary = Some(
+            "Burn_p2p release verification now publishes browser and native peer readiness."
+                .to_string(),
+        );
+        event.score_hint = Some(86);
+
+        let Json(view) = ingest_event(state, event).await.expect("event ingests");
+
+        assert!(view.accepted);
+        assert_eq!(view.bulletin_ids.len(), 1);
+        let story = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("settled story forwarded");
+        assert_eq!(story.project.as_deref(), Some("burn_p2p"));
+        assert!(story.headline.contains("release verification"));
     }
 
     #[tokio::test]
