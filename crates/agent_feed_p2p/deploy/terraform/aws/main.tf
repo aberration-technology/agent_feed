@@ -374,6 +374,19 @@ resource "aws_route53_record" "edge" {
   allow_overwrite = true
 }
 
+resource "aws_route53_record" "edge_caa" {
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = local.edge_domain_name_normalized
+  type    = "CAA"
+  ttl     = 300
+  records = [
+    "0 issue \"letsencrypt.org\"",
+    "0 issue \"sectigo.com\"",
+    "0 issue \"zerossl.com\"",
+  ]
+  allow_overwrite = true
+}
+
 resource "aws_route53_record" "browser" {
   zone_id         = data.aws_route53_zone.selected.zone_id
   name            = local.browser_app_hostname_normalized
