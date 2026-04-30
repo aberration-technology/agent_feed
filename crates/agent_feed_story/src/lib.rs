@@ -1812,8 +1812,6 @@ fn active_update_fingerprint(window: &StoryWindow, story: &CompiledStory) -> Str
         .map(|summary| story_update_signature(summary, ""));
     let mut fingerprint = semantic_story_fingerprint(&story.headline, &story.deck);
     if let Some(signature) = summary_signature {
-        fingerprint.push_str(" source_topic=");
-        fingerprint.push_str(&signature.topic_fingerprint);
         fingerprint.push_str(" source_state=");
         fingerprint.push_str(&signature.state_fingerprint);
         fingerprint.push_str(" source_impact=");
@@ -2688,6 +2686,37 @@ mod tests {
         assert_eq!(
             second[0].headline,
             "burn_dragon deploy clears browser canaries"
+        );
+    }
+
+    #[test]
+    fn same_open_turn_wording_change_without_state_change_is_deduped() {
+        let mut compiler = StoryCompiler::default();
+        let mut first = event(EventKind::AgentMessage, "codex posted an update");
+        first.project = Some("agent_reel".to_string());
+        first.summary = Some(
+            "Static pages, edge APIs, and network canaries can be verified together across the feed deployment path."
+                .to_string(),
+        );
+        assert!(compiler.ingest(first).is_empty());
+        assert_eq!(compiler.flush().len(), 1);
+
+        let mut repeated = event(EventKind::AgentMessage, "codex posted an update");
+        repeated.project = Some("agent_reel".to_string());
+        repeated.summary = Some(
+            "Static pages, edge APIs, and network canaries can still be verified together across the same feed deployment path."
+                .to_string(),
+        );
+        assert!(compiler.ingest(repeated).is_empty());
+
+        assert!(compiler.flush().is_empty());
+        assert_eq!(
+            compiler
+                .diagnostics()
+                .last_decision
+                .as_ref()
+                .map(|decision| decision.action),
+            Some(StoryDecisionAction::Deduped)
         );
     }
 
