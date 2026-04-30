@@ -357,6 +357,91 @@ jobs:
           name: feed-terraform-outputs
           path: ${{ runner.temp }}/feed-terraform-outputs.json
 
+      - name: sync edge host
+        if: ${{ env.APPLY_TERRAFORM == 'true' }}
+        working-directory: ${{ env.TF_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          instance_id="$(terraform output -raw edge_instance_id)"
+          sync_dir="$RUNNER_TEMP/feed-edge-sync"
+          mkdir -p "$sync_dir"
+
+          terraform output -raw rendered_caddyfile > "$sync_dir/Caddyfile"
+          terraform output -raw rendered_edge_env > "$sync_dir/edge.env"
+          terraform output -raw rendered_edge_toml > "$sync_dir/edge.toml"
+          terraform output -raw rendered_edge_service_unit > "$sync_dir/agent-feed-edge.service"
+
+          caddy_b64="$(base64 -w0 "$sync_dir/Caddyfile")"
+          edge_env_b64="$(base64 -w0 "$sync_dir/edge.env")"
+          edge_toml_b64="$(base64 -w0 "$sync_dir/edge.toml")"
+          edge_service_b64="$(base64 -w0 "$sync_dir/agent-feed-edge.service")"
+          binary_s3_uri="s3://${TF_STATE_BUCKET}/${AGENT_FEED_BINARY_S3_KEY}"
+
+          parameters="$(
+            jq -n \
+              --arg binary_s3_uri "$binary_s3_uri" \
+              --arg caddy_b64 "$caddy_b64" \
+              --arg edge_env_b64 "$edge_env_b64" \
+              --arg edge_toml_b64 "$edge_toml_b64" \
+              --arg edge_service_b64 "$edge_service_b64" \
+              --arg github_client_id_parameter "$GITHUB_CLIENT_ID_PARAMETER_NAME" \
+              --arg github_client_secret_parameter "$GITHUB_CLIENT_SECRET_PARAMETER_NAME" \
+              '{
+                commands: [
+                  "set -euxo pipefail",
+                  "cloud-init status --wait || true",
+                  "if ! id agent-feed >/dev/null 2>&1; then sudo useradd --system --home-dir /var/lib/agent-feed --create-home --shell /usr/sbin/nologin agent-feed; fi",
+                  "sudo install -d -m 0755 /etc/agent-feed /usr/local/bin",
+                  "sudo install -d -m 0750 -o agent-feed -g agent-feed /var/lib/agent-feed",
+                  ("aws s3 cp " + ($binary_s3_uri | @sh) + " /tmp/agent-feed.new"),
+                  "sudo install -m 0755 -o root -g root /tmp/agent-feed.new /usr/local/bin/agent-feed",
+                  ("printf %s " + ($caddy_b64 | @sh) + " | base64 -d | sudo tee /etc/caddy/Caddyfile >/dev/null"),
+                  ("printf %s " + ($edge_env_b64 | @sh) + " | base64 -d | sudo tee /etc/agent-feed/edge.env >/dev/null"),
+                  ("github_client_id=$(aws ssm get-parameter --name " + ($github_client_id_parameter | @sh) + " --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"),
+                  ("github_client_secret=$(aws ssm get-parameter --name " + ($github_client_secret_parameter | @sh) + " --with-decryption --query Parameter.Value --output text 2>/dev/null || true)"),
+                  "if [ -n \"${github_client_id:-}\" ]; then printf '\''AGENT_FEED_GITHUB_CLIENT_ID=%s\\n'\'' \"$github_client_id\" | sudo tee -a /etc/agent-feed/edge.env >/dev/null; fi",
+                  "if [ -n \"${github_client_secret:-}\" ]; then printf '\''AGENT_FEED_GITHUB_CLIENT_SECRET=%s\\n'\'' \"$github_client_secret\" | sudo tee -a /etc/agent-feed/edge.env >/dev/null; fi",
+                  "sudo chmod 0640 /etc/agent-feed/edge.env",
+                  "sudo chown root:agent-feed /etc/agent-feed/edge.env",
+                  ("printf %s " + ($edge_toml_b64 | @sh) + " | base64 -d | sudo tee /etc/agent-feed/edge.toml >/dev/null"),
+                  "sudo chmod 0644 /etc/agent-feed/edge.toml",
+                  ("printf %s " + ($edge_service_b64 | @sh) + " | base64 -d | sudo tee /etc/systemd/system/agent-feed-edge.service >/dev/null"),
+                  "sudo caddy validate --config /etc/caddy/Caddyfile",
+                  "sudo systemctl daemon-reload",
+                  "sudo systemctl restart agent-feed-edge",
+                  "sudo systemctl reload caddy || sudo systemctl restart caddy",
+                  "sudo systemctl --no-pager --full status agent-feed-edge caddy"
+                ]
+              }'
+          )"
+
+          command_id="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$instance_id" \
+              --document-name AWS-RunShellScript \
+              --parameters "$parameters" \
+              --query Command.CommandId \
+              --output text
+          )"
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --command-id "$command_id"
+          invocation="$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --command-id "$command_id" \
+            --output json)"
+          status="$(jq -r '.Status' <<<"$invocation")"
+          jq -r '.StandardOutputContent' <<<"$invocation"
+          jq -r '.StandardErrorContent' <<<"$invocation" >&2
+          if [ "$status" != "Success" ]; then
+            echo "edge host sync failed with status ${status}" >&2
+            exit 1
+          fi
+
       - name: edge health canary
         if: ${{ env.APPLY_TERRAFORM == 'true' }}
         shell: bash

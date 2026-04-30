@@ -48,6 +48,26 @@ output "edge_resolver_url" {
   value       = "${local.edge_url}/resolve/github/${var.canary_github_login}"
 }
 
+output "rendered_caddyfile" {
+  description = "Rendered Caddyfile synced to the edge host by the deploy workflow."
+  value       = local.caddyfile
+}
+
+output "rendered_edge_env" {
+  description = "Rendered non-secret edge environment synced to the edge host by the deploy workflow."
+  value       = local.edge_env
+}
+
+output "rendered_edge_toml" {
+  description = "Rendered edge TOML config synced to the edge host by the deploy workflow."
+  value       = local.edge_toml
+}
+
+output "rendered_edge_service_unit" {
+  description = "Rendered systemd unit synced to the edge host by the deploy workflow."
+  value       = local.edge_service_unit
+}
+
 output "secret_parameter_prefix" {
   description = "SSM parameter prefix read by the edge host."
   value       = var.secret_parameter_prefix

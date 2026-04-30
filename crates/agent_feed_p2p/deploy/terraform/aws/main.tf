@@ -331,7 +331,7 @@ resource "aws_instance" "edge" {
   vpc_security_group_ids      = [aws_security_group.edge.id]
   iam_instance_profile        = aws_iam_instance_profile.edge.name
   associate_public_ip_address = true
-  user_data_replace_on_change = true
+  user_data_replace_on_change = false
   user_data                   = local.user_data
 
   metadata_options {
