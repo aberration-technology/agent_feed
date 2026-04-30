@@ -21,7 +21,7 @@ use agent_feed_security::SecurityConfig;
 use agent_feed_server::{ServerConfig, serve_with_ready};
 #[cfg(test)]
 use agent_feed_story::StoryCompiler;
-use agent_feed_story::{CompiledStory, compile_events};
+use agent_feed_story::{CompiledStory, StoryFamily, compile_events};
 use agent_feed_summarize::{
     DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
     GuardrailPattern, INTERNAL_SUMMARIZER_MARKER, ImageDecisionMode, ImageProcessorConfig,
@@ -2219,7 +2219,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
     );
 
     let mut pending = Vec::<CompiledStory>::new();
-    let mut recent = VecDeque::<RecentSummary>::new();
+    let mut recent = seed_recent_summaries_from_edge(&config);
     let mut recent_capsules = VecDeque::<Signed<StoryCapsule>>::new();
     let mut next_seq = 1u64;
     let mut last_publish = Instant::now();
@@ -2452,6 +2452,85 @@ fn run_serve_publisher(config: ServePublishConfig) {
             }
         }
     }
+}
+
+fn seed_recent_summaries_from_edge(config: &ServePublishConfig) -> VecDeque<RecentSummary> {
+    let path = format!(
+        "/network/snapshot?network={}",
+        edge_network_query_value(&config.network_id)
+    );
+    match get_edge_json(&config.edge, &path) {
+        Ok(snapshot) => {
+            let feed_id = publish_feed_id(config);
+            let recent = edge_snapshot_recent_summaries(
+                &snapshot,
+                &feed_id,
+                &config.feed,
+                &config.session.login,
+                config.summary_config.publish.recent_window.max(1),
+            );
+            if !recent.is_empty() {
+                info!(
+                    feed_name = %config.feed,
+                    %feed_id,
+                    recent_summaries = recent.len(),
+                    "p2p publisher seeded recent summaries from edge snapshot"
+                );
+            }
+            recent
+        }
+        Err(err) => {
+            warn!(
+                feed_name = %config.feed,
+                edge = %config.edge,
+                error = %err,
+                "p2p publisher could not seed recent summaries from edge snapshot"
+            );
+            VecDeque::new()
+        }
+    }
+}
+
+fn edge_snapshot_recent_summaries(
+    snapshot: &Value,
+    feed_id: &str,
+    feed_label: &str,
+    publisher_login: &str,
+    limit: usize,
+) -> VecDeque<RecentSummary> {
+    let expected_login = clean_github_login(publisher_login);
+    let mut recent = VecDeque::new();
+    let Some(headlines) = snapshot.get("headlines").and_then(Value::as_array) else {
+        return recent;
+    };
+
+    for item in headlines.iter().rev() {
+        let item_feed_id = value_str(item, "feed_id");
+        let item_feed_label = value_str(item, "feed_label");
+        let feed_matches = item_feed_id == Some(feed_id) || item_feed_label == Some(feed_label);
+        if !feed_matches || !publisher_matches(item, Some(&expected_login)) {
+            continue;
+        }
+        let headline = value_str(item, "headline").unwrap_or_default().trim();
+        let deck = value_str(item, "deck").unwrap_or_default().trim();
+        if headline.is_empty() || deck.is_empty() {
+            continue;
+        }
+        recent.push_back(RecentSummary {
+            headline: headline.to_string(),
+            deck: deck.to_string(),
+            story_family: StoryFamily::Turn,
+            score: item
+                .get("score")
+                .and_then(Value::as_u64)
+                .unwrap_or(75)
+                .min(u8::MAX as u64) as u8,
+        });
+        if recent.len() >= limit.max(1) {
+            break;
+        }
+    }
+    recent
 }
 
 fn publish_feed_presence(config: &ServePublishConfig) -> Result<EdgePublishAck, CliError> {
@@ -3389,6 +3468,53 @@ mod tests {
                 .iter()
                 .any(|transport| transport == "webrtc_direct")
         );
+    }
+
+    #[test]
+    fn edge_snapshot_seed_uses_matching_publisher_feed_headlines() {
+        let snapshot = json!({
+            "headlines": [
+                {
+                    "feed_id": "github:1:lab",
+                    "feed_label": "lab",
+                    "publisher_login": "mosure",
+                    "headline": "wrong feed",
+                    "deck": "should not seed",
+                    "score": 91
+                },
+                {
+                    "feed_id": "github:1:workstation",
+                    "feed_label": "workstation",
+                    "publisher_login": "alice",
+                    "headline": "wrong publisher",
+                    "deck": "should not seed",
+                    "score": 91
+                },
+                {
+                    "feed_id": "github:1:workstation",
+                    "feed_label": "workstation",
+                    "publisher_login": "mosure",
+                    "headline": "burn_dragon browser route verifies edge snapshots",
+                    "deck": "browser route and edge snapshot verification are now connected for public feed discovery.",
+                    "score": 76
+                }
+            ]
+        });
+
+        let recent = edge_snapshot_recent_summaries(
+            &snapshot,
+            "github:1:workstation",
+            "workstation",
+            "Mosure",
+            8,
+        );
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0].headline,
+            "burn_dragon browser route verifies edge snapshots"
+        );
+        assert_eq!(recent[0].story_family, StoryFamily::Turn);
     }
 
     #[test]
@@ -8430,6 +8556,10 @@ fn post_edge_json_with_bearer(
     let child = ProcessCommand::new("curl")
         .args([
             "-fsS",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "20",
             "-X",
             "POST",
             "-H",

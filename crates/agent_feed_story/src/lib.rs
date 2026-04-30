@@ -2033,6 +2033,7 @@ fn summary_is_redundant(input: &str) -> bool {
         || trimmed.starts_with("implemented and published")
         || trimmed.starts_with("the code and crates are published")
         || trimmed.starts_with("the commit is created")
+        || trimmed.starts_with("the current daemon")
         || trimmed.starts_with("with that command")
         || trimmed.starts_with("with the currently")
     {
@@ -2064,6 +2065,7 @@ fn summary_is_redundant(input: &str) -> bool {
         "i’m committing",
         "implemented and pushed",
         "local capture is alive",
+        "local publisher",
         "one more important nuance",
         "pushing it now",
         "remote fast-forward",
@@ -2077,10 +2079,13 @@ fn summary_is_redundant(input: &str) -> bool {
         "shell command failed",
         "targeted tests",
         "there are no push-triggered workflows",
+        "there's a second problem",
+        "there s a second problem",
         "this session is network-disabled",
         "transcript sample",
         "test command failed",
         "test command passed",
+        "the key live check passed",
         "without raw content",
         "without command output",
     ]
@@ -2192,12 +2197,32 @@ fn summary_is_operator_chatter(normalized: &str) -> bool {
         "your active codex",
         "the live edge now has",
         "the live state confirms",
+        "the latest evidence is more specific",
+        "the edge path accepted",
         "the daemon is now actually",
+        "the current daemon",
         "the fixed daemon is running",
         "the new binary started",
         "the repo is on the pushed",
         "hot paths",
         "current publisher is stuck",
+        "story gate",
+        "startup context",
+        "edge snapshot request",
+        "public snapshot",
+        "public publish loop",
+        "publish worker",
+        "edge call",
+        "debugging status",
+        "concrete regression",
+        "operator narration",
+        "public feed and hides the real signal",
+        "recent_summaries",
+        "restart-safe duplicate memory",
+        "stale native-smoke update",
+        "future new work",
+        "behavior we wanted",
+        "correctly skipped",
         "this debugging session",
         "the bug is not no capture",
         "startup lines",
@@ -2242,7 +2267,6 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
         "missing",
         "passed",
         "preflight",
-        "problem",
         "publish",
         "published",
         "publishes",
@@ -2252,17 +2276,12 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
         "regressed",
         "reliably",
         "released",
-        "remaining",
         "rerun",
-        "running",
         "rollout",
         "shipped",
         "success",
-        "support",
-        "supports",
         "turned green",
         "unblocked",
-        "uses",
         "works",
     ]
     .iter()
@@ -2429,6 +2448,10 @@ mod tests {
             "The local story after the restart is now from the active `burn_dragon` session, and the p2p publisher correctly declined to republish it.",
             "The repo is on the pushed `4bf38b6` revision. I’m reading the two hot paths now: the p2p publish loop and the open-turn story compiler.",
             "The live state confirms the bug is not “no capture”: local events and one newly published local bulletin exist. The current publisher is stuck in publishing.",
+            "The current daemon is running the latest source install and it is publishing, but the story gate is still starving most work.",
+            "There’s a second problem now: the local publisher queued a burn_dragon story, but the edge snapshot request returned 504.",
+            "I found a concrete regression while validating: my own debugging/status messages are being treated as publishable agent work.",
+            "The key live check passed: the publisher now says `recent_summaries=8` on startup and the summarizer skipped the stale native-smoke update.",
         ] {
             let mut compiler = StoryCompiler::default();
             let mut message = event(EventKind::AgentMessage, "codex posted an update");
