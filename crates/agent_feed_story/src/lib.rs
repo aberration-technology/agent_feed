@@ -565,23 +565,32 @@ impl StoryCompiler {
     }
 
     fn compile_active_update(&self, window: &StoryWindow) -> Option<CompiledStory> {
-        let summary = window.signals.latest_summary.as_deref()?;
-        if !active_update_summary(summary) && !active_progress_summary(summary) {
-            return None;
+        if let Some(summary) = window.signals.latest_summary.as_deref() {
+            if !active_update_summary(summary) && !active_progress_summary(summary) {
+                return self.compile_activity_checkpoint(window);
+            }
+            let score = story_score(window).max(72);
+            let context_score = context_score(window).max(76);
+            let story = self.compile_window_with_scores(
+                window.clone(),
+                Some(score.min(88)),
+                Some(context_score.min(100)),
+            )?;
+            if is_low_quality_story(window, &story.headline, &story.deck)
+                && !active_summary_has_release_outcome(summary)
+            {
+                return self.compile_activity_checkpoint(window);
+            }
+            return Some(story);
         }
-        let score = story_score(window).max(72);
-        let context_score = context_score(window).max(76);
-        let story = self.compile_window_with_scores(
-            window.clone(),
-            Some(score.min(88)),
-            Some(context_score.min(100)),
-        )?;
-        if is_low_quality_story(window, &story.headline, &story.deck)
-            && !active_summary_has_release_outcome(summary)
-        {
-            return None;
-        }
-        Some(story)
+        self.compile_activity_checkpoint(window)
+    }
+
+    fn compile_activity_checkpoint(&self, window: &StoryWindow) -> Option<CompiledStory> {
+        let (headline, deck) = activity_checkpoint_copy(window)?;
+        let score = story_score(window).clamp(72, 86);
+        let context_score = context_score(window).clamp(76, 100);
+        self.compile_story_with_copy(window.clone(), headline, deck, score, context_score)
     }
 
     fn compile_window_with_scores(
@@ -601,6 +610,17 @@ impl StoryCompiler {
             headline = rewritten_headline;
             deck = rewritten_deck;
         }
+        self.compile_story_with_copy(window, headline, deck, score, context_score)
+    }
+
+    fn compile_story_with_copy(
+        &self,
+        window: StoryWindow,
+        headline: String,
+        deck: String,
+        score: u8,
+        context_score: u8,
+    ) -> Option<CompiledStory> {
         let project = window.key.project_hash.clone();
         let mut chips = Vec::new();
         if let Some(project) = &project {
@@ -1805,6 +1825,9 @@ fn semantic_story_fingerprint(headline: &str, deck: &str) -> String {
 }
 
 fn active_update_fingerprint(window: &StoryWindow, story: &CompiledStory) -> String {
+    if is_activity_checkpoint_story(story) {
+        return semantic_story_fingerprint(&story.headline, &story.deck);
+    }
     let summary_signature = window
         .signals
         .latest_summary
@@ -1818,6 +1841,15 @@ fn active_update_fingerprint(window: &StoryWindow, story: &CompiledStory) -> Str
         fingerprint.push_str(&signature.impact_fingerprint);
     }
     fingerprint
+}
+
+fn is_activity_checkpoint_story(story: &CompiledStory) -> bool {
+    let deck = story.deck.to_ascii_lowercase();
+    deck.contains("open turn")
+        && (deck.contains("final outcome")
+            || deck.contains("final handoff")
+            || deck.contains("final result")
+            || deck.contains("final pass/fail"))
 }
 
 #[must_use]
@@ -2188,6 +2220,10 @@ fn summary_is_operator_chatter(normalized: &str) -> bool {
         "i m patching",
         "i'm patching",
         "i’m patching",
+        "i am waiting",
+        "i m waiting",
+        "i'm waiting",
+        "i’m waiting",
         "i found the",
         "i m past",
         "i'm past",
@@ -2196,20 +2232,40 @@ fn summary_is_operator_chatter(normalized: &str) -> bool {
         "your workstation feed",
         "your active codex",
         "the live edge now has",
+        "public edge now shows",
+        "edge now shows",
         "the live state confirms",
         "the latest evidence is more specific",
         "the edge path accepted",
         "the daemon is now actually",
         "the current daemon",
+        "the daemon itself",
         "the fixed daemon is running",
         "the new binary started",
         "the repo is on the pushed",
+        "amended commit",
+        "ci for the amended commit",
+        "pushed commit",
+        "background launch",
+        "background start",
+        "foreground run",
+        "same serve command under",
+        "short timeout",
+        "systemd",
+        "guardrail leak",
+        "covered by a new test",
+        "running service has both fixes",
+        "both fixes",
+        "installing once more",
+        "reinstalling once more",
+        "source build",
         "hot paths",
         "current publisher is stuck",
         "story gate",
         "startup context",
         "edge snapshot request",
         "public snapshot",
+        "public edge capsule",
         "public publish loop",
         "publish worker",
         "edge call",
@@ -2286,6 +2342,106 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
+}
+
+fn activity_checkpoint_copy(window: &StoryWindow) -> Option<(String, String)> {
+    if window.key.family != StoryFamily::Turn {
+        return None;
+    }
+    let project = concrete_activity_project(window)?;
+    let min_publishable_events = if project_is_public_signal(&project) {
+        4
+    } else {
+        5
+    };
+    if window.publishable_events < min_publishable_events {
+        return None;
+    }
+    if window.counters.tests_failed > 0 {
+        return Some((
+            format!("{project} verification is red"),
+            "a failing test signal arrived while the turn is still open; final recovery has not landed yet."
+                .to_string(),
+        ));
+    }
+    if window.counters.tests_passed > 0 && window.counters.files_changed > 0 {
+        return Some((
+            format!("{project} changes are passing verification"),
+            "edits and passing checks are accumulating in the open turn before the final outcome is reported."
+                .to_string(),
+        ));
+    }
+    if window.counters.tests_passed > 0 {
+        return Some((
+            format!("{project} validation is passing"),
+            "test signals are green in the open turn; the final handoff has not been reported yet."
+                .to_string(),
+        ));
+    }
+    if window.counters.files_changed > 0
+        && (has_command_topic(window, "verification") || has_command_topic(window, "ci status"))
+    {
+        return Some((
+            format!("{project} update is moving through verification"),
+            "changed files are being checked in the open turn before a final pass/fail result is available."
+                .to_string(),
+        ));
+    }
+    if window.counters.commands >= min_publishable_events && has_command_topic(window, "ci status")
+    {
+        return Some((
+            format!("{project} release checks are being monitored"),
+            "workflow state is being checked from an open turn; no new final pass/fail outcome has landed yet."
+                .to_string(),
+        ));
+    }
+    if window.counters.commands >= min_publishable_events
+        && has_command_topic(window, "verification")
+    {
+        return Some((
+            format!("{project} verification is active"),
+            "build or test commands are running in the open turn; the final result has not been reported yet."
+                .to_string(),
+        ));
+    }
+    if window.counters.commands >= min_publishable_events
+        && (has_command_topic(window, "remote service check")
+            || has_command_topic(window, "repository state"))
+        && project_is_public_signal(&project)
+    {
+        return Some((
+            format!("{project} release state is being checked"),
+            "repository or remote service checks are active in the open turn before a final outcome is available."
+                .to_string(),
+        ));
+    }
+    None
+}
+
+fn concrete_activity_project(window: &StoryWindow) -> Option<String> {
+    let project = window.key.project_hash.as_deref()?;
+    if matches!(
+        project,
+        "repo" | "repos" | "workspace" | "workspaces" | "local"
+    ) {
+        return None;
+    }
+    if project_is_internal_debug_project(project)
+        && window.counters.tests_failed == 0
+        && window.counters.tests_passed == 0
+        && window.counters.files_changed == 0
+    {
+        return None;
+    }
+    Some(project.to_string())
+}
+
+fn project_is_internal_debug_project(project: &str) -> bool {
+    matches!(project, "agent_reel" | "agent_feed")
+}
+
+fn project_is_public_signal(project: &str) -> bool {
+    matches!(project, "burn_p2p" | "burn_dragon")
 }
 
 fn summary_has_work_context(input: &str) -> bool {
@@ -2452,6 +2608,11 @@ mod tests {
             "There’s a second problem now: the local publisher queued a burn_dragon story, but the edge snapshot request returned 504.",
             "I found a concrete regression while validating: my own debugging/status messages are being treated as publishable agent work.",
             "The key live check passed: the publisher now says `recent_summaries=8` on startup and the summarizer skipped the stale native-smoke update.",
+            "The background start exited unexpectedly without an error line. I’m going to run the same serve command under a short timeout.",
+            "The daemon itself stayed healthy under an 8s foreground run and started importing the burn_p2p/burn_dragon root-workspace session immediately.",
+            "The guardrail leak is fixed and covered by a new test. I’m reinstalling once more so the running service has both fixes.",
+            "Public edge now shows the new capsule at `17:52:55Z`, and CI for the amended commit is green. I’m waiting for the Pages and AWS deploy workflows from the same commit to finish.",
+            "agent_reel now surfaces a new public edge capsule; the amended commit reports green ci, with rollout movement still awaiting the next operator-facing step.",
         ] {
             let mut compiler = StoryCompiler::default();
             let mut message = event(EventKind::AgentMessage, "codex posted an update");
@@ -3094,6 +3255,78 @@ mod tests {
         assert!(
             stories.is_empty(),
             "ci polling and shell-only command bursts are not display stories"
+        );
+    }
+
+    #[test]
+    fn open_turn_project_verification_checkpoint_publishes() {
+        let mut compiler = StoryCompiler::default();
+        for index in 0..4 {
+            let kind = if index % 2 == 0 {
+                EventKind::CommandExec
+            } else {
+                EventKind::ToolComplete
+            };
+            let mut command = event(kind, "codex command completed");
+            command.project = Some("burn_p2p".to_string());
+            command.summary = Some(if kind == EventKind::CommandExec {
+                "command lifecycle captured without command output.".to_string()
+            } else {
+                "exit 0. raw output omitted.".to_string()
+            });
+            command.command = Some("cargo test -p burn_p2p_browser".to_string());
+            command.score_hint = Some(48);
+            assert!(compiler.ingest(command).is_empty());
+        }
+
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].project.as_deref(), Some("burn_p2p"));
+        assert_eq!(stories[0].headline, "burn_p2p verification is active");
+        assert!(
+            stories[0]
+                .deck
+                .contains("final result has not been reported")
+        );
+        assert!(stories[0].score >= 72);
+    }
+
+    #[test]
+    fn open_turn_project_checkpoint_does_not_hot_loop() {
+        let mut compiler = StoryCompiler::default();
+        for index in 0..4 {
+            let mut command = event(EventKind::CommandExec, "codex command completed");
+            command.project = Some("burn_dragon".to_string());
+            command.summary =
+                Some("command lifecycle captured without command output.".to_string());
+            command.command = Some(format!(
+                "gh run view {index} --repo aberration-technology/burn_dragon"
+            ));
+            command.score_hint = Some(48);
+            assert!(compiler.ingest(command).is_empty());
+        }
+
+        assert_eq!(compiler.flush().len(), 1);
+        assert!(compiler.flush().is_empty());
+
+        let mut next_poll = event(EventKind::CommandExec, "codex command completed");
+        next_poll.project = Some("burn_dragon".to_string());
+        next_poll.summary = Some("command lifecycle captured without command output.".to_string());
+        next_poll.command =
+            Some("gh run view latest --repo aberration-technology/burn_dragon".to_string());
+        next_poll.score_hint = Some(48);
+        assert!(compiler.ingest(next_poll).is_empty());
+
+        assert!(compiler.flush().is_empty());
+        assert!(
+            compiler
+                .diagnostics()
+                .recent_decisions
+                .iter()
+                .any(|decision| decision.action == StoryDecisionAction::Deduped
+                    && decision.project.as_deref() == Some("burn_dragon")
+                    && decision.family == StoryFamily::Turn)
         );
     }
 

@@ -1359,7 +1359,7 @@ fn summarize_request_inner(
         external_cost_allowed = !matches!(&config.processor, SummaryProcessorConfig::Deterministic),
         "summary processor preparing candidate"
     );
-    let processor_output = if let Some(processor) = processor {
+    let mut processor_output = if let Some(processor) = processor {
         let processor_request = request_for_external_processor(request, config)?;
         processor.summarize(&processor_request)?
     } else {
@@ -1421,6 +1421,26 @@ fn summarize_request_inner(
             }
         }
     };
+    if matches!(
+        config.processor,
+        SummaryProcessorConfig::CodexSessionMemory { .. }
+    ) && local_story_fallback_allowed(request, &processor_output)
+    {
+        let mut fallback = deterministic_output(request);
+        fallback.publish_reason = Some(
+            processor_output
+                .publish_reason
+                .as_deref()
+                .filter(|reason| !reason.trim().is_empty())
+                .map(|reason| {
+                    format!("codex-memory declined; evaluating local safe story instead: {reason}")
+                })
+                .unwrap_or_else(|| {
+                    "codex-memory declined; evaluating local safe story instead".to_string()
+                }),
+        );
+        processor_output = fallback;
+    }
 
     let mut summary = build_summary(request, processor_output, config)?;
     attach_optional_image(&mut summary, request, config, image_processor)?;
@@ -1706,6 +1726,31 @@ fn deterministic_output(request: &SummaryRequest) -> ProcessorSummary {
     }
 }
 
+fn local_story_fallback_allowed(request: &SummaryRequest, output: &ProcessorSummary) -> bool {
+    if output.publish != Some(false) || request.stories.len() != 1 {
+        return false;
+    }
+    let story = &request.stories[0];
+    if story.score < 76 || story.privacy != PrivacyClass::Redacted {
+        return false;
+    }
+    let output_combined = normalize_text(&format!(
+        "{} {} {}",
+        output.headline,
+        output.deck,
+        output.publish_reason.as_deref().unwrap_or_default()
+    ));
+    let processor_declined_as_no_change = is_no_change_public_copy(&output_combined)
+        || output_combined.contains("no change")
+        || output_combined.contains("not meaningfully different")
+        || output_combined.contains("headline did not meaningfully change");
+    if !processor_declined_as_no_change {
+        return false;
+    }
+    let combined = normalize_text(&format!("{} {}", story.headline, story.deck));
+    !combined.is_empty() && !public_copy_has_banned_terms(&combined)
+}
+
 fn representative_story(request: &SummaryRequest) -> Option<&CompiledStory> {
     request
         .stories
@@ -1794,7 +1839,8 @@ fn build_summary(
     if lower_third.is_empty() {
         lower_third = "feed · redacted".to_string();
     }
-    lower_third = remove_project_placeholder_segments(&lower_third);
+    lower_third =
+        remove_project_placeholder_inline(&remove_project_placeholder_segments(&lower_third));
     if let Some(project) = project_tags.first() {
         lower_third = prepend_project_to_lower_third(&lower_third, project);
         lower_third = clamp_chars(&lower_third, budget.max_lower_third_chars);
@@ -2082,13 +2128,32 @@ fn fit_capsule_budget(
         }
         summary.deck = clamp_chars(&summary.deck, summary.deck.len().saturating_sub(24));
     }
-    let (deck, violations) = clean_and_clamp(&summary.deck, budget.max_deck_chars, guardrails)?;
+    let project_tags = project_tags_from_summary(summary, guardrails);
+    let (deck, violations) = clean_and_clamp_with_project_tags(
+        &summary.deck,
+        budget.max_deck_chars,
+        guardrails,
+        &project_tags,
+    )?;
     summary.metadata.violations.extend(violations);
-    summary.deck = deck;
+    summary.deck = ensure_terminal_sentence(&remove_project_placeholder_inline(&deck));
     if summary.deck.is_empty() {
         summary.deck = "settled story activity reached the feed.".to_string();
     }
     Ok(())
+}
+
+fn project_tags_from_summary(summary: &FeedSummary, guardrails: &SummaryGuardrails) -> Vec<String> {
+    if !guardrails.allow_project_tags {
+        return Vec::new();
+    }
+    summary
+        .chips
+        .iter()
+        .filter_map(|chip| public_project_tag(chip))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn polish_public_summary(summary: &mut FeedSummary) {
@@ -2098,7 +2163,9 @@ fn polish_public_summary(summary: &mut FeedSummary) {
     }
     summary.headline = remove_agent_headline_prefix(&polish_public_copy(&summary.headline));
     summary.deck = ensure_terminal_sentence(&polish_public_copy(&summary.deck));
-    summary.lower_third = polish_public_copy(&summary.lower_third);
+    summary.lower_third = remove_project_placeholder_inline(&remove_project_placeholder_segments(
+        &polish_public_copy(&summary.lower_third),
+    ));
     summary.chips = summary
         .chips
         .iter()
@@ -2520,6 +2587,7 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
     ]
     .iter()
     .any(|needle| combined.contains(needle))
+        || is_no_change_public_copy(&combined)
         || is_operational_status_without_public_impact(&combined)
         || is_file_count_without_public_impact(&combined)
         || is_test_status_without_public_impact(&combined)
@@ -2532,6 +2600,27 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
             && !combined.contains("test")
             && !combined.contains("verified")
             && !combined.contains("complete"))
+}
+
+fn is_no_change_public_copy(normalized: &str) -> bool {
+    [
+        "no public impact change",
+        "no public facing outcome",
+        "no public facing delta",
+        "no newly reported shift",
+        "no notable public shift",
+        "no meaningful feed change",
+        "no meaningful headline change",
+        "does not change outcome",
+        "does not alter public outcome",
+        "remains in the same holding state",
+        "remain in the same holding state",
+        "same holding state",
+        "existing verification and readiness posture remains",
+        "all observed streams remain",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn is_operational_status_without_public_impact(normalized: &str) -> bool {
@@ -3811,8 +3900,54 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             "{} {} {}",
             summaries[0].headline, summaries[0].deck, summaries[0].lower_third
         );
-        assert!(!display.contains("[project]"));
+        assert!(!display.contains("[project]"), "{display}");
         assert!(summaries[0].lower_third.starts_with("burn_dragon ·"));
+    }
+
+    struct ProjectDeckProcessor;
+
+    impl SummaryProcessor for ProjectDeckProcessor {
+        fn name(&self) -> &str {
+            "project-deck"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "burn_dragon release readiness workflow is under active verification"
+                    .to_string(),
+                deck: "burn_dragon release readiness workflow is under active verification while ci continues."
+                    .to_string(),
+                lower_third: Some("@mosure / workstation".to_string()),
+                chips: vec!["burn_dragon".to_string(), "release-readiness".to_string()],
+                publish: None,
+                publish_reason: None,
+                memory_digest: None,
+                semantic_fingerprint: None,
+            })
+        }
+    }
+
+    #[test]
+    fn fit_budget_does_not_remask_allowed_project_tags_to_placeholder() {
+        let mut config = SummaryConfig::p2p_default();
+        config.budget.max_capsule_chars = 160;
+        let summaries = summarize_feed_with_processor(
+            "github:35904762:workstation",
+            &[public_project_story("burn_dragon", 88)],
+            &config,
+            &ProjectDeckProcessor,
+        )
+        .expect("summary with project deck");
+
+        let display = format!(
+            "{} {} {} {}",
+            summaries[0].headline,
+            summaries[0].deck,
+            summaries[0].lower_third,
+            summaries[0].chips.join(" ")
+        );
+        assert!(!display.contains("[project]"), "{display}");
+        assert!(summaries[0].chips.iter().any(|chip| chip == "burn_dragon"));
     }
 
     struct EndpointLikeProcessor;
@@ -3960,6 +4095,14 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
                 "agent_feed daemon restart restored publishing while exposing one self-referential story",
                 "the new binary started after an earlier dead daemon and the startup lines showed a local 7777 daemon issue.",
             ),
+            (
+                "no public-impact change surfaced",
+                "all observed streams remain in the same holding state.",
+            ),
+            (
+                "stream entered pushed revision review",
+                "there is no newly reported shift in public-facing outcome; existing verification and readiness posture remains in place.",
+            ),
         ];
 
         for (headline, deck) in cases {
@@ -4077,6 +4220,27 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         }
     }
 
+    struct NoChangeDecliningProcessor;
+
+    impl SummaryProcessor for NoChangeDecliningProcessor {
+        fn name(&self) -> &str {
+            "no-change-declining"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "no public-impact change surfaced".to_string(),
+                deck: "all observed streams remain in the same holding state.".to_string(),
+                lower_third: Some("processor · redacted".to_string()),
+                chips: vec!["processor".to_string(), "redacted".to_string()],
+                publish: Some(false),
+                publish_reason: Some("no meaningful feed change".to_string()),
+                memory_digest: Some("same holding state".to_string()),
+                semantic_fingerprint: Some("no-change".to_string()),
+            })
+        }
+    }
+
     #[test]
     fn local_agent_processor_can_decline_publish() {
         let mut config = SummaryConfig::p2p_default();
@@ -4108,6 +4272,46 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             summary.metadata.publish_action,
             PublishAction::SkipProcessor
         );
+    }
+
+    #[test]
+    fn codex_memory_decline_falls_back_to_safe_local_story_candidate() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let mut story = public_project_story("burn_dragon", 84);
+        story.headline = "feed deployment paths now exercise browser and edge delivery".to_string();
+        story.deck =
+            "static pages, edge APIs, and network canaries can be verified together.".to_string();
+
+        let request = SummaryRequest {
+            feed_id: "github:35904762:workstation".to_string(),
+            mode: FeedSummaryMode::PerStory,
+            stories: vec![story],
+            recent_summaries: Vec::new(),
+            prompt_style: None,
+            max_prompt_chars: None,
+            branch: None,
+            session_hint: None,
+        };
+        let summaries = summarize_feed_with_processor(
+            &request.feed_id,
+            &request.stories,
+            &config,
+            &NoChangeDecliningProcessor,
+        )
+        .expect("fallback summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].headline,
+            "feed deployment paths now exercise browser and edge delivery"
+        );
+        assert_eq!(summaries[0].metadata.publish_action, PublishAction::Publish);
     }
 
     struct DecliningStateUpdateProcessor;

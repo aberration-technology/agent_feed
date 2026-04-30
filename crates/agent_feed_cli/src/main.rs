@@ -4063,7 +4063,142 @@ mod tests {
             Some("deployment workflow monitoring is active.")
         );
         assert!(recap.tags.iter().any(|tag| tag == "active-attach"));
-        assert!(!recap.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG));
+        assert!(recap.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG));
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_active_command_attach_emits_displayable_live_checkpoint() {
+        let root = temp_test_root("codex-active-command-attach-root");
+        let workspace = root.join("repos");
+        let burn_dragon = workspace.join("burn_dragon");
+        fs::create_dir_all(&burn_dragon).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "root-active-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_live",
+                        "arguments": {
+                            "cmd": "sleep 1200; gh run view 25174591811 --repo aberration-technology/burn_dragon --json status,conclusion,jobs",
+                            "workdir": burn_dragon
+                        }
+                    }
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_live",
+                        "output": "Process running with session ID 98939"
+                    }
+                }),
+            ],
+        );
+        let input = fs::read_to_string(&transcript).expect("transcript reads");
+
+        let checkpoint = codex_active_command_attach_event(
+            &transcript,
+            &input,
+            TranscriptState::default(),
+            None,
+            None,
+        )
+        .expect("active command checkpoint emits");
+
+        assert_eq!(checkpoint.kind, EventKind::AgentMessage);
+        assert_eq!(checkpoint.project.as_deref(), Some("burn_dragon"));
+        assert_eq!(
+            checkpoint.summary.as_deref(),
+            Some(
+                "burn_dragon release readiness workflow is under active verification while ci continues."
+            )
+        );
+        assert!(checkpoint.tags.iter().any(|tag| tag == "active-command"));
+        assert!(!checkpoint.tags.iter().any(|tag| tag == STARTUP_CONTEXT_TAG));
+
+        let mut compiler = StoryCompiler::default();
+        assert!(compiler.ingest(checkpoint).is_empty());
+        let stories = compiler.flush();
+        assert_eq!(stories.len(), 1);
+        assert!(
+            stories[0]
+                .headline
+                .contains("burn_dragon release readiness")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
+    fn codex_active_command_attach_ignores_completed_commands() {
+        let root = temp_test_root("codex-active-command-attach-completed");
+        let workspace = root.join("repos");
+        let burn_dragon = workspace.join("burn_dragon");
+        fs::create_dir_all(&burn_dragon).expect("workspace dir");
+        let transcript = root.join("codex.jsonl");
+        write_jsonl(
+            &transcript,
+            [
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "root-active-session", "cwd": workspace}
+                }),
+                json!({
+                    "type": "turn_context",
+                    "payload": {"cwd": workspace, "turn_id": "turn_1"}
+                }),
+                json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_done",
+                        "arguments": {
+                            "cmd": "gh run list --repo aberration-technology/burn_dragon --branch main",
+                            "workdir": burn_dragon
+                        }
+                    }
+                }),
+                json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "exec_command_end",
+                        "call_id": "call_done",
+                        "turn_id": "turn_1",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "command": ["gh", "run", "list"],
+                        "cwd": burn_dragon
+                    }
+                }),
+            ],
+        );
+        let input = fs::read_to_string(&transcript).expect("transcript reads");
+
+        assert!(
+            codex_active_command_attach_event(
+                &transcript,
+                &input,
+                TranscriptState::default(),
+                None,
+                None,
+            )
+            .is_none()
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp workspace");
     }
@@ -6061,6 +6196,22 @@ fn initialize_codex_watcher(
         {
             stats.imported += 1;
         }
+        let command_state = state.clone();
+        if let Some(active_command) = codex_active_command_attach_event(
+            path,
+            &context,
+            command_state,
+            workspace,
+            processor_registry,
+        ) && post_codex_synthetic_event(
+            server,
+            path,
+            &active_command,
+            event_sink,
+            "active command checkpoint",
+        ) {
+            stats.imported += 1;
+        }
         stats
     };
     Ok((state, stats, initial_len))
@@ -6178,10 +6329,118 @@ fn codex_startup_recap_event(
         "codex".to_string(),
         "transcript".to_string(),
         "active-attach".to_string(),
+        STARTUP_CONTEXT_TAG.to_string(),
     ];
     recap.score_hint = Some(74);
     recap.severity = Severity::Notice;
     Some(recap)
+}
+
+fn codex_active_command_attach_event(
+    path: &Path,
+    input: &str,
+    mut state: TranscriptState,
+    workspace: Option<&WorkspaceFilter>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
+) -> Option<AgentEvent> {
+    if is_agent_feed_internal_transcript_for_registry(input, Some(&state), processor_registry) {
+        return None;
+    }
+
+    let mut active_commands =
+        std::collections::BTreeMap::<String, (AgentEvent, String, time::OffsetDateTime)>::new();
+
+    for line in input.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let started_call_id = codex_exec_call_id(&value);
+        let ended_call_id = codex_exec_end_call_id(&value);
+        let Some(event) = normalize_transcript_value(value, &mut state, Some(path)) else {
+            if let Some(call_id) = ended_call_id {
+                active_commands.remove(&call_id);
+            }
+            continue;
+        };
+        if let Some(call_id) = ended_call_id {
+            active_commands.remove(&call_id);
+        }
+        if processor_registry.is_some_and(|registry| registry.drop_processor_event(&event)) {
+            continue;
+        }
+        if !event_matches_workspace(&event, workspace, path, "codex") {
+            continue;
+        }
+        if !event_is_recent_for_attach(&event) {
+            continue;
+        }
+        let Some(call_id) = started_call_id else {
+            continue;
+        };
+        let Some(summary) = active_command_attach_summary(&event) else {
+            continue;
+        };
+        let occurred_at = event.occurred_at.unwrap_or(event.received_at);
+        active_commands.insert(call_id, (event, summary, occurred_at));
+    }
+
+    let (event, summary, _) = active_commands
+        .into_values()
+        .max_by_key(|(_, _, occurred_at)| *occurred_at)?;
+    let mut checkpoint = AgentEvent::new(
+        SourceKind::Codex,
+        EventKind::AgentMessage,
+        "codex active command checkpoint",
+    );
+    checkpoint.agent = "codex".to_string();
+    checkpoint.adapter = "codex.transcript".to_string();
+    checkpoint.session_id = event.session_id;
+    checkpoint.turn_id = event.turn_id;
+    checkpoint.project = event.project;
+    checkpoint.cwd = event.cwd;
+    checkpoint.occurred_at = event.occurred_at;
+    checkpoint.summary = Some(summary);
+    checkpoint.command = event.command;
+    checkpoint.tags = vec![
+        "codex".to_string(),
+        "transcript".to_string(),
+        "active-attach".to_string(),
+        "active-command".to_string(),
+    ];
+    checkpoint.score_hint = Some(76);
+    checkpoint.severity = Severity::Notice;
+    Some(checkpoint)
+}
+
+fn codex_exec_call_id(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    if payload.get("name").and_then(Value::as_str) != Some("exec_command") {
+        return None;
+    }
+    payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn codex_exec_end_call_id(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("exec_command_end") {
+        return None;
+    }
+    payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn attach_recap_rank(event: &AgentEvent, summary: &str) -> u8 {
@@ -6258,6 +6517,56 @@ fn attach_summary_has_context(summary: &str) -> bool {
     ]
     .iter()
     .any(|needle| lowered.contains(needle))
+}
+
+fn active_command_attach_summary(event: &AgentEvent) -> Option<String> {
+    let summary = active_command_recap_summary(event)?;
+    let Some(project) = event
+        .project
+        .as_deref()
+        .filter(|project| !generic_project_label(project))
+    else {
+        return Some(summary);
+    };
+    let lowered = summary.to_ascii_lowercase();
+    if lowered.contains("deployment workflow") {
+        return Some(format!(
+            "{project} release readiness workflow is under active verification while ci continues."
+        ));
+    }
+    if lowered.contains("browser peer") {
+        return Some(format!(
+            "{project} browser peer readiness verification is active while network checks continue."
+        ));
+    }
+    if lowered.contains("p2p verification") {
+        return Some(format!(
+            "{project} release readiness verification is active while p2p checks continue."
+        ));
+    }
+    if lowered.contains("browser training") {
+        return Some(format!(
+            "{project} browser training readiness verification is active while checks continue."
+        ));
+    }
+    if lowered.contains("infrastructure deployment") {
+        return Some(format!(
+            "{project} infrastructure deployment readiness is being verified."
+        ));
+    }
+    if lowered.contains("training system") {
+        return Some(format!(
+            "{project} training system readiness verification is active."
+        ));
+    }
+    Some(format!("{project} {summary}"))
+}
+
+fn generic_project_label(project: &str) -> bool {
+    matches!(
+        project,
+        "repo" | "repos" | "workspace" | "workspaces" | "local"
+    )
 }
 
 fn active_command_recap_summary(event: &AgentEvent) -> Option<String> {
