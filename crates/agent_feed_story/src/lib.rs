@@ -447,12 +447,12 @@ impl StoryCompiler {
             }
             if is_open_turn_window(&window) {
                 if let Some(story) = self.compile_active_update(&window) {
-                    let fingerprint = semantic_story_fingerprint(&story.headline, &story.deck);
+                    let fingerprint = active_update_fingerprint(&window, &story);
                     let changed = self
                         .active_update_fingerprints
                         .get(&key)
                         .is_none_or(|existing| existing != &fingerprint);
-                    if changed && self.accept_story(&story) {
+                    if changed && self.accept_story_with_extra(&story, Some(&fingerprint)) {
                         self.active_update_fingerprints
                             .insert(key.clone(), fingerprint);
                         self.diagnostics.published_stories += 1;
@@ -676,12 +676,17 @@ impl StoryCompiler {
     }
 
     fn accept_story(&mut self, story: &CompiledStory) -> bool {
+        self.accept_story_with_extra(story, None)
+    }
+
+    fn accept_story_with_extra(&mut self, story: &CompiledStory, extra: Option<&str>) -> bool {
         let fingerprint = format!(
-            "{}:{}:{:?}:{}",
+            "{}:{}:{:?}:{}:{}",
             story.agent,
             story.project.as_deref().unwrap_or("local"),
             story.family,
-            semantic_story_fingerprint(&story.headline, &story.deck)
+            semantic_story_fingerprint(&story.headline, &story.deck),
+            extra.unwrap_or_default()
         );
         if self
             .recent_fingerprints
@@ -1394,6 +1399,55 @@ fn story_impact_rewrite(
             "burn_dragon ci turns green with wasm smoke",
             "the current head clears the browser smoke lane before final repository checks",
         ))
+    } else if combined.contains("pages deploy")
+        && combined.contains("browser canary")
+        && (combined.contains("green") || combined.contains("completed successfully"))
+    {
+        Some((
+            "burn_dragon deploy clears browser canaries",
+            "the pages rollout and live browser checks completed on the current release candidate",
+        ))
+    } else if combined.contains("deployment diagnostics")
+        && (combined.contains("passed") || combined.contains("green"))
+        && (combined.contains("browser canary") || combined.contains("pages"))
+    {
+        Some((
+            "burn_dragon deploy reaches browser canary",
+            "edge diagnostics passed and the rollout advanced into pages plus live browser verification",
+        ))
+    } else if combined.contains("terraform apply")
+        && (combined.contains("completed")
+            || combined.contains("sync")
+            || combined.contains("restart"))
+    {
+        Some((
+            "burn_dragon edge rollout restarts after terraform",
+            "infrastructure apply completed and the bootstrap runtime is syncing back to service readiness",
+        ))
+    } else if combined.contains("terraform")
+        && (combined.contains("adopting") || combined.contains("state"))
+        && combined.contains("deploy")
+    {
+        Some((
+            "burn_dragon deploy enters terraform state adoption",
+            "the edge rollout moved past binary compilation and is reconciling existing aws resources",
+        ))
+    } else if combined.contains("deploy compile finished")
+        || (combined.contains("compile finished") && combined.contains("terraform"))
+    {
+        Some((
+            "burn_dragon deploy leaves edge binary build",
+            "the release path moved from native artifact compilation into infrastructure rollout",
+        ))
+    } else if combined.contains("edge binary")
+        || ((combined.contains("binary compile") || combined.contains("binary build"))
+            && (combined.contains("deploy") || combined.contains("rollout"))
+            && !combined.contains("terraform"))
+    {
+        Some((
+            "burn_dragon deploy builds edge binaries",
+            "the production rollout is preparing native edge artifacts before infrastructure changes",
+        ))
     } else if is_burn_dragon
         && (combined.contains("terraform apply") || combined.contains("infrastructure rollout"))
         && (combined.contains("deploy") || combined.contains("deployment"))
@@ -1750,6 +1804,24 @@ fn semantic_story_fingerprint(headline: &str, deck: &str) -> String {
     )
 }
 
+fn active_update_fingerprint(window: &StoryWindow, story: &CompiledStory) -> String {
+    let summary_signature = window
+        .signals
+        .latest_summary
+        .as_deref()
+        .map(|summary| story_update_signature(summary, ""));
+    let mut fingerprint = semantic_story_fingerprint(&story.headline, &story.deck);
+    if let Some(signature) = summary_signature {
+        fingerprint.push_str(" source_topic=");
+        fingerprint.push_str(&signature.topic_fingerprint);
+        fingerprint.push_str(" source_state=");
+        fingerprint.push_str(&signature.state_fingerprint);
+        fingerprint.push_str(" source_impact=");
+        fingerprint.push_str(&signature.impact_fingerprint);
+    }
+    fingerprint
+}
+
 #[must_use]
 pub fn story_update_signature(headline: &str, deck: &str) -> StoryUpdateSignature {
     let normalized = normalized_story_text(&format!("{headline} {deck}"));
@@ -2093,6 +2165,18 @@ fn summary_is_operator_chatter(normalized: &str) -> bool {
         "i m checking",
         "i'm checking",
         "i’m checking",
+        "i am reading",
+        "i m reading",
+        "i'm reading",
+        "i’m reading",
+        "i ll focus",
+        "i'll focus",
+        "i’ll focus",
+        "i will focus",
+        "i ll check",
+        "i'll check",
+        "i’ll check",
+        "i will check",
         "i am tightening",
         "i m tightening",
         "i'm tightening",
@@ -2109,9 +2193,15 @@ fn summary_is_operator_chatter(normalized: &str) -> bool {
         "your workstation feed",
         "your active codex",
         "the live edge now has",
+        "the live state confirms",
         "the daemon is now actually",
         "the fixed daemon is running",
         "the new binary started",
+        "the repo is on the pushed",
+        "hot paths",
+        "current publisher is stuck",
+        "this debugging session",
+        "the bug is not no capture",
         "startup lines",
         "dead daemon",
         "existing 7777 daemon",
@@ -2339,6 +2429,8 @@ mod tests {
             "The new binary started and then exited without writing an error after the startup lines. That is a separate stability bug in the publish daemon.",
             "The full workspace test pass is green. I’m doing one last runtime check now: installed binary on PATH, live daemon.",
             "The local story after the restart is now from the active `burn_dragon` session, and the p2p publisher correctly declined to republish it.",
+            "The repo is on the pushed `4bf38b6` revision. I’m reading the two hot paths now: the p2p publish loop and the open-turn story compiler.",
+            "The live state confirms the bug is not “no capture”: local events and one newly published local bulletin exist. The current publisher is stuck in publishing.",
         ] {
             let mut compiler = StoryCompiler::default();
             let mut message = event(EventKind::AgentMessage, "codex posted an update");
@@ -2564,6 +2656,39 @@ mod tests {
         );
         assert!(stories[0].deck.contains("browser smoke lane"));
         assert!(!stories[0].deck.contains("I’m"));
+    }
+
+    #[test]
+    fn same_open_turn_deploy_stage_changes_publish_again() {
+        let mut compiler = StoryCompiler::default();
+        let mut terraform = event(EventKind::AgentMessage, "codex posted an update");
+        terraform.project = Some("burn_p2p".to_string());
+        terraform.summary = Some(
+            "The deploy compile finished and Terraform is running; current step is adopting existing AWS resources into state. CI test is still running."
+                .to_string(),
+        );
+        assert!(compiler.ingest(terraform).is_empty());
+        let first = compiler.flush();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].headline,
+            "burn_dragon deploy enters terraform state adoption"
+        );
+
+        let mut canary = event(EventKind::AgentMessage, "codex posted an update");
+        canary.project = Some("burn_p2p".to_string());
+        canary.summary = Some(
+            "Pages deploy and every live browser canary lane are green on `5898cfc`, including the chromium-webrtc-direct-checkpoint lane that failed before."
+                .to_string(),
+        );
+        assert!(compiler.ingest(canary).is_empty());
+        let second = compiler.flush();
+
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second[0].headline,
+            "burn_dragon deploy clears browser canaries"
+        );
     }
 
     #[test]

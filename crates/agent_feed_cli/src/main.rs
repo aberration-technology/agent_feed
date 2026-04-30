@@ -2055,8 +2055,14 @@ struct EdgePublishAck {
 
 #[derive(Clone, Debug, Default)]
 struct PublishBatchResult {
-    capsules: usize,
+    capsules: Vec<Signed<StoryCapsule>>,
     edge_ack: Option<EdgePublishAck>,
+}
+
+impl PublishBatchResult {
+    fn capsule_count(&self) -> usize {
+        self.capsules.len()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2214,6 +2220,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
 
     let mut pending = Vec::<CompiledStory>::new();
     let mut recent = VecDeque::<RecentSummary>::new();
+    let mut recent_capsules = VecDeque::<Signed<StoryCapsule>>::new();
     let mut next_seq = 1u64;
     let mut last_publish = Instant::now();
     let mut last_presence = Instant::now() - Duration::from_secs(60);
@@ -2252,9 +2259,34 @@ fn run_serve_publisher(config: ServePublishConfig) {
 
         if last_presence.elapsed() >= Duration::from_secs(60) {
             match publish_feed_presence(&config) {
-                Ok(ack) => {
+                Ok(mut ack) => {
                     last_presence = Instant::now();
                     info!(feed_name = %config.feed, "p2p feed presence registered");
+                    let replay_needed = ack.headlines == 0 && !recent_capsules.is_empty();
+                    let mut replayed_capsules = 0usize;
+                    if replay_needed {
+                        let replay = recent_capsules.iter().cloned().collect::<Vec<_>>();
+                        match publish_capsule_batch(&config, &replay, "recent-story-replay") {
+                            Ok(replay_ack) => {
+                                replayed_capsules = replay.len();
+                                ack = replay_ack;
+                                info!(
+                                    feed_name = %config.feed,
+                                    capsules = replayed_capsules,
+                                    edge_headlines = ack.headlines,
+                                    "p2p publisher replayed recent capsules after empty edge snapshot"
+                                );
+                            }
+                            Err(err) => {
+                                warn!(
+                                    feed_name = %config.feed,
+                                    capsules = replay.len(),
+                                    error = %err,
+                                    "p2p recent capsule replay failed"
+                                );
+                            }
+                        }
+                    }
                     let retained_ack =
                         last_success
                             .as_ref()
@@ -2267,7 +2299,15 @@ fn run_serve_publisher(config: ServePublishConfig) {
                         .as_ref()
                         .map(|(stories, capsules, _)| (*stories, *capsules));
                     let (state, last_batch_stories, last_batch_capsules, edge_ack, detail) =
-                        if let (Some((stories, capsules)), Some(retained_ack)) =
+                        if replayed_capsules > 0 {
+                            (
+                                "published",
+                                0,
+                                replayed_capsules,
+                                &ack,
+                                "recent story replay refreshed the edge snapshot",
+                            )
+                        } else if let (Some((stories, capsules)), Some(retained_ack)) =
                             (retained, retained_ack.as_ref())
                         {
                             (
@@ -2344,13 +2384,21 @@ fn run_serve_publisher(config: ServePublishConfig) {
             Ok(result) => {
                 config.processor_registry.refresh();
                 last_publish = Instant::now();
-                if result.capsules > 0 {
+                let capsule_count = result.capsule_count();
+                if capsule_count > 0 {
                     if let Some(edge_ack) = result.edge_ack.clone() {
-                        last_success = Some((stories.len(), result.capsules, edge_ack));
+                        last_success = Some((stories.len(), capsule_count, edge_ack));
+                    }
+                    for capsule in result.capsules.iter().rev() {
+                        recent_capsules.push_front(capsule.clone());
+                    }
+                    while recent_capsules.len() > config.summary_config.publish.recent_window.max(8)
+                    {
+                        recent_capsules.pop_back();
                     }
                     println!(
                         "p2p publish: sent {} capsule(s) from {} story update(s)",
-                        result.capsules,
+                        capsule_count,
                         stories.len()
                     );
                     post_serve_publish_status(
@@ -2358,7 +2406,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
                         PublishStatusPost {
                             state: "published",
                             last_batch_stories: stories.len(),
-                            last_batch_capsules: result.capsules,
+                            last_batch_capsules: capsule_count,
                             edge_ack: result.edge_ack.as_ref(),
                             detail: Some("edge accepted story capsule batch"),
                             ..PublishStatusPost::default()
@@ -2502,11 +2550,30 @@ fn publish_story_batch(
             "p2p publish skipped empty capsule batch"
         );
         return Ok(PublishBatchResult {
-            capsules: 0,
+            capsules,
             edge_ack: None,
         });
     }
 
+    let ack = publish_capsule_batch(config, &capsules, "story-batch")?;
+    info!(
+        feed_name = %config.feed,
+        capsules = capsules.len(),
+        stories = stories.len(),
+        "p2p publish sent to edge"
+    );
+    Ok(PublishBatchResult {
+        capsules,
+        edge_ack: Some(ack),
+    })
+}
+
+fn publish_capsule_batch(
+    config: &ServePublishConfig,
+    capsules: &[Signed<StoryCapsule>],
+    reason: &'static str,
+) -> Result<EdgePublishAck, CliError> {
+    let feed_id = publish_feed_id(config);
     let body = serde_json::to_string(&json!({
         "network_id": config.network_id,
         "compatibility": ProtocolCompatibility::current(),
@@ -2520,15 +2587,13 @@ fn publish_story_batch(
     let ack = parse_edge_publish_ack(&response)?;
     info!(
         feed_name = %config.feed,
+        %feed_id,
         capsules = capsules.len(),
-        stories = stories.len(),
         response = %response.trim(),
-        "p2p publish sent to edge"
+        %reason,
+        "p2p capsule batch sent to edge"
     );
-    Ok(PublishBatchResult {
-        capsules: capsules.len(),
-        edge_ack: Some(ack),
-    })
+    Ok(ack)
 }
 
 fn log_compiled_story(stage: &'static str, story: &CompiledStory) {
