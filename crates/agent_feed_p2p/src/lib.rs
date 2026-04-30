@@ -227,15 +227,15 @@ pub enum P2pCommand {
     },
     AnnounceFeed {
         peer_id: PeerIdString,
-        profile: FeedProfile,
+        profile: Box<FeedProfile>,
     },
     AnnounceDirectoryEntry {
         peer_id: PeerIdString,
-        entry: FeedDirectoryEntry,
+        entry: Box<FeedDirectoryEntry>,
     },
     CacheDirectoryEntry {
         peer_id: PeerIdString,
-        entry: FeedDirectoryEntry,
+        entry: Box<FeedDirectoryEntry>,
     },
     DiscoverGithubUser {
         peer_id: PeerIdString,
@@ -266,7 +266,7 @@ pub enum P2pCommand {
     },
     PublishCapsule {
         peer_id: PeerIdString,
-        capsule: Signed<StoryCapsule>,
+        capsule: Box<Signed<StoryCapsule>>,
     },
     RequestSnapshot {
         peer_id: PeerIdString,
@@ -699,7 +699,7 @@ impl P2pRuntime {
             P2pCommand::AnnounceFeed { peer_id, profile } => {
                 let feed_id = profile.feed_id.clone();
                 let peer = self.peer(&peer_id)?;
-                peer.announce_feed(profile)?;
+                peer.announce_feed(*profile)?;
                 self.events.push_back(P2pEvent::PublishAccepted {
                     peer_id,
                     feed_id,
@@ -709,16 +709,16 @@ impl P2pRuntime {
             }
             P2pCommand::AnnounceDirectoryEntry { peer_id, entry } => {
                 let peer = self.peer(&peer_id)?;
-                peer.announce_directory_entry(entry.clone())?;
+                peer.announce_directory_entry((*entry).clone())?;
                 self.events
-                    .push_back(P2pEvent::DirectoryEntryReceived(Box::new(entry)));
+                    .push_back(P2pEvent::DirectoryEntryReceived(entry));
                 Ok(())
             }
             P2pCommand::CacheDirectoryEntry { peer_id, entry } => {
                 let peer = self.peer(&peer_id)?;
-                peer.cache_directory_entry(entry.clone())?;
+                peer.cache_directory_entry((*entry).clone())?;
                 self.events
-                    .push_back(P2pEvent::DirectoryEntryReceived(Box::new(entry)));
+                    .push_back(P2pEvent::DirectoryEntryReceived(entry));
                 Ok(())
             }
             P2pCommand::DiscoverGithubUser {
@@ -781,7 +781,7 @@ impl P2pRuntime {
             P2pCommand::PublishCapsule { peer_id, capsule } => {
                 let feed_id = capsule.value.feed_id.clone();
                 let peer = self.peer(&peer_id)?;
-                match peer.publish_capsule(capsule) {
+                match peer.publish_capsule(*capsule) {
                     Ok(delivered) => {
                         self.events.push_back(P2pEvent::PublishAccepted {
                             peer_id,
@@ -2105,12 +2105,12 @@ mod tests {
         })?;
         runtime.handle(P2pCommand::AnnounceFeed {
             peer_id: "peer-a".to_string(),
-            profile: profile("feed-public", FeedVisibility::Public)?,
+            profile: Box::new(profile("feed-public", FeedVisibility::Public)?),
         })?;
 
         runtime.handle(P2pCommand::PublishCapsule {
             peer_id: "peer-a".to_string(),
-            capsule: capsule("feed-public", 1)?,
+            capsule: Box::new(capsule("feed-public", 1)?),
         })?;
         runtime.handle(P2pCommand::DrainInbox {
             peer_id: "peer-b".to_string(),
@@ -2132,7 +2132,7 @@ mod tests {
         })?;
         runtime.handle(P2pCommand::PublishCapsule {
             peer_id: "peer-a".to_string(),
-            capsule: capsule_with_score("feed-public", 2, 95)?,
+            capsule: Box::new(capsule_with_score("feed-public", 2, 95)?),
         })?;
         runtime.handle(P2pCommand::DrainInbox {
             peer_id: "peer-b".to_string(),
@@ -2179,11 +2179,11 @@ mod tests {
         })?;
         runtime.handle(P2pCommand::AnnounceFeed {
             peer_id: "peer-a".to_string(),
-            profile: profile("feed-public", FeedVisibility::Public)?,
+            profile: Box::new(profile("feed-public", FeedVisibility::Public)?),
         })?;
         runtime.handle(P2pCommand::CacheDirectoryEntry {
             peer_id: "peer-fabric".to_string(),
-            entry: entry.clone(),
+            entry: Box::new(entry.clone()),
         })?;
         runtime.handle(P2pCommand::DiscoverGithubUser {
             peer_id: "peer-fabric".to_string(),
@@ -2191,7 +2191,7 @@ mod tests {
         })?;
         runtime.handle(P2pCommand::PublishCapsule {
             peer_id: "peer-a".to_string(),
-            capsule: capsule_from_entry(&entry, 1)?,
+            capsule: Box::new(capsule_from_entry(&entry, 1)?),
         })?;
         runtime.handle(P2pCommand::DrainInbox {
             peer_id: "peer-fabric".to_string(),
@@ -2232,12 +2232,12 @@ mod tests {
         })?;
         runtime.handle(P2pCommand::AnnounceFeed {
             peer_id: "peer-a".to_string(),
-            profile: profile("feed-public", FeedVisibility::Public)?,
+            profile: Box::new(profile("feed-public", FeedVisibility::Public)?),
         })?;
         for seq in 1..=4 {
             runtime.handle(P2pCommand::PublishCapsule {
                 peer_id: "peer-a".to_string(),
-                capsule: capsule_with_score("feed-public", seq, 95)?,
+                capsule: Box::new(capsule_with_score("feed-public", seq, 95)?),
             })?;
         }
         runtime.handle(P2pCommand::RequestSnapshot {
