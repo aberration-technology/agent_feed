@@ -1,9 +1,11 @@
 name: deploy feed pages
 
 on:
-  push:
-    branches:
-      - main
+  workflow_run:
+    workflows:
+      - deploy feed p2p aws
+    types:
+      - completed
   workflow_dispatch:
     inputs:
       environment:
@@ -46,6 +48,7 @@ env:
 
 jobs:
   build:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'agent-feed-p2p-production' }}
     outputs:
