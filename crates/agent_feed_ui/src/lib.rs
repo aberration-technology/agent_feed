@@ -560,12 +560,18 @@ mod tests {
         assert!(html.contains("const MAX_STAGE_BULLETINS = 12;"));
         assert!(html.contains("const MAX_SEEN_BULLETINS = 512;"));
         assert!(html.contains("const STAGE_HEADLINE_MAX_AGE_MS = 30 * 60 * 1000;"));
+        assert!(html.contains("const LATEST_SEEN_HEADLINE_HOLD_MS = 15 * 60 * 1000;"));
         assert!(html.contains("const SEEN_BULLETIN_STORAGE_KEY = \"feed.seenBulletins.v1\";"));
         assert!(html.contains("const MIN_QUEUED_ADVANCE_MS = 2500;"));
         assert!(html.contains("function applyBulletinQueueUpdate"));
         assert!(html.contains("function queueIncomingBulletin"));
         assert!(html.contains("function completeActiveBulletin"));
         assert!(html.contains("function markBulletinSeen"));
+        assert!(html.contains("function renderLatestSeenStory"));
+        assert!(html.contains("function bulletinIsRecentForLatestHold"));
+        assert!(html.contains("setText(liveState, \"latest\");"));
+        assert!(html.contains("feed.remote.latest_seen"));
+        assert!(html.contains("latestBulletin,"));
         assert!(html.contains("function shouldInterruptBulletin"));
         assert!(html.contains(
             "priority >= 95 || (priority >= 90 && [\"breaking\", \"incident\"].includes(mode))"

@@ -40,6 +40,7 @@ let activeDwellMs = 14000;
 const MAX_STAGE_BULLETINS = 12;
 const MAX_SEEN_BULLETINS = 512;
 const STAGE_HEADLINE_MAX_AGE_MS = 30 * 60 * 1000;
+const LATEST_SEEN_HEADLINE_HOLD_MS = 15 * 60 * 1000;
 const MIN_QUEUED_ADVANCE_MS = 2500;
 const LOCAL_SNAPSHOT_REFRESH_MS = 5000;
 const REMOTE_SNAPSHOT_REFRESH_MS = 5000;
@@ -639,6 +640,9 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
 }
 
 function renderQuietConnected(route, classification = {}, nextPublisher = undefined) {
+  if (renderLatestSeenStory(route, classification, nextPublisher)) {
+    return;
+  }
   const feedCount = Number(classification.feedCount ?? classification.feeds?.length ?? remoteFeedCount ?? 0);
   const detail = quietDetail(route, classification);
   logInfo("feed.remote.quiet", {
@@ -670,6 +674,46 @@ function renderQuietConnected(route, classification = {}, nextPublisher = undefi
   ]);
   renderTicker(detail);
   stopStageProgress();
+}
+
+function renderLatestSeenStory(route, classification = {}, nextPublisher = undefined) {
+  const latest = classification.latestBulletin;
+  if (!latest || !bulletinIsRecentForLatestHold(latest)) {
+    return false;
+  }
+  logInfo("feed.remote.latest_seen", {
+    reason: classification.kind || "latest",
+    scope: route.kind || "user",
+    login: route.login,
+    selection: route.selection,
+    feed_mode: route.feedMode,
+    network: route.network,
+    bulletin_id: bulletinId(latest),
+    age_ms: Date.now() - bulletinCreatedAtMs(latest),
+  });
+  showStage();
+  document.body.dataset.mode = latest.mode || "dispatch";
+  setText(liveState, "latest");
+  setText(eyebrow, latest.eyebrow || routeEyebrow(route));
+  setText(headline, latest.headline);
+  setText(deck, latest.deck);
+  renderPublisher(
+    latest.publisher ||
+      latest.feed_publisher ||
+      nextPublisher ||
+      classification.profile ||
+      (route.kind === "global" ? undefined : { login: route.login }),
+  );
+  renderHeadlineImage(latest.image || latest.headline_image);
+  renderStoryTime(latest);
+  clearAuthAction();
+  renderStageActions(latest);
+  renderChips(latest.chips || []);
+  renderTicker(latest.ticker || []);
+  stopStageProgress();
+  activeStartedAt = 0;
+  activeDwellMs = 0;
+  return true;
 }
 
 function quietDetail(route, classification = {}) {
@@ -921,6 +965,11 @@ function bulletinCreatedAtMs(bulletin) {
 function bulletinIsFreshForStage(bulletin) {
   const ageMs = Date.now() - bulletinCreatedAtMs(bulletin);
   return ageMs <= STAGE_HEADLINE_MAX_AGE_MS;
+}
+
+function bulletinIsRecentForLatestHold(bulletin) {
+  const ageMs = Date.now() - bulletinCreatedAtMs(bulletin);
+  return ageMs >= 0 && ageMs <= LATEST_SEEN_HEADLINE_HOLD_MS;
 }
 
 function stageCandidateBulletins(items, previousIds = new Set()) {
@@ -2853,6 +2902,7 @@ function classifyRemoteSnapshot(route, feeds = [], headlines = [], context = {})
   const stageBulletins = routeHeadlines
     .map((item, index) => remoteHeadlineToBulletin(route, item, index))
     .filter(Boolean);
+  const latestBulletin = latestBulletinByTime(stageBulletins);
   const freshUnseen = stageBulletins.filter(
     (item) => !seenBulletinIds.has(bulletinId(item)) && bulletinIsFreshForStage(item),
   );
@@ -2879,6 +2929,7 @@ function classifyRemoteSnapshot(route, feeds = [], headlines = [], context = {})
     feedCount: feedList.length,
     headlines: routeHeadlines,
     headlineCount: routeHeadlines.length,
+    latestBulletin,
     freshBulletins: freshUnseen,
     freshUnseenCount: freshUnseen.length,
     historyAvailable: routeHeadlines.length > 0 || feedList.length > 0,
@@ -2887,6 +2938,19 @@ function classifyRemoteSnapshot(route, feeds = [], headlines = [], context = {})
     profile: context.profile,
     targets: context.targets || [],
   };
+}
+
+function latestBulletinByTime(items) {
+  let latest = undefined;
+  let latestTime = 0;
+  for (const item of items || []) {
+    const timestamp = bulletinCreatedAtMs(item);
+    if (!latest || timestamp > latestTime) {
+      latest = item;
+      latestTime = timestamp;
+    }
+  }
+  return latest;
 }
 
 function latestTimeValue(items, keys) {
