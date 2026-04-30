@@ -4,7 +4,7 @@ use agent_feed_core::{
 };
 use agent_feed_highlight::score_event;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use time::OffsetDateTime;
 
 const DEFAULT_DWELL_MS: u64 = 14_000;
@@ -100,6 +100,36 @@ pub struct StoryCompilerDiagnostics {
     pub deduped_stories: usize,
     pub last_decision: Option<StoryDecision>,
     pub recent_decisions: Vec<StoryDecision>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoryUpdateSignature {
+    pub topic_fingerprint: String,
+    pub state_fingerprint: String,
+    pub impact_fingerprint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryUpdateRelation {
+    NewTopic,
+    ExactRepeat,
+    SameState,
+    StateChanged,
+    ImpactChanged,
+}
+
+impl StoryUpdateRelation {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NewTopic => "new_topic",
+            Self::ExactRepeat => "exact_repeat",
+            Self::SameState => "same_state",
+            Self::StateChanged => "state_changed",
+            Self::ImpactChanged => "impact_changed",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1713,33 +1743,193 @@ fn normalized_story_text(input: &str) -> String {
 }
 
 fn semantic_story_fingerprint(headline: &str, deck: &str) -> String {
-    normalized_story_text(&format!("{headline} {deck}"))
-        .split_whitespace()
-        .filter(|word| {
-            !matches!(
-                *word,
-                "a" | "an"
-                    | "and"
-                    | "are"
-                    | "as"
-                    | "by"
-                    | "codex"
-                    | "claude"
-                    | "for"
-                    | "from"
-                    | "in"
-                    | "is"
-                    | "it"
-                    | "of"
-                    | "on"
-                    | "the"
-                    | "to"
-                    | "with"
-            )
-        })
-        .take(18)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let signature = story_update_signature(headline, deck);
+    format!(
+        "topic={} state={} impact={}",
+        signature.topic_fingerprint, signature.state_fingerprint, signature.impact_fingerprint
+    )
+}
+
+#[must_use]
+pub fn story_update_signature(headline: &str, deck: &str) -> StoryUpdateSignature {
+    let normalized = normalized_story_text(&format!("{headline} {deck}"));
+    let mut topic = BTreeSet::new();
+    let mut state = BTreeSet::new();
+    let mut impact = BTreeSet::new();
+
+    for word in normalized.split_whitespace() {
+        if let Some(label) = state_label(word) {
+            state.insert(label.to_string());
+            continue;
+        }
+        if let Some(label) = impact_label(word) {
+            impact.insert(label.to_string());
+        }
+        if !is_story_signature_stopword(word)
+            && state_label(word).is_none()
+            && !is_story_update_verb(word)
+        {
+            topic.insert(stem_story_term(word));
+        }
+    }
+
+    StoryUpdateSignature {
+        topic_fingerprint: topic.into_iter().take(14).collect::<Vec<_>>().join(":"),
+        state_fingerprint: state.into_iter().take(8).collect::<Vec<_>>().join(":"),
+        impact_fingerprint: impact.into_iter().take(8).collect::<Vec<_>>().join(":"),
+    }
+}
+
+#[must_use]
+pub fn story_update_relation(
+    candidate: &StoryUpdateSignature,
+    previous: &StoryUpdateSignature,
+) -> StoryUpdateRelation {
+    if candidate == previous {
+        return StoryUpdateRelation::ExactRepeat;
+    }
+    if !same_story_topic(&candidate.topic_fingerprint, &previous.topic_fingerprint) {
+        return StoryUpdateRelation::NewTopic;
+    }
+    if candidate.state_fingerprint != previous.state_fingerprint {
+        return StoryUpdateRelation::StateChanged;
+    }
+    if candidate.impact_fingerprint != previous.impact_fingerprint {
+        return StoryUpdateRelation::ImpactChanged;
+    }
+    StoryUpdateRelation::SameState
+}
+
+fn same_story_topic(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return left == right;
+    }
+    if left == right {
+        return true;
+    }
+    let left = left.split(':').collect::<BTreeSet<_>>();
+    let right = right.split(':').collect::<BTreeSet<_>>();
+    let intersection = left.intersection(&right).count();
+    let union = left.union(&right).count().max(1);
+    (intersection * 100) / union >= 60
+}
+
+fn state_label(word: &str) -> Option<&'static str> {
+    match word {
+        "blocked" | "blocker" | "blocking" | "stuck" | "unavailable" | "degraded" | "down" => {
+            Some("blocked")
+        }
+        "broken" | "fail" | "failed" | "failing" | "failure" | "red" | "regressed"
+        | "regression" => Some("failing"),
+        "fixed" | "fixes" | "resolved" | "restored" | "recovered" | "cleared" => Some("fixed"),
+        "green" | "pass" | "passed" | "passing" | "healthy" => Some("passing"),
+        "live" | "available" | "connected" | "online" => Some("available"),
+        "deploy" | "deployed" | "deployment" | "published" | "released" | "shipped" | "launch"
+        | "launched" => Some("shipped"),
+        "implemented" | "added" | "enabled" | "supports" | "support" => Some("implemented"),
+        "verified" | "validated" | "confirmed" | "proven" => Some("verified"),
+        "planned" | "designed" | "drafted" => Some("planned"),
+        "denied" | "rejected" => Some("denied"),
+        "requested" | "pending" | "waiting" => Some("requested"),
+        _ => None,
+    }
+}
+
+fn impact_label(word: &str) -> Option<&'static str> {
+    match word {
+        "auth" | "oauth" | "callback" | "signin" | "login" => Some("auth"),
+        "browser" | "page" | "pages" | "ui" | "ux" | "mobile" | "desktop" => Some("browser"),
+        "capture" | "codex" | "claude" | "transcript" | "session" => Some("capture"),
+        "deploy" | "deployment" | "edge" | "terraform" | "aws" => Some("deploy"),
+        "discovery" | "feed" | "feeds" | "follower" | "following" | "network" | "p2p" | "peer"
+        | "peers" | "subscription" | "subscriptions" => Some("network"),
+        "install" | "package" | "publish" | "release" | "cargo" => Some("release"),
+        "privacy" | "redaction" | "guardrail" | "secret" | "secrets" => Some("safety"),
+        "summary" | "summaries" | "summarization" | "headline" | "story" | "stories" => {
+            Some("summary")
+        }
+        "test" | "tests" | "ci" | "check" | "checks" | "canary" => Some("verification"),
+        _ => None,
+    }
+}
+
+fn is_story_signature_stopword(word: &str) -> bool {
+    matches!(
+        word,
+        "a" | "an"
+            | "and"
+            | "are"
+            | "as"
+            | "by"
+            | "codex"
+            | "claude"
+            | "for"
+            | "from"
+            | "in"
+            | "is"
+            | "it"
+            | "of"
+            | "on"
+            | "the"
+            | "to"
+            | "with"
+            | "now"
+            | "again"
+            | "after"
+            | "before"
+            | "latest"
+            | "new"
+            | "one"
+            | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "ten"
+    ) || word.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn is_story_update_verb(word: &str) -> bool {
+    matches!(
+        word,
+        "advance"
+            | "advanced"
+            | "advances"
+            | "become"
+            | "became"
+            | "becomes"
+            | "change"
+            | "changed"
+            | "changes"
+            | "finish"
+            | "finished"
+            | "finishes"
+            | "move"
+            | "moved"
+            | "moves"
+            | "shift"
+            | "shifted"
+            | "shifts"
+            | "stay"
+            | "stayed"
+            | "stays"
+            | "turn"
+            | "turned"
+            | "turns"
+            | "update"
+            | "updated"
+            | "updates"
+    )
+}
+
+fn stem_story_term(word: &str) -> String {
+    word.strip_suffix('s')
+        .filter(|stem| stem.len() > 3)
+        .unwrap_or(word)
+        .to_string()
 }
 
 fn summary_is_redundant(input: &str) -> bool {
@@ -2144,6 +2334,31 @@ mod tests {
                 .as_ref()
                 .map(|decision| decision.action),
             Some(StoryDecisionAction::Deduped)
+        );
+    }
+
+    #[test]
+    fn same_topic_status_progression_publishes_again() {
+        let mut compiler = StoryCompiler::default();
+        let mut blocked = event(EventKind::AgentMessage, "codex posted an update");
+        blocked.project = Some("burn_p2p".to_string());
+        blocked.summary =
+            Some("Burn_p2p release checks are blocked by a failing browser canary.".to_string());
+        assert!(compiler.ingest(blocked).is_empty());
+        assert_eq!(compiler.flush().len(), 1);
+
+        let mut fixed = event(EventKind::AgentMessage, "codex posted an update");
+        fixed.project = Some("burn_p2p".to_string());
+        fixed.summary =
+            Some("Burn_p2p release checks are green after the browser canary passed.".to_string());
+        assert!(compiler.ingest(fixed).is_empty());
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert!(stories[0].headline.contains("burn_p2p release checks"));
+        assert!(
+            stories[0].deck.contains("green") || stories[0].headline.contains("green"),
+            "changed status should survive active-update dedupe"
         );
     }
 

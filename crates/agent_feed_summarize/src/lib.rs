@@ -1,5 +1,7 @@
 use agent_feed_core::{HeadlineImage, PrivacyClass, Severity};
-use agent_feed_story::{CompiledStory, StoryFamily};
+use agent_feed_story::{
+    CompiledStory, StoryFamily, StoryUpdateRelation, story_update_relation, story_update_signature,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -501,6 +503,14 @@ pub struct SummaryMetadata {
     pub publish_action: PublishAction,
     pub publish_reason: String,
     pub headline_fingerprint: String,
+    #[serde(default)]
+    pub topic_fingerprint: String,
+    #[serde(default)]
+    pub state_fingerprint: String,
+    #[serde(default)]
+    pub impact_fingerprint: String,
+    #[serde(default)]
+    pub update_relation: String,
     pub max_headline_similarity: u8,
     pub max_deck_similarity: u8,
     pub guardrail_version: u32,
@@ -680,7 +690,7 @@ impl CodexSessionMemoryProcessor {
             .filter(|fingerprint| !fingerprint.trim().is_empty())
             .unwrap_or("none");
         format!(
-            "You are the private local headline memory for one agent feed. Maintain continuity across calls, but publish only when the new redacted delta changes the public story. Do not run tools. Return JSON only. Include memory_digest and semantic_fingerprint.\nsummary_memory_key={}\nprior_memory_digest={}\nprior_semantic_fingerprint={}\n\n{}",
+            "You are the private local headline memory for one agent feed. Maintain continuity across calls, but publish only when the new redacted delta changes the public story. A same-topic update should publish when the public outcome, status, phase, availability, or user/operator impact changed. Do not run tools. Return JSON only. Include memory_digest and semantic_fingerprint.\nsummary_memory_key={}\nprior_memory_digest={}\nprior_semantic_fingerprint={}\n\n{}",
             self.key,
             clamp_chars(digest, 900),
             clamp_chars(fingerprint, 180),
@@ -1254,6 +1264,10 @@ fn push_publishable_summary(
             output_chars = summary.metadata.output_chars,
             headline_similarity = summary.metadata.max_headline_similarity,
             deck_similarity = summary.metadata.max_deck_similarity,
+            update_relation = %summary.metadata.update_relation,
+            topic_fingerprint = %summary.metadata.topic_fingerprint,
+            state_fingerprint = %summary.metadata.state_fingerprint,
+            impact_fingerprint = %summary.metadata.impact_fingerprint,
             violations = summary.metadata.violations.len(),
             headline_fingerprint = %summary.metadata.headline_fingerprint,
             "summary publish decision skipped"
@@ -1271,6 +1285,10 @@ fn push_publishable_summary(
         output_chars = summary.metadata.output_chars,
         headline_similarity = summary.metadata.max_headline_similarity,
         deck_similarity = summary.metadata.max_deck_similarity,
+        update_relation = %summary.metadata.update_relation,
+        topic_fingerprint = %summary.metadata.topic_fingerprint,
+        state_fingerprint = %summary.metadata.state_fingerprint,
+        impact_fingerprint = %summary.metadata.impact_fingerprint,
         violations = summary.metadata.violations.len(),
         image_enabled = summary.metadata.image_enabled,
         image_attached = summary.image.is_some(),
@@ -1831,6 +1849,7 @@ fn build_summary(
     };
 
     let headline_fingerprint = headline_fingerprint(&headline);
+    let update_signature = story_update_signature(&headline, &deck);
     let mut summary = FeedSummary {
         story_window,
         source_agent_kinds,
@@ -1852,6 +1871,10 @@ fn build_summary(
             publish_reason: processor_publish_reason
                 .unwrap_or_else(|| "local publish policy accepted the summary".to_string()),
             headline_fingerprint,
+            topic_fingerprint: update_signature.topic_fingerprint,
+            state_fingerprint: update_signature.state_fingerprint,
+            impact_fingerprint: update_signature.impact_fingerprint,
+            update_relation: StoryUpdateRelation::NewTopic.as_str().to_string(),
             max_headline_similarity: 0,
             max_deck_similarity: 0,
             guardrail_version: guardrails.version,
@@ -2370,13 +2393,14 @@ fn apply_publish_decision(
         return true;
     }
 
-    if summary.metadata.publish_action == PublishAction::SkipProcessor {
-        return false;
-    }
-
+    let candidate_signature = story_update_signature(&summary.headline, &summary.deck);
+    summary.metadata.topic_fingerprint = candidate_signature.topic_fingerprint.clone();
+    summary.metadata.state_fingerprint = candidate_signature.state_fingerprint.clone();
+    summary.metadata.impact_fingerprint = candidate_signature.impact_fingerprint.clone();
     let mut nearest_headline = 0u8;
     let mut nearest_deck = 0u8;
     let mut nearest = None::<&RecentSummary>;
+    let mut nearest_relation = StoryUpdateRelation::NewTopic;
     for recent in request
         .recent_summaries
         .iter()
@@ -2393,12 +2417,21 @@ fn apply_publish_decision(
             nearest_headline = headline_score;
             nearest_deck = deck_score;
             nearest = Some(recent);
+            nearest_relation = story_update_relation(
+                &candidate_signature,
+                &story_update_signature(&recent.headline, &recent.deck),
+            );
         }
     }
 
     summary.metadata.max_headline_similarity = nearest_headline;
     summary.metadata.max_deck_similarity = nearest_deck;
     summary.metadata.headline_fingerprint = headline_fingerprint(&summary.headline);
+    summary.metadata.update_relation = if nearest.is_some() {
+        nearest_relation.as_str().to_string()
+    } else {
+        StoryUpdateRelation::NewTopic.as_str().to_string()
+    };
 
     if is_generic_or_low_signal_summary(summary) {
         summary.metadata.publish_action = PublishAction::SkipProcessor;
@@ -2407,10 +2440,31 @@ fn apply_publish_decision(
         return false;
     }
 
-    let duplicate = nearest.is_some()
-        && nearest_headline >= policy.max_headline_similarity
-        && (nearest_headline == 100
-            || nearest_deck >= policy.max_deck_similarity_when_headline_matches);
+    let changed_update = matches!(
+        nearest_relation,
+        StoryUpdateRelation::StateChanged | StoryUpdateRelation::ImpactChanged
+    );
+    if summary.metadata.publish_action == PublishAction::SkipProcessor {
+        if summary.metadata.processor == "codex-memory" && changed_update {
+            summary.metadata.publish_action = PublishAction::Publish;
+            summary.metadata.publish_reason = format!(
+                "codex-memory skip overridden because the same topic {}",
+                nearest_relation.as_str()
+            );
+        } else {
+            return false;
+        }
+    }
+
+    let exact_text_repeat = nearest.is_some() && nearest_headline == 100 && nearest_deck == 100;
+    let duplicate = exact_text_repeat
+        || (nearest.is_some()
+            && matches!(
+                nearest_relation,
+                StoryUpdateRelation::ExactRepeat | StoryUpdateRelation::SameState
+            )
+            && nearest_headline >= policy.max_headline_similarity
+            && nearest_deck >= policy.max_deck_similarity_when_headline_matches);
     if duplicate {
         summary.metadata.publish_action = PublishAction::SkipDuplicate;
         summary.metadata.publish_reason = format!(
@@ -2427,7 +2481,12 @@ fn apply_publish_decision(
     }
 
     summary.metadata.publish_action = PublishAction::Publish;
-    summary.metadata.publish_reason = if nearest.is_some() {
+    summary.metadata.publish_reason = if changed_update {
+        format!(
+            "same topic published again because the story {} (nearest headline similarity {nearest_headline}, deck similarity {nearest_deck})",
+            nearest_relation.as_str()
+        )
+    } else if nearest.is_some() {
         format!(
             "headline changed enough to publish (nearest headline similarity {nearest_headline}, deck similarity {nearest_deck})"
         )
@@ -2727,7 +2786,7 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         format!("recent_published:\n{recent}")
     };
     let prompt = format!(
-        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false when the candidate is not meaningfully different from recent published summaries, or when the facts only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false only when the topic and public outcome are unchanged from recent published summaries, or when the facts only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. If the same topic moved from blocked to fixed, failing to passing, planned to implemented, unavailable to available, local-only to public/live, or degraded to recovered, publish a compact update. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
         request.feed_id, request.mode, recent, stories
     );
     clamp_chars(&prompt, max_prompt_chars)
@@ -3344,6 +3403,34 @@ mod tests {
             headline_similarity("codex changed 1 files", &existing.headline),
             100
         );
+    }
+
+    #[test]
+    fn same_topic_state_update_publishes_despite_identical_headline() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let existing = RecentSummary {
+            headline: "browser canary changes deployment status".to_string(),
+            deck: "browser canary is failing and deployment is blocked.".to_string(),
+            story_family: StoryFamily::Test,
+            score: 82,
+        };
+        let mut update = verified_story(84);
+        update.headline = existing.headline.clone();
+        update.deck = "browser canary is passing and deployment is live.".to_string();
+
+        let summaries = summarize_feed_with_recent(
+            "local:workstation",
+            &[update],
+            &config,
+            std::slice::from_ref(&existing),
+        )
+        .expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].metadata.max_headline_similarity, 100);
+        assert_eq!(summaries[0].metadata.update_relation, "state_changed");
+        assert_eq!(summaries[0].metadata.publish_action, PublishAction::Publish);
     }
 
     #[test]
@@ -4021,6 +4108,65 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             summary.metadata.publish_action,
             PublishAction::SkipProcessor
         );
+    }
+
+    struct DecliningStateUpdateProcessor;
+
+    impl SummaryProcessor for DecliningStateUpdateProcessor {
+        fn name(&self) -> &str {
+            "declining-state-update"
+        }
+
+        fn summarize(&self, request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            assert_eq!(request.recent_summaries.len(), 1);
+            Ok(ProcessorSummary {
+                headline: "browser canary changes deployment status".to_string(),
+                deck: "browser canary is passing and deployment is live.".to_string(),
+                lower_third: Some("codex-memory · redacted".to_string()),
+                chips: vec!["browser".to_string(), "deployment".to_string()],
+                publish: Some(false),
+                publish_reason: Some("same topic, but stale processor declined".to_string()),
+                memory_digest: Some("browser canary moved from blocked to live".to_string()),
+                semantic_fingerprint: Some("browser-canary:deployment:live".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn built_in_memory_skip_is_overridden_for_state_transition() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let request = SummaryRequest {
+            feed_id: "local:workstation".to_string(),
+            mode: FeedSummaryMode::PerStory,
+            stories: vec![verified_story(84)],
+            recent_summaries: vec![RecentSummary {
+                headline: "browser canary changes deployment status".to_string(),
+                deck: "browser canary is failing and deployment is blocked.".to_string(),
+                story_family: StoryFamily::Test,
+                score: 82,
+            }],
+            prompt_style: None,
+            max_prompt_chars: None,
+            branch: None,
+            session_hint: None,
+        };
+        let mut summary =
+            summarize_request_with_processor(&request, &config, &DecliningStateUpdateProcessor)
+                .expect("declining processor returns a display-safe candidate");
+
+        assert!(apply_publish_decision(
+            &mut summary,
+            &request,
+            &config.publish
+        ));
+        assert_eq!(summary.metadata.update_relation, "state_changed");
+        assert_eq!(summary.metadata.publish_action, PublishAction::Publish);
     }
 
     struct StaticImageProcessor {
