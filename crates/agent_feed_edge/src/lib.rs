@@ -1508,10 +1508,8 @@ fn public_feed_is_visible(feed: &ResolveFeedView) -> bool {
 fn public_headline_is_visible(headline: &RemoteHeadlineView) -> bool {
     !headline.feed_id.starts_with("local:")
         && !remote_copy_has_public_quality_issue(&format!(
-            "{} {} {}",
-            headline.headline,
-            headline.deck,
-            headline.chips.join(" ")
+            "{} {}",
+            headline.headline, headline.deck
         ))
 }
 
@@ -2664,6 +2662,19 @@ mod tests {
         let mut test_status = base.clone();
         test_status.headline = "codex verifies tests, confirms pass state".to_string();
         test_status.deck = "tests passed after the two-file change.".to_string();
+        let mut contextual_with_file_chip = base.clone();
+        contextual_with_file_chip.headline =
+            "gemma bridge now isolates the device mismatch blocking inference".to_string();
+        contextual_with_file_chip.deck =
+            "input tensors are routed toward the quantized model path so forward checks can reach TRELLIS conditioning."
+                .to_string();
+        contextual_with_file_chip.chips = vec![
+            "gemma4_trellis2".to_string(),
+            "codex".to_string(),
+            "turn".to_string(),
+            "4 files".to_string(),
+            "score 84".to_string(),
+        ];
 
         store.push(local);
         store.push(bad);
@@ -2672,15 +2683,17 @@ mod tests {
         store.push(ci_status);
         store.push(file_count);
         store.push(test_status);
+        store.push(contextual_with_file_chip.clone());
         store.push(base);
         let snapshot = network_snapshot_value(&config(), &store);
 
         let headlines = snapshot["headlines"].as_array().expect("headlines");
-        assert_eq!(headlines.len(), 1);
-        assert_eq!(
-            headlines[0]["headline"],
-            serde_json::json!("codex finished release pass")
-        );
+        assert_eq!(headlines.len(), 2);
+        assert!(headlines.iter().any(
+            |headline| headline["headline"] == serde_json::json!("codex finished release pass")
+        ));
+        assert!(headlines.iter().any(|headline| headline["headline"]
+            == serde_json::json!(contextual_with_file_chip.headline)));
         let feeds = snapshot["feeds"].as_array().expect("feeds");
         assert!(feeds.iter().all(|feed| {
             !feed["feed_id"]
@@ -2829,9 +2842,11 @@ mod tests {
             deck: "operators can confirm local stories reached the public edge snapshot without a page refresh.".to_string(),
             lower_third: "codex · feed · score 91 · redacted".to_string(),
             chips: vec![
+                "feed".to_string(),
                 "codex".to_string(),
                 "publish".to_string(),
                 "edge".to_string(),
+                "4 files".to_string(),
             ],
             severity: Severity::Notice,
             score: 91,
