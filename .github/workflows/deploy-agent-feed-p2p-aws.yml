@@ -418,8 +418,17 @@ jobs:
               '{
                 commands: [
                   "set -eux",
+                  "export DEBIAN_FRONTEND=noninteractive",
                   "cloud-init status --wait || true",
                   "if ! id agent-feed >/dev/null 2>&1; then sudo useradd --system --home-dir /var/lib/agent-feed --create-home --shell /usr/sbin/nologin agent-feed; fi",
+                  "sudo apt-get update",
+                  "sudo apt-get install -y --no-install-recommends ca-certificates curl debian-archive-keyring debian-keyring apt-transport-https gnupg",
+                  "sudo rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg.tmp",
+                  "curl -1sLf '\''https://dl.cloudsmith.io/public/caddy/stable/gpg.key'\'' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg.tmp",
+                  "sudo mv /usr/share/keyrings/caddy-stable-archive-keyring.gpg.tmp /usr/share/keyrings/caddy-stable-archive-keyring.gpg",
+                  "curl -1sLf '\''https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt'\'' | sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null",
+                  "sudo apt-get update",
+                  "sudo apt-get install -y --no-install-recommends caddy",
                   "sudo install -d -m 0755 /etc/agent-feed /usr/local/bin",
                   "sudo install -d -m 0750 -o agent-feed -g agent-feed /var/lib/agent-feed",
                   ("aws s3 cp " + ($binary_s3_uri | @sh) + " /tmp/agent-feed.new"),

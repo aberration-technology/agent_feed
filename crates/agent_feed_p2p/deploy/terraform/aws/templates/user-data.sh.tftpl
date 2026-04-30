@@ -5,8 +5,22 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  build-essential \
   ca-certificates \
+  curl \
+  debian-archive-keyring \
+  debian-keyring \
+  apt-transport-https \
+  gnupg
+
+rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg.tmp
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg.tmp
+mv /usr/share/keyrings/caddy-stable-archive-keyring.gpg.tmp /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  >/etc/apt/sources.list.d/caddy-stable.list
+apt-get update
+apt-get install -y --no-install-recommends \
+  build-essential \
   caddy \
   curl \
   git \
