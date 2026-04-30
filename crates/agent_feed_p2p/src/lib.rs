@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 pub const MAINNET_NETWORK_ID: &str = "agent-feed-mainnet";
-pub const MAINNET_EDGE_HOST: &str = "api.feed.aberration.technology";
 pub const MAINNET_EDGE_BASE_URL: &str = "https://api.feed.aberration.technology";
+pub const MAINNET_BOOTSTRAP_HOST: &str = "edge.feed.aberration.technology";
 pub const MAINNET_P2P_PORT: u16 = 7747;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -381,9 +381,9 @@ impl P2pNetworkConfig {
             network_id: MAINNET_NETWORK_ID.to_string(),
             edge_base_url: MAINNET_EDGE_BASE_URL.to_string(),
             bootstrap_peers: vec![
-                format!("/dns4/{MAINNET_EDGE_HOST}/tcp/{MAINNET_P2P_PORT}"),
-                format!("/dns4/{MAINNET_EDGE_HOST}/udp/{MAINNET_P2P_PORT}/quic-v1"),
-                format!("/dns4/{MAINNET_EDGE_HOST}/udp/443/webrtc-direct"),
+                format!("/dns4/{MAINNET_BOOTSTRAP_HOST}/tcp/{MAINNET_P2P_PORT}"),
+                format!("/dns4/{MAINNET_BOOTSTRAP_HOST}/udp/{MAINNET_P2P_PORT}/quic-v1"),
+                format!("/dns4/{MAINNET_BOOTSTRAP_HOST}/udp/443/webrtc-direct"),
             ],
             topology: BootstrapTopology::SingleBootstrap,
             data_plane: P2pDataPlane::EdgeSnapshotFallback,
@@ -2291,7 +2291,7 @@ mod tests {
         assert_eq!(config.edge_fallback, EdgeFallbackMode::Auto);
         assert_eq!(
             single_bootstrap_host(&config.bootstrap_peers).as_deref(),
-            Some(MAINNET_EDGE_HOST)
+            Some(MAINNET_BOOTSTRAP_HOST)
         );
         assert!(config.is_single_bootstrap_topology());
         assert!(
@@ -2317,7 +2317,7 @@ mod tests {
     #[test]
     fn single_bootstrap_detection_rejects_mixed_hosts() {
         let peers = vec![
-            "/dns4/api.feed.aberration.technology/tcp/7747".to_string(),
+            "/dns4/edge.feed.aberration.technology/tcp/7747".to_string(),
             "/dns4/backup.feed.aberration.technology/tcp/7747".to_string(),
         ];
 

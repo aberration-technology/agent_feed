@@ -23,6 +23,11 @@ output "edge_public_ip" {
   value       = aws_eip.edge.public_ip
 }
 
+output "bootstrap_domain_name" {
+  description = "Public DNS hostname for the single p2p bootstrap peer."
+  value       = local.bootstrap_domain_name_normalized
+}
+
 output "seed_node_tcp_multiaddr" {
   description = "TCP bootstrap multiaddr advertised to native peers."
   value       = local.seed_node_tcp_multiaddr

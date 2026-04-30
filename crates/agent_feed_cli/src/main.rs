@@ -549,6 +549,8 @@ enum EdgeCommand {
         config: Option<PathBuf>,
         #[arg(long, default_value = "https://api.feed.aberration.technology")]
         edge_base_url: String,
+        #[arg(long, default_value = "edge.feed.aberration.technology")]
+        bootstrap_host: String,
         #[arg(long, default_value = "https://feed.aberration.technology")]
         browser_app_base_url: String,
         #[arg(
@@ -1224,7 +1226,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 );
                 println!("p2p doctor: story capsule protocol ok");
                 println!("p2p doctor: topology={}", config.topology.as_str());
-                println!("p2p doctor: bootstrap_host=api.feed.aberration.technology");
+                println!("p2p doctor: bootstrap_host=edge.feed.aberration.technology");
                 println!("p2p doctor: data_plane={}", config.data_plane.as_str());
                 println!(
                     "p2p doctor: active_transport={} available={} · {}",
@@ -1573,17 +1575,20 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 bind,
                 config: _,
                 edge_base_url,
+                bootstrap_host,
                 browser_app_base_url,
                 github_callback_url,
                 network_id,
             } => {
-                let edge_host = edge_base_url
+                let bootstrap_host = bootstrap_host
                     .trim_start_matches("https://")
                     .trim_start_matches("http://")
-                    .trim_end_matches('/');
+                    .trim_end_matches('/')
+                    .to_string();
                 info!(
                     %bind,
                     edge_base_url = %edge_base_url,
+                    bootstrap_host = %bootstrap_host,
                     browser_app_base_url = %browser_app_base_url,
                     github_callback_url = %github_callback_url,
                     network_id = %network_id,
@@ -1595,9 +1600,9 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     browser_app_base_url,
                     github_callback_url,
                     bootstrap_peers: vec![
-                        format!("/dns4/{edge_host}/tcp/7747"),
-                        format!("/dns4/{edge_host}/udp/7747/quic-v1"),
-                        format!("/dns4/{edge_host}/udp/443/webrtc-direct"),
+                        format!("/dns4/{bootstrap_host}/tcp/7747"),
+                        format!("/dns4/{bootstrap_host}/udp/7747/quic-v1"),
+                        format!("/dns4/{bootstrap_host}/udp/443/webrtc-direct"),
                     ],
                     authority_id: "edge.feed".to_string(),
                     org_policy: OrgDeploymentPolicy::from_env(),

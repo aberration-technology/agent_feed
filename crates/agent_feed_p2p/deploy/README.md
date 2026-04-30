@@ -7,8 +7,11 @@ feed.aberration.technology
   public browser shell and username deep links on github pages
 
 api.feed.aberration.technology
-  one bootstrap/edge peer for github auth, browser seeds, directory,
-  rendezvous/bootstrap probes, and edge snapshot fallback
+  cloudfront/acm https front door for github auth, browser seeds, directory,
+  and edge snapshot fallback
+
+edge.feed.aberration.technology
+  the single native/browser p2p bootstrap peer on ec2
 ```
 
 the local product stays local. the hosted product is called `feed` in the UI.
@@ -67,6 +70,7 @@ recommended variables:
 AGENT_FEED_P2P_AWS_REGION=us-east-2
 AGENT_FEED_P2P_STACK_NAME=agent-feed-p2p-production
 AGENT_FEED_P2P_EDGE_DOMAIN_NAME=api.feed.aberration.technology
+AGENT_FEED_P2P_BOOTSTRAP_DOMAIN_NAME=edge.feed.aberration.technology
 AGENT_FEED_P2P_EDGE_BASE_URL=https://api.feed.aberration.technology
 AGENT_FEED_P2P_BROWSER_APP_BASE_URL=https://feed.aberration.technology
 AGENT_FEED_P2P_GITHUB_CALLBACK_URL=https://api.feed.aberration.technology/callback/github
@@ -113,9 +117,11 @@ the stack manages:
 one ec2 edge host
 one elastic ip
 one small public vpc/subnet
-route53 A record for api.feed.aberration.technology
+cloudfront + acm certificate for api.feed.aberration.technology
+route53 A alias for api.feed.aberration.technology -> cloudfront
+route53 A record for edge.feed.aberration.technology -> ec2
 route53 CNAME for feed.aberration.technology -> github pages
-caddy tls termination for the edge host
+caddy http reverse proxy for cloudfront origin traffic
 tcp/udp p2p fabric probes on 7747
 udp browser handoff probe on 443
 ssm-enabled instance role
@@ -144,8 +150,8 @@ deploy is not considered green until these pass:
 https://feed.aberration.technology/{canary_github_login}?all loads the static shell
 https://api.feed.aberration.technology/callback/github is the github oauth callback URL
 https://api.feed.aberration.technology/healthz returns ok
-api.feed.aberration.technology:7747 accepts tcp p2p fabric probes
-api.feed.aberration.technology:7747 answers udp p2p fabric probes
+edge.feed.aberration.technology:7747 accepts tcp p2p fabric probes
+edge.feed.aberration.technology:7747 answers udp p2p fabric probes
 ```
 
 resolver and feed-discovery checks can be tightened as the native p2p data plane

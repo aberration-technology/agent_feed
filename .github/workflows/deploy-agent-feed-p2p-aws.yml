@@ -61,6 +61,7 @@ jobs:
           VAR_AWS_ROLE_ARN: ${{ vars.AGENT_FEED_P2P_AWS_ROLE_ARN }}
           VAR_STACK_NAME: ${{ vars.AGENT_FEED_P2P_STACK_NAME }}
           VAR_EDGE_DOMAIN_NAME: ${{ vars.AGENT_FEED_P2P_EDGE_DOMAIN_NAME }}
+          VAR_BOOTSTRAP_DOMAIN_NAME: ${{ vars.AGENT_FEED_P2P_BOOTSTRAP_DOMAIN_NAME }}
           VAR_BROWSER_APP_BASE_URL: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_BASE_URL }}
           VAR_BROWSER_APP_PAGES_DOMAIN_TARGET: ${{ vars.AGENT_FEED_P2P_BROWSER_APP_PAGES_DOMAIN_TARGET }}
           VAR_GITHUB_CALLBACK_URL: ${{ vars.AGENT_FEED_P2P_GITHUB_CALLBACK_URL }}
@@ -86,6 +87,7 @@ jobs:
           aws_role_arn="${VAR_AWS_ROLE_ARN:-}"
           stack_name="${VAR_STACK_NAME:-agent-feed-p2p-production}"
           edge_domain_name="${VAR_EDGE_DOMAIN_NAME:-api.feed.aberration.technology}"
+          bootstrap_domain_name="${VAR_BOOTSTRAP_DOMAIN_NAME:-edge.feed.aberration.technology}"
           edge_base_url="https://${edge_domain_name}"
           browser_app_base_url="${VAR_BROWSER_APP_BASE_URL:-https://feed.aberration.technology}"
           github_callback_url="${VAR_GITHUB_CALLBACK_URL:-${edge_base_url%/}/callback/github}"
@@ -113,6 +115,7 @@ jobs:
             echo "TF_VAR_agent_feed_binary_s3_bucket=$state_bucket"
             echo "TF_VAR_agent_feed_binary_s3_key=$binary_s3_key"
             echo "TF_VAR_edge_domain_name=$edge_domain_name"
+            echo "TF_VAR_bootstrap_domain_name=$bootstrap_domain_name"
             echo "TF_VAR_browser_app_base_url=$browser_app_base_url"
             echo "TF_VAR_browser_app_pages_domain_target=${VAR_BROWSER_APP_PAGES_DOMAIN_TARGET:-aberration-technology.github.io}"
             echo "TF_VAR_github_callback_url=$github_callback_url"
@@ -324,6 +327,7 @@ jobs:
             browser_host="${browser_host#http://}"
             browser_host="${browser_host%%/*}"
             try_import aws_route53_record.edge "${zone_id}_${TF_VAR_edge_domain_name}_A"
+            try_import aws_route53_record.bootstrap "${zone_id}_${TF_VAR_bootstrap_domain_name}_A"
             try_import aws_route53_record.browser "${zone_id}_${browser_host}_A"
           fi
 
@@ -521,9 +525,7 @@ jobs:
         run: |
           set -euo pipefail
           edge_url="${{ steps.terraform_outputs.outputs.edge_url }}"
-          edge_host="${edge_url#https://}"
-          edge_host="${edge_host#http://}"
-          edge_host="${edge_host%%/*}"
+          edge_host="$(terraform -chdir="$TF_ROOT" output -raw bootstrap_domain_name)"
 
           for attempt in $(seq 1 30); do
             tcp_probe="$(

@@ -7,9 +7,9 @@ profile = "mainnet"
 enabled = true
 edge_base_url = "https://api.feed.aberration.technology"
 bootstrap_peers = [
-  "/dns4/api.feed.aberration.technology/tcp/7747",
-  "/dns4/api.feed.aberration.technology/udp/7747/quic-v1",
-  "/dns4/api.feed.aberration.technology/udp/443/webrtc-direct",
+  "/dns4/edge.feed.aberration.technology/tcp/7747",
+  "/dns4/edge.feed.aberration.technology/udp/7747/quic-v1",
+  "/dns4/edge.feed.aberration.technology/udp/443/webrtc-direct",
 ]
 
 [p2p.publish]

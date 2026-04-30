@@ -31,10 +31,22 @@ data "aws_ami" "ubuntu" {
   }
 }
 
+data "aws_cloudfront_cache_policy" "caching_disabled" {
+  name = "Managed-CachingDisabled"
+}
+
+data "aws_cloudfront_origin_request_policy" "all_viewer_except_host_header" {
+  name = "Managed-AllViewerExceptHostHeader"
+}
+
 locals {
   route53_zone_apex           = trimsuffix(lower(trimspace(var.route53_zone_name)), ".")
   edge_domain_name_normalized = trimsuffix(lower(trimspace(var.edge_domain_name)), ".")
-  browser_app_base_url        = trimsuffix(trimspace(var.browser_app_base_url), "/")
+  bootstrap_domain_name_normalized = trimsuffix(
+    lower(trimspace(var.bootstrap_domain_name)),
+    ".",
+  )
+  browser_app_base_url = trimsuffix(trimspace(var.browser_app_base_url), "/")
   browser_app_hostname = split(
     "/",
     replace(replace(local.browser_app_base_url, "https://", ""), "http://", ""),
@@ -43,14 +55,15 @@ locals {
   browser_app_pages_domain_target   = trimsuffix(trimspace(var.browser_app_pages_domain_target), ".")
   github_callback_url               = trimspace(var.github_callback_url) == "" ? "${local.edge_url}/callback/github" : trimspace(var.github_callback_url)
   claiming_edge_apex                = local.edge_domain_name_normalized == local.route53_zone_apex
+  claiming_bootstrap_apex           = local.bootstrap_domain_name_normalized == local.route53_zone_apex
   claiming_browser_apex             = local.browser_app_hostname_normalized == local.route53_zone_apex
   cloudwatch_alarm_actions          = trimspace(var.alarm_sns_topic_arn) == "" ? [] : [trimspace(var.alarm_sns_topic_arn)]
   agent_feed_install_source         = lower(trimspace(var.agent_feed_install_source))
   github_admin_logins_csv           = join(",", var.github_admin_logins)
-  edge_url                          = "https://${var.edge_domain_name}"
-  seed_node_tcp_multiaddr           = "/dns4/${var.edge_domain_name}/tcp/${var.p2p_port}"
-  seed_node_quic_multiaddr          = "/dns4/${var.edge_domain_name}/udp/${var.p2p_port}/quic-v1"
-  seed_node_webrtc_direct_multiaddr = "/dns4/${var.edge_domain_name}/udp/443/webrtc-direct"
+  edge_url                          = "https://${local.edge_domain_name_normalized}"
+  seed_node_tcp_multiaddr           = "/dns4/${local.bootstrap_domain_name_normalized}/tcp/${var.p2p_port}"
+  seed_node_quic_multiaddr          = "/dns4/${local.bootstrap_domain_name_normalized}/udp/${var.p2p_port}/quic-v1"
+  seed_node_webrtc_direct_multiaddr = "/dns4/${local.bootstrap_domain_name_normalized}/udp/443/webrtc-direct"
   tags = merge(
     var.tags,
     {
@@ -70,6 +83,7 @@ locals {
   edge_env = templatefile("${path.module}/templates/edge.env.tftpl", {
     browser_app_base_url                = local.browser_app_base_url
     edge_base_url                       = local.edge_url
+    bootstrap_domain_name               = local.bootstrap_domain_name_normalized
     github_callback_url                 = local.github_callback_url
     network_id                          = var.network_id
     p2p_port                            = var.p2p_port
@@ -85,6 +99,7 @@ locals {
   edge_toml = templatefile("${path.module}/templates/edge.toml.tftpl", {
     browser_app_base_url  = local.browser_app_base_url
     edge_base_url         = local.edge_url
+    bootstrap_domain_name = local.bootstrap_domain_name_normalized
     github_callback_url   = local.github_callback_url
     network_id            = var.network_id
     p2p_port              = var.p2p_port
@@ -96,13 +111,18 @@ locals {
     browser_app_hostname            = local.browser_app_hostname
     browser_app_origin              = local.browser_app_base_url
     browser_app_pages_domain_target = local.browser_app_pages_domain_target
-    edge_domain_name                = var.edge_domain_name
+    bootstrap_domain_name           = local.bootstrap_domain_name_normalized
+    edge_domain_name                = local.edge_domain_name_normalized
     edge_loopback_port              = var.edge_loopback_port
     tls_contact_email               = var.tls_contact_email
   })
   edge_service_unit = templatefile("${path.module}/templates/agent-feed-edge.service.tftpl", {
-    edge_loopback_port  = var.edge_loopback_port
-    github_callback_url = local.github_callback_url
+    bootstrap_domain_name = local.bootstrap_domain_name_normalized
+    browser_app_base_url  = local.browser_app_base_url
+    edge_base_url         = local.edge_url
+    edge_loopback_port    = var.edge_loopback_port
+    github_callback_url   = local.github_callback_url
+    network_id            = var.network_id
   })
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
     agent_feed_binary_s3_uri   = var.agent_feed_binary_s3_uri
@@ -122,14 +142,15 @@ locals {
 
 resource "terraform_data" "apex_guardrail" {
   input = {
-    browser = local.claiming_browser_apex
-    edge    = local.claiming_edge_apex
+    bootstrap = local.claiming_bootstrap_apex
+    browser   = local.claiming_browser_apex
+    edge      = local.claiming_edge_apex
   }
 
   lifecycle {
     precondition {
       condition = (
-        (!local.claiming_browser_apex && !local.claiming_edge_apex)
+        (!local.claiming_browser_apex && !local.claiming_edge_apex && !local.claiming_bootstrap_apex)
         || var.allow_route53_zone_apex_records
       )
       error_message = "refusing to manage hosted-zone apex records without explicit override"
@@ -365,12 +386,116 @@ resource "aws_eip_association" "edge" {
   instance_id   = aws_instance.edge.id
 }
 
-resource "aws_route53_record" "edge" {
+resource "aws_route53_record" "bootstrap" {
   zone_id         = data.aws_route53_zone.selected.zone_id
-  name            = local.edge_domain_name_normalized
+  name            = local.bootstrap_domain_name_normalized
   type            = "A"
   ttl             = 60
   records         = [aws_eip.edge.public_ip]
+  allow_overwrite = true
+}
+
+resource "aws_acm_certificate" "edge" {
+  provider          = aws.us_east_1
+  domain_name       = local.edge_domain_name_normalized
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  depends_on = [aws_route53_record.edge_caa]
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-edge-api"
+  })
+}
+
+resource "aws_route53_record" "edge_cert_validation" {
+  for_each = {
+    for option in aws_acm_certificate.edge.domain_validation_options : option.domain_name => {
+      name   = option.resource_record_name
+      record = option.resource_record_value
+      type   = option.resource_record_type
+    }
+  }
+
+  zone_id         = data.aws_route53_zone.selected.zone_id
+  name            = each.value.name
+  type            = each.value.type
+  ttl             = 60
+  records         = [each.value.record]
+  allow_overwrite = true
+}
+
+resource "aws_acm_certificate_validation" "edge" {
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.edge.arn
+  validation_record_fqdns = [for record in aws_route53_record.edge_cert_validation : record.fqdn]
+}
+
+resource "aws_cloudfront_distribution" "edge" {
+  enabled         = true
+  is_ipv6_enabled = true
+  comment         = "${var.stack_name} feed api"
+  aliases         = [local.edge_domain_name_normalized]
+  price_class     = "PriceClass_100"
+  http_version    = "http2"
+
+  origin {
+    domain_name = local.bootstrap_domain_name_normalized
+    origin_id   = "feed-edge-http"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only"
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "feed-edge-http"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods         = ["GET", "HEAD", "OPTIONS"]
+    compress               = true
+    cache_policy_id        = data.aws_cloudfront_cache_policy.caching_disabled.id
+    origin_request_policy_id = (
+      data.aws_cloudfront_origin_request_policy.all_viewer_except_host_header.id
+    )
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.edge.certificate_arn
+    minimum_protocol_version = "TLSv1.2_2021"
+    ssl_support_method       = "sni-only"
+  }
+
+  tags = merge(local.tags, {
+    Name = "${var.stack_name}-edge-api"
+  })
+
+  depends_on = [aws_route53_record.bootstrap]
+}
+
+resource "aws_route53_record" "edge" {
+  zone_id = data.aws_route53_zone.selected.zone_id
+  name    = local.edge_domain_name_normalized
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.edge.domain_name
+    zone_id                = aws_cloudfront_distribution.edge.hosted_zone_id
+    evaluate_target_health = false
+  }
+
   allow_overwrite = true
 }
 
@@ -380,6 +505,10 @@ resource "aws_route53_record" "edge_caa" {
   type    = "CAA"
   ttl     = 300
   records = [
+    "0 issue \"amazon.com\"",
+    "0 issue \"amazonaws.com\"",
+    "0 issue \"amazontrust.com\"",
+    "0 issue \"awstrust.com\"",
     "0 issue \"letsencrypt.org\"",
     "0 issue \"sectigo.com\"",
     "0 issue \"zerossl.com\"",

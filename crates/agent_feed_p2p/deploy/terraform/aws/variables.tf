@@ -45,6 +45,12 @@ variable "edge_domain_name" {
   default     = "api.feed.aberration.technology"
 }
 
+variable "bootstrap_domain_name" {
+  description = "Public DNS hostname for the single native/browser p2p bootstrap peer."
+  type        = string
+  default     = "edge.feed.aberration.technology"
+}
+
 variable "browser_app_pages_domain_target" {
   description = "GitHub Pages origin host used by Caddy to fetch the browser shell."
   type        = string
