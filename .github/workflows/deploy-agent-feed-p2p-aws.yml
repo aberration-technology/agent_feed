@@ -438,7 +438,7 @@ jobs:
                   "sudo caddy validate --config /etc/caddy/Caddyfile",
                   "sudo systemctl daemon-reload",
                   "sudo systemctl restart agent-feed-edge",
-                  "sudo systemctl reload caddy || sudo systemctl restart caddy",
+                  "sudo systemctl restart caddy",
                   "sudo systemctl --no-pager --full status agent-feed-edge caddy"
                 ]
               }'
@@ -552,6 +552,63 @@ jobs:
             exit 1
           fi
           grep -q '<title>feed</title>' "$route_body"
+
+      - name: edge diagnostics on failure
+        if: ${{ failure() && env.APPLY_TERRAFORM == 'true' }}
+        working-directory: ${{ env.TF_ROOT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          instance_id="$(terraform output -raw edge_instance_id 2>/dev/null || true)"
+          if [ -z "$instance_id" ]; then
+            echo "edge instance id unavailable; skipping diagnostics"
+            exit 0
+          fi
+
+          parameters="$(
+            jq -n '{
+              commands: [
+                "set -eu",
+                "echo '\''--- caddy status ---'\''",
+                "sudo systemctl --no-pager --full status caddy || true",
+                "echo '\''--- agent-feed-edge status ---'\''",
+                "sudo systemctl --no-pager --full status agent-feed-edge || true",
+                "echo '\''--- caddyfile ---'\''",
+                "sudo sed -n '\''1,220p'\'' /etc/caddy/Caddyfile || true",
+                "echo '\''--- caddy certificates ---'\''",
+                "sudo find /var/lib/caddy/.local/share/caddy -maxdepth 6 -type f | sort || true",
+                "echo '\''--- loopback health ---'\''",
+                "curl -v --max-time 10 http://127.0.0.1:7778/healthz || true",
+                "echo '\''--- recent caddy logs ---'\''",
+                "sudo journalctl -u caddy --since '\''45 minutes ago'\'' --no-pager | tail -n 240 || true",
+                "echo '\''--- recent edge logs ---'\''",
+                "sudo journalctl -u agent-feed-edge --since '\''45 minutes ago'\'' --no-pager | tail -n 160 || true"
+              ]
+            }'
+          )"
+          command_id="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$instance_id" \
+              --document-name AWS-RunShellScript \
+              --parameters "$parameters" \
+              --query Command.CommandId \
+              --output text
+          )"
+          echo "edge diagnostics command: ${command_id}"
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --command-id "$command_id" || true
+          invocation="$(aws ssm get-command-invocation \
+            --region "$AWS_REGION" \
+            --instance-id "$instance_id" \
+            --command-id "$command_id" \
+            --output json || true)"
+          if [ -n "$invocation" ]; then
+            jq -r '.StandardOutputContent // ""' <<<"$invocation"
+            jq -r '.StandardErrorContent // ""' <<<"$invocation" >&2
+          fi
 
       - name: dispatch pages publish
         if: ${{ env.APPLY_TERRAFORM == 'true' && env.DEPLOY_PAGES_AFTER_APPLY == 'true' }}
