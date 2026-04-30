@@ -472,7 +472,14 @@ jobs:
               --instance-id "$instance_id" \
               --command-id "$command_id" \
               --output json 2>/dev/null || true)"
-            status="$(jq -r '.Status // "Pending"' <<<"${invocation:-{}}")"
+            if [ -z "$invocation" ]; then
+              status="Pending"
+            elif ! status="$(jq -er '.Status // "Pending"' <<<"$invocation")"; then
+              echo "edge host sync returned an invalid invocation payload; retrying" >&2
+              printf '%s\n' "$invocation" >&2
+              invocation=""
+              status="Pending"
+            fi
             case "$status" in
               Success|Failed|Cancelled|TimedOut|Cancelling)
                 break
@@ -485,8 +492,8 @@ jobs:
             echo "edge host sync invocation was unavailable" >&2
             exit 1
           fi
-          jq -r '.StandardOutputContent' <<<"$invocation"
-          jq -r '.StandardErrorContent' <<<"$invocation" >&2
+          jq -r '.StandardOutputContent // ""' <<<"$invocation"
+          jq -r '.StandardErrorContent // ""' <<<"$invocation" >&2
           if [ "$status" != "Success" ]; then
             echo "edge host sync failed with status ${status}" >&2
             exit 1
