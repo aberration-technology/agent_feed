@@ -2217,6 +2217,7 @@ fn run_serve_publisher(config: ServePublishConfig) {
     let mut next_seq = 1u64;
     let mut last_publish = Instant::now();
     let mut last_presence = Instant::now() - Duration::from_secs(60);
+    let mut last_success: Option<(usize, usize, EdgePublishAck)> = None;
 
     loop {
         match config.receiver.recv_timeout(Duration::from_millis(500)) {
@@ -2254,13 +2255,40 @@ fn run_serve_publisher(config: ServePublishConfig) {
                 Ok(ack) => {
                     last_presence = Instant::now();
                     info!(feed_name = %config.feed, "p2p feed presence registered");
+                    let retained_ack =
+                        last_success
+                            .as_ref()
+                            .map(|(_, _, last_ack)| EdgePublishAck {
+                                accepted: last_ack.accepted,
+                                feeds: ack.feeds,
+                                headlines: ack.headlines,
+                            });
+                    let retained = last_success
+                        .as_ref()
+                        .map(|(stories, capsules, _)| (*stories, *capsules));
+                    let (state, last_batch_stories, last_batch_capsules, edge_ack, detail) =
+                        if let (Some((stories, capsules)), Some(retained_ack)) =
+                            (retained, retained_ack.as_ref())
+                        {
+                            (
+                                "published",
+                                stories,
+                                capsules,
+                                retained_ack,
+                                "feed presence registered at edge; last publish retained",
+                            )
+                        } else {
+                            ("present", 0, 0, &ack, "feed presence registered at edge")
+                        };
                     post_serve_publish_status(
                         &config,
                         PublishStatusPost {
-                            state: "present",
+                            state,
                             pending_stories: pending.len(),
-                            edge_ack: Some(&ack),
-                            detail: Some("feed presence registered at edge"),
+                            last_batch_stories,
+                            last_batch_capsules,
+                            edge_ack: Some(edge_ack),
+                            detail: Some(detail),
                             ..PublishStatusPost::default()
                         },
                     );
@@ -2317,6 +2345,9 @@ fn run_serve_publisher(config: ServePublishConfig) {
                 config.processor_registry.refresh();
                 last_publish = Instant::now();
                 if result.capsules > 0 {
+                    if let Some(edge_ack) = result.edge_ack.clone() {
+                        last_success = Some((stories.len(), result.capsules, edge_ack));
+                    }
                     println!(
                         "p2p publish: sent {} capsule(s) from {} story update(s)",
                         result.capsules,
