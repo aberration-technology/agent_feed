@@ -48,7 +48,7 @@ const DEFAULT_URL: &str = "http://127.0.0.1:7777/reel";
 const LOOPBACK_ADDR: &str = "127.0.0.1:7777";
 const CAPTURE_STATUS_HEARTBEAT: Duration = Duration::from_secs(15);
 const STARTUP_STATE_SAMPLE_BYTES: usize = 1024 * 1024;
-const STARTUP_CONTEXT_TAIL_BYTES: usize = 512 * 1024;
+const STARTUP_CONTEXT_TAIL_BYTES: usize = 4 * 1024 * 1024;
 const STARTUP_RECAP_MAX_AGE: time::Duration = time::Duration::minutes(45);
 const STARTUP_CONTEXT_TAG: &str = "startup-context";
 
@@ -3451,6 +3451,8 @@ mod tests {
                 label: "private.jsonl".to_string(),
                 state: "watching".to_string(),
                 workspace: Some("all".to_string()),
+                session_id: Some("session".to_string()),
+                last_append_ms: Some(1_000),
                 offset: 42,
                 file_len: 42,
                 imported_events: 0,
@@ -4320,6 +4322,51 @@ mod tests {
     }
 
     #[test]
+    fn active_codex_sessions_prioritize_process_backed_session_ids() {
+        let root = temp_test_root("active-codex-process");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).expect("sessions dir");
+        let active_id = "019dbbb4-b30f-7991-b0f6-1cbbcfebe0c2";
+        let recent_id = "019dbd66-3c8a-7bb0-9abf-213204b8c6a8";
+        let active = sessions.join(format!("rollout-2026-04-23T13-57-55-{active_id}.jsonl"));
+        let recent = sessions.join(format!("rollout-2026-04-23T21-51-27-{recent_id}.jsonl"));
+        write_jsonl(
+            &active,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:49.696Z",
+                "payload": {"id": active_id, "cwd": root}
+            })],
+        );
+        write_jsonl(
+            &recent,
+            [json!({
+                "type": "session_meta",
+                "timestamp": "2026-04-24T03:16:50.696Z",
+                "payload": {"id": recent_id, "cwd": root}
+            })],
+        );
+
+        let paths = active_codex_session_paths_with_process_ids(
+            &root.join("missing-history.jsonl"),
+            &sessions,
+            1,
+            None,
+            None,
+            &[active_id.to_string()],
+        )
+        .expect("active sessions resolve");
+
+        assert_eq!(paths, vec![active]);
+        assert_eq!(
+            parse_codex_resume_session_id(&format!("/usr/local/bin/codex resume {active_id}")),
+            Some(active_id.to_string())
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp workspace");
+    }
+
+    #[test]
     fn active_codex_sessions_skip_agent_feed_internal_summarizer_sessions() {
         let root = temp_test_root("active-codex-internal");
         let sessions = root.join("sessions");
@@ -5075,12 +5122,20 @@ struct CaptureWatchPost<'a> {
 }
 
 fn post_capture_watch_status(update: CaptureWatchPost<'_>) {
+    let session_id = codex_session_id_from_path(update.path);
+    let last_append_ms = fs::metadata(update.path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
     let body = match serde_json::to_string(&json!({
         "agent": update.agent,
         "adapter": update.adapter,
         "label": capture_watch_label(update.path),
         "state": update.state,
         "workspace": capture_status_workspace(update.workspace),
+        "session_id": session_id,
+        "last_append_ms": last_append_ms,
         "offset": update.offset,
         "file_len": update.file_len,
         "imported_events": update.stats.imported,
@@ -5511,6 +5566,7 @@ fn watch_codex_active_sessions(config: CodexActiveWatch<'_>) -> Result<(), CliEr
                     pending: String::new(),
                     last_status_at: Instant::now(),
                     internal_processor: false,
+                    total_stats: stats,
                 });
             }
 
@@ -5587,6 +5643,7 @@ fn watch_codex_sessions(
             pending: String::new(),
             last_status_at: Instant::now(),
             internal_processor: false,
+            total_stats: stats,
         });
     }
 
@@ -5623,6 +5680,7 @@ fn poll_codex_watchers(
             watcher.offset = 0;
             watcher.pending.clear();
             watcher.internal_processor = false;
+            watcher.total_stats = ImportStats::default();
             post_capture_watch_status(CaptureWatchPost {
                 server,
                 agent: "codex",
@@ -5645,7 +5703,7 @@ fn poll_codex_watchers(
                     adapter: "codex.transcript",
                     path: &watcher.path,
                     state: "watching",
-                    stats: ImportStats::default(),
+                    stats: watcher.total_stats,
                     offset: watcher.offset,
                     file_len: len,
                     poll_ms,
@@ -5662,14 +5720,21 @@ fn poll_codex_watchers(
         watcher.offset = len;
         watcher.pending.push_str(&chunk);
         let complete = split_complete_jsonl(&mut watcher.pending);
-        if watcher.internal_processor
-            || is_agent_feed_internal_transcript_for_registry(
-                &complete,
-                Some(&watcher.state),
-                processor_registry,
-            )
-        {
-            watcher.internal_processor = true;
+        let processor_chunk = is_agent_feed_internal_transcript_for_registry(
+            &complete,
+            Some(&watcher.state),
+            processor_registry,
+        );
+        if watcher.internal_processor || processor_chunk {
+            if processor_chunk
+                && confirmed_agent_feed_internal_processor_chunk(
+                    &complete,
+                    &watcher.state,
+                    processor_registry,
+                )
+            {
+                watcher.internal_processor = true;
+            }
             let session_id =
                 codex_session_id_from_input(&complete).or_else(|| watcher.state.session_id.clone());
             if let Some(registry) = processor_registry {
@@ -5686,7 +5751,7 @@ fn poll_codex_watchers(
                 adapter: "codex.transcript",
                 path: &watcher.path,
                 state: "processor-skipped",
-                stats: ImportStats::default(),
+                stats: watcher.total_stats,
                 offset: watcher.offset,
                 file_len: len,
                 poll_ms,
@@ -5705,6 +5770,7 @@ fn poll_codex_watchers(
             processor_registry,
         );
         if stats.imported > 0 || stats.filtered > 0 {
+            watcher.total_stats.add(stats);
             info!(
                 path = %watcher.path.display(),
                 events = stats.imported,
@@ -5721,7 +5787,7 @@ fn poll_codex_watchers(
             adapter: "codex.transcript",
             path: &watcher.path,
             state: "appended",
-            stats,
+            stats: watcher.total_stats,
             offset: watcher.offset,
             file_len: len,
             poll_ms,
@@ -6321,6 +6387,7 @@ fn watch_claude_active_sessions(
                     state,
                     pending: String::new(),
                     last_status_at: Instant::now(),
+                    total_stats: stats,
                 });
             }
 
@@ -6382,6 +6449,7 @@ fn watch_claude_sessions(
             state,
             pending: String::new(),
             last_status_at: Instant::now(),
+            total_stats: stats,
         });
     }
 
@@ -6409,6 +6477,7 @@ fn poll_claude_watchers(
             );
             watcher.offset = 0;
             watcher.pending.clear();
+            watcher.total_stats = ImportStats::default();
             post_capture_watch_status(CaptureWatchPost {
                 server,
                 agent: "claude",
@@ -6431,7 +6500,7 @@ fn poll_claude_watchers(
                     adapter: "claude.stream-json",
                     path: &watcher.path,
                     state: "watching",
-                    stats: ImportStats::default(),
+                    stats: watcher.total_stats,
                     offset: watcher.offset,
                     file_len: len,
                     poll_ms,
@@ -6457,6 +6526,7 @@ fn poll_claude_watchers(
             event_sink,
         );
         if stats.imported > 0 || stats.filtered > 0 {
+            watcher.total_stats.add(stats);
             info!(
                 path = %watcher.path.display(),
                 events = stats.imported,
@@ -6473,7 +6543,7 @@ fn poll_claude_watchers(
             adapter: "claude.stream-json",
             path: &watcher.path,
             state: "appended",
-            stats,
+            stats: watcher.total_stats,
             offset: watcher.offset,
             file_len: len,
             poll_ms,
@@ -6760,6 +6830,7 @@ struct CodexWatcher {
     pending: String,
     last_status_at: Instant,
     internal_processor: bool,
+    total_stats: ImportStats,
 }
 
 #[derive(Debug)]
@@ -6769,6 +6840,7 @@ struct ClaudeWatcher {
     state: ClaudeState,
     pending: String,
     last_status_at: Instant,
+    total_stats: ImportStats,
 }
 
 fn active_codex_session_paths(
@@ -6778,11 +6850,35 @@ fn active_codex_session_paths(
     workspace: Option<&WorkspaceFilter>,
     processor_registry: Option<&ProcessorSessionRegistry>,
 ) -> Result<Vec<PathBuf>, CliError> {
+    active_codex_session_paths_with_process_ids(
+        history,
+        sessions_dir,
+        limit,
+        workspace,
+        processor_registry,
+        &codex_process_session_ids(),
+    )
+}
+
+fn active_codex_session_paths_with_process_ids(
+    history: &Path,
+    sessions_dir: &Path,
+    limit: usize,
+    workspace: Option<&WorkspaceFilter>,
+    processor_registry: Option<&ProcessorSessionRegistry>,
+    process_session_ids: &[String],
+) -> Result<Vec<PathBuf>, CliError> {
     if limit == 0 || !sessions_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut candidates = jsonl_files_by_mtime(sessions_dir)?;
+    let mut candidates = Vec::new();
+    for session_id in process_session_ids {
+        if let Some(path) = find_session_path(sessions_dir, session_id)? {
+            candidates.push(path);
+        }
+    }
+    candidates.extend(jsonl_files_by_mtime(sessions_dir)?);
     if history.exists() {
         let input = fs::read_to_string(history)?;
         let mut seen_history = HashSet::new();
@@ -6846,6 +6942,34 @@ fn active_codex_session_paths(
         }
     }
     Ok(paths)
+}
+
+fn codex_process_session_ids() -> Vec<String> {
+    let output = ProcessCommand::new("ps")
+        .args(["-eo", "args="])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_codex_resume_session_id)
+        .collect()
+}
+
+fn parse_codex_resume_session_id(line: &str) -> Option<String> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    for window in parts.windows(2) {
+        if window[0] == "resume" && is_uuid_like_session_id(window[1]) {
+            return Some(window[1].to_string());
+        }
+    }
+    None
 }
 
 fn codex_session_id_from_path_or_sample(path: &Path) -> Result<Option<String>, CliError> {
@@ -7083,6 +7207,33 @@ fn is_agent_feed_internal_transcript_for_registry(
         .cwd
         .as_deref()
         .is_some_and(|cwd| registry.owns_cwd(cwd))
+}
+
+fn confirmed_agent_feed_internal_processor_chunk(
+    input: &str,
+    state: &TranscriptState,
+    processor_registry: Option<&ProcessorSessionRegistry>,
+) -> bool {
+    let signals = internal_transcript_signals(input, Some(state));
+    if signals
+        .cwd
+        .as_deref()
+        .is_some_and(is_default_processor_work_dir)
+    {
+        return true;
+    }
+    if let Some(registry) = processor_registry {
+        if let Some(session_id) = signals.session_id.as_deref()
+            && registry.is_known_session_id(session_id)
+        {
+            return true;
+        }
+        return signals
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| registry.owns_cwd(cwd));
+    }
+    signals.session_id.is_some() && signals.saw_internal_prompt && !signals.saw_external_activity
 }
 
 fn is_default_processor_work_dir(cwd: &str) -> bool {
@@ -7952,12 +8103,19 @@ fn format_local_status(status: &StatusView) -> String {
     if !status.capture_watchers.is_empty() {
         output.push_str("\nwatchers:\n");
         for watcher in status.capture_watchers.iter().take(8) {
+            let append = watcher
+                .last_append_ms
+                .map(format_duration_ms)
+                .unwrap_or_else(|| "unknown".to_string());
+            let session = watcher.session_id.as_deref().unwrap_or("session");
             let _ = writeln!(
                 output,
-                "  {} {} {} · offset {} · {} imported · {} filtered",
+                "  {} {} {} · {} · last append {} · offset {} · {} imported · {} filtered",
                 watcher.agent,
                 watcher.adapter,
                 watcher.state,
+                session,
+                append,
                 watcher.offset,
                 watcher.imported_events,
                 watcher.filtered_events
@@ -8039,6 +8197,16 @@ fn story_status_is_active(story: &agent_feed_views::StoryStatusView) -> bool {
 
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{}m", ms / 60_000)
+    }
 }
 
 fn get_json<T>(server: &str, path: &str) -> Result<T, CliError>

@@ -566,7 +566,7 @@ impl StoryCompiler {
 
     fn compile_active_update(&self, window: &StoryWindow) -> Option<CompiledStory> {
         let summary = window.signals.latest_summary.as_deref()?;
-        if !active_update_summary(summary) {
+        if !active_update_summary(summary) && !active_progress_summary(summary) {
             return None;
         }
         let score = story_score(window).max(72);
@@ -2042,6 +2042,51 @@ fn active_update_summary(input: &str) -> bool {
         && active_summary_has_release_outcome(input)
 }
 
+fn active_progress_summary(input: &str) -> bool {
+    if summary_is_redundant(input) {
+        return false;
+    }
+    let normalized = normalized_story_text(input);
+    if normalized.len() < 80
+        || normalized.starts_with("i am ")
+        || normalized.starts_with("i m ")
+        || normalized.starts_with("i ll ")
+        || normalized.starts_with("i will ")
+        || summary_is_operator_chatter(&normalized)
+    {
+        return false;
+    }
+    if !(summary_has_work_context(input) || summary_mentions_public_project(&normalized)) {
+        return false;
+    }
+    [
+        "adds",
+        "aligns",
+        "builds",
+        "connects",
+        "covers",
+        "enables",
+        "exposes",
+        "extends",
+        "hardens",
+        "improves",
+        "integrates",
+        "moves",
+        "opens",
+        "prepares",
+        "protects",
+        "reduces",
+        "removes",
+        "resolves",
+        "supports",
+        "tracks",
+        "validates",
+        "verifies",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn summary_is_operator_chatter(normalized: &str) -> bool {
     [
         "i am checking",
@@ -2262,6 +2307,29 @@ mod tests {
                 .contains("burn_p2p browser training receipts")
         );
         assert!(stories[0].score >= DEFAULT_MIN_SCORE);
+    }
+
+    #[test]
+    fn active_progress_message_can_publish_without_turn_completion() {
+        let mut compiler = StoryCompiler::default();
+        let mut message = event(EventKind::AgentMessage, "codex posted an update");
+        message.project = Some("burn_p2p".to_string());
+        message.summary = Some(
+            "Burn_p2p optimizer coverage extends the DiLoCo training path for multi-peer validation across native and browser workers."
+                .to_string(),
+        );
+
+        assert!(compiler.ingest(message).is_empty());
+        let stories = compiler.flush();
+
+        assert_eq!(stories.len(), 1);
+        assert_eq!(stories[0].project.as_deref(), Some("burn_p2p"));
+        assert!(
+            stories[0]
+                .headline
+                .to_ascii_lowercase()
+                .contains("burn_p2p")
+        );
     }
 
     #[test]

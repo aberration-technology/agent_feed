@@ -133,6 +133,10 @@ pub struct CaptureWatchUpdate {
     pub label: String,
     pub state: String,
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub last_append_ms: Option<u64>,
     pub offset: u64,
     pub file_len: u64,
     pub imported_events: usize,
@@ -147,6 +151,10 @@ pub struct CaptureWatchView {
     pub label: String,
     pub state: String,
     pub workspace: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub last_append_ms: Option<u64>,
     pub offset: u64,
     pub file_len: u64,
     pub imported_events: usize,

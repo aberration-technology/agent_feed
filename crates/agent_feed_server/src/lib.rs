@@ -541,6 +541,11 @@ async fn capture_status(
             .workspace
             .as_deref()
             .map(|workspace| safe_status_token(workspace, "workspace")),
+        session_id: update
+            .session_id
+            .as_deref()
+            .map(|session_id| safe_status_token(session_id, "session")),
+        last_append_ms: update.last_append_ms,
         offset: update.offset,
         file_len: update.file_len,
         imported_events: update.imported_events,
@@ -1089,6 +1094,8 @@ mod tests {
                 label: "/home/mosure/.codex/sessions/private.jsonl".to_string(),
                 state: "watching".to_string(),
                 workspace: Some("/home/mosure/repos/agent_feed".to_string()),
+                session_id: Some("019dbbb4-b30f-7991-b0f6-1cbbcfebe0c2".to_string()),
+                last_append_ms: Some(250),
                 offset: 123,
                 file_len: 456,
                 imported_events: 0,
