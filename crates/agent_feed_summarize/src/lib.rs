@@ -2161,8 +2161,10 @@ fn polish_public_summary(summary: &mut FeedSummary) {
         summary.headline = headline;
         summary.deck = deck;
     }
-    summary.headline = remove_agent_headline_prefix(&polish_public_copy(&summary.headline));
-    summary.deck = ensure_terminal_sentence(&polish_public_copy(&summary.deck));
+    let headline = remove_agent_headline_prefix(&polish_public_copy(&summary.headline));
+    let deck = ensure_terminal_sentence(&polish_public_copy(&summary.deck));
+    summary.headline = repair_incomplete_public_headline(&headline, &deck);
+    summary.deck = deck;
     summary.lower_third = remove_project_placeholder_inline(&remove_project_placeholder_segments(
         &polish_public_copy(&summary.lower_third),
     ));
@@ -2180,6 +2182,70 @@ fn polish_public_summary(summary: &mut FeedSummary) {
     if summary.chips.is_empty() {
         summary.chips.push("redacted".to_string());
     }
+}
+
+fn repair_incomplete_public_headline(headline: &str, deck: &str) -> String {
+    let headline = headline.trim();
+    if !headline_has_incomplete_tail(headline) && !headline_starts_with_first_person(headline) {
+        return headline.to_string();
+    }
+    let candidate = first_public_sentence(deck);
+    if candidate.is_empty()
+        || headline_has_incomplete_tail(&candidate)
+        || headline_starts_with_first_person(&candidate)
+    {
+        return headline.to_string();
+    }
+    clamp_chars(candidate.trim_end_matches(['.', '!', '?']), 96)
+}
+
+fn first_public_sentence(input: &str) -> String {
+    input
+        .split_terminator(['.', '!', '?'])
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn headline_has_incomplete_tail(input: &str) -> bool {
+    let Some(last) = normalize_text(input)
+        .split_whitespace()
+        .last()
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    matches!(
+        last.as_str(),
+        "a" | "an"
+            | "and"
+            | "because"
+            | "but"
+            | "first"
+            | "for"
+            | "from"
+            | "that"
+            | "the"
+            | "then"
+            | "to"
+            | "until"
+            | "while"
+            | "with"
+    )
+}
+
+fn headline_starts_with_first_person(input: &str) -> bool {
+    let normalized = normalize_text(input);
+    normalized.starts_with("i ")
+        || normalized.starts_with("im ")
+        || normalized.starts_with("i m ")
+        || normalized.starts_with("ive ")
+        || normalized.starts_with("i ve ")
+        || normalized.starts_with("my ")
+        || normalized.starts_with("we ")
+        || normalized.starts_with("weve ")
+        || normalized.starts_with("we ve ")
 }
 
 fn impact_rewrite(headline: &str, deck: &str) -> Option<(String, String)> {
@@ -2263,6 +2329,13 @@ fn polish_public_copy(input: &str) -> String {
 }
 
 const PUBLIC_COPY_REPLACEMENTS: &[(&str, &str)] = &[
+    (r"(?i)^i\s+have enough shape now\.\s*", ""),
+    (r"(?i)^have enough shape now\.\s*", ""),
+    (r"(?i)^i(?:['’]m|\s+am)\s+adding\s+(?:an?\s+|the\s+)?", ""),
+    (
+        r"(?i)^we(?:['’]re|\s+are)\s+adding\s+(?:an?\s+|the\s+)?",
+        "",
+    ),
     (r"(?i)\bproduction scaffold\b", "feed implementation"),
     (r"(?i)\bproduction flow\b", "feed publishing"),
     (r"(?i)\bagent feed scaffold\b", "agent feed implementation"),
@@ -3396,6 +3469,40 @@ mod tests {
             summarize_feed("local:workstation", &[incident], &config).expect("summary compiles");
 
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn first_person_progress_fragments_rewrite_to_complete_public_headline() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut story = public_project_story("gemma4_trellis2", 84);
+        story.family = StoryFamily::Turn;
+        story.key.family = StoryFamily::Turn;
+        story.headline =
+            "have enough shape now. I’m adding a `precompute-supervision` path that".to_string();
+        story.deck = "I have enough shape now. I’m adding a `precompute-supervision` path that builds fixed-size training targets from real exported files.".to_string();
+        story.chips = vec![
+            "gemma4_trellis2".to_string(),
+            "codex".to_string(),
+            "turn".to_string(),
+            "2 files".to_string(),
+            "score 84".to_string(),
+        ];
+
+        let summaries = summarize_feed("github:35904762:workstation", &[story], &config)
+            .expect("summary compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].headline.contains("precompute-supervision"));
+        assert!(!summaries[0].headline.to_ascii_lowercase().starts_with("i "));
+        assert!(
+            !summaries[0]
+                .headline
+                .to_ascii_lowercase()
+                .ends_with(" that")
+        );
+        assert!(!summaries[0].deck.contains("I’m adding"));
+        assert!(!summaries[0].deck.contains("have enough shape"));
     }
 
     #[test]
