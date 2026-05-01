@@ -1,7 +1,7 @@
 use agent_feed_directory::{
-    DirectoryError, DirectoryStore, GithubDiscoveryTicket, GithubProfileView, OrgDiscoveryTicket,
-    OrgRouteFilter, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute, ResolveFeedView,
-    SignedBrowserSeed, ensure_current_compatibility, ensure_network_id,
+    DirectoryError, DirectoryStore, FeedAccessPolicy, GithubDiscoveryTicket, GithubProfileView,
+    OrgDiscoveryTicket, OrgRouteFilter, RemoteHeadlineView, RemoteReelFilter, RemoteUserRoute,
+    ResolveFeedView, SignedBrowserSeed, ensure_current_compatibility, ensure_network_id,
 };
 use agent_feed_identity::{GithubLogin, GithubOrgName, GithubTeamSlug};
 use agent_feed_identity_github::{
@@ -22,7 +22,7 @@ use hmac::{Hmac, Mac};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -388,6 +388,7 @@ pub struct ResolveOrgResponse {
     pub org: String,
     pub team: Option<String>,
     pub feeds: Vec<ResolveFeedView>,
+    pub headlines: Vec<RemoteHeadlineView>,
     pub browser_seed_url: String,
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
@@ -403,17 +404,29 @@ impl From<&OrgDiscoveryTicket> for ResolveOrgResponse {
 impl ResolveOrgResponse {
     #[must_use]
     pub fn from_ticket(ticket: &OrgDiscoveryTicket, config: &EdgeConfig) -> Self {
+        Self::from_ticket_and_headlines(ticket, config, Vec::new())
+    }
+
+    #[must_use]
+    pub fn from_ticket_and_headlines(
+        ticket: &OrgDiscoveryTicket,
+        config: &EdgeConfig,
+        headlines: Vec<RemoteHeadlineView>,
+    ) -> Self {
+        let mut feeds: Vec<_> = ticket
+            .candidate_feeds
+            .iter()
+            .map(|feed| resolve_feed_view(feed, config))
+            .collect();
+        merge_resolve_feed_views(&mut feeds, feed_views_from_headlines(headlines.clone()));
         Self {
             state: "resolved".to_string(),
             network_id: ticket.network_id.clone(),
             compatibility: ticket.compatibility.clone(),
             org: ticket.org.to_string(),
             team: ticket.team.as_ref().map(ToString::to_string),
-            feeds: ticket
-                .candidate_feeds
-                .iter()
-                .map(|feed| resolve_feed_view(feed, config))
-                .collect(),
+            feeds,
+            headlines,
             browser_seed_url: "/browser-seed".to_string(),
             expires_at: ticket.expires_at,
             signature: ticket.signature.digest.clone(),
@@ -723,6 +736,52 @@ impl SnapshotStore {
         feeds
     }
 
+    fn headlines_for_org(
+        &self,
+        org: &GithubOrgName,
+        team: Option<&GithubTeamSlug>,
+        filter: &OrgRouteFilter,
+    ) -> Vec<RemoteHeadlineView> {
+        let now = OffsetDateTime::now_utc();
+        self.headlines
+            .lock()
+            .map(|headlines| {
+                headlines
+                    .iter()
+                    .filter(|headline| headline_is_within_retention(headline, now))
+                    .filter(|headline| headline_matches_org_route(headline, org, team, filter))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn feeds_for_org(
+        &self,
+        org: &GithubOrgName,
+        team: Option<&GithubTeamSlug>,
+        filter: &OrgRouteFilter,
+    ) -> Vec<ResolveFeedView> {
+        let now = OffsetDateTime::now_utc();
+        let mut feeds = self
+            .feeds
+            .lock()
+            .map(|feeds| {
+                feeds
+                    .iter()
+                    .filter(|feed| feed_is_within_retention(feed, now))
+                    .filter(|feed| feed_matches_org_route(feed, org, team, filter))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        merge_resolve_feed_views(
+            &mut feeds,
+            feed_views_from_headlines(self.headlines_for_org(org, team, filter)),
+        );
+        feeds
+    }
+
     fn persist_snapshot(&self, feeds: Vec<ResolveFeedView>, headlines: Vec<RemoteHeadlineView>) {
         let Some(path) = &self.path else {
             return;
@@ -998,6 +1057,10 @@ async fn auth_github(
         state: query.get("state").cloned().unwrap_or_default(),
         redirect_uri,
         return_to,
+        github_org: query
+            .get("org")
+            .cloned()
+            .filter(|value| !value.trim().is_empty()),
     };
     let Ok(encoded_state) = encode_oauth_state(&payload) else {
         return edge_error(
@@ -1006,10 +1069,12 @@ async fn auth_github(
         );
     };
     let callback_url = state.config.github_callback_url();
-    let scope = query
-        .get("scope")
-        .cloned()
-        .unwrap_or_else(|| default_github_scope(&state.config.org_policy));
+    let default_scope = if payload.github_org.is_some() {
+        "read:user read:org".to_string()
+    } else {
+        default_github_scope(&state.config.org_policy)
+    };
+    let scope = query.get("scope").cloned().unwrap_or(default_scope);
     let authorize_url = format!(
         "https://github.com/login/oauth/authorize?{}",
         encode_query(&[
@@ -1064,16 +1129,56 @@ async fn callback_github(
         Ok(token) => token,
         Err(message) => return edge_error(StatusCode::BAD_GATEWAY, message),
     };
-    let profile = match fetch_github_profile(&token) {
+    let profile = match fetch_github_profile(&token.access_token) {
         Ok(profile) => profile,
         Err(message) => return edge_error(StatusCode::BAD_GATEWAY, message),
     };
-    if let Err(message) = authorize_github_token_policy(&token, &profile, &state.config.org_policy)
+    if let Err(message) =
+        authorize_github_token_policy(&token.access_token, &profile, &state.config.org_policy)
     {
         return edge_error(StatusCode::FORBIDDEN, message);
     }
+    let mut authorized_orgs = Vec::new();
+    let mut authorized_teams = Vec::new();
+    if let Some(org) = payload.github_org.as_deref() {
+        let org = match GithubOrgName::parse(org) {
+            Ok(org) => org,
+            Err(err) => return edge_error(StatusCode::BAD_REQUEST, err.to_string()),
+        };
+        if !token.scopes.iter().any(|scope| scope == "read:org") {
+            return edge_error(
+                StatusCode::FORBIDDEN,
+                "github org feeds require read:org scope",
+            );
+        }
+        if let Err(message) =
+            fetch_github_org_membership(&token.access_token, &org, profile.login.as_str())
+        {
+            return edge_error(StatusCode::FORBIDDEN, message);
+        }
+        match fetch_github_user_teams(&token.access_token) {
+            Ok(teams) => {
+                authorized_teams.extend(
+                    teams
+                        .into_iter()
+                        .filter(|team| team.org == org)
+                        .map(|team| format!("{}/{}", team.org.as_str(), team.slug.as_str())),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(org = %org, error = %err, "github team claim fetch failed after org membership check");
+            }
+        }
+        authorized_orgs.push(org.as_str().to_ascii_lowercase());
+    }
     let expires_at = OffsetDateTime::now_utc() + Duration::days(7);
-    let session = match issue_session_token(profile.id.get(), expires_at) {
+    let session = match issue_session_token_for_auth(
+        profile.id.get(),
+        expires_at,
+        token.scopes.clone(),
+        authorized_orgs.clone(),
+        authorized_teams.clone(),
+    ) {
         Some(session) => session,
         None => {
             return edge_error(
@@ -1096,6 +1201,8 @@ async fn callback_github(
     let expires_at = expires_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
+    let scopes = token.scopes.join(" ");
+    let github_orgs = authorized_orgs.join(",");
     let callback_query = encode_query(&[
         ("state", payload.state.as_str()),
         ("github_user_id", github_user_id.as_str()),
@@ -1103,6 +1210,8 @@ async fn callback_github(
         ("name", profile.name.as_deref().unwrap_or("")),
         ("avatar_url", avatar_url.as_str()),
         ("session", session.as_str()),
+        ("scopes", scopes.as_str()),
+        ("github_orgs", github_orgs.as_str()),
         ("expires_at", expires_at.as_str()),
         ("return_to", payload.return_to.as_str()),
     ]);
@@ -1191,22 +1300,25 @@ async fn resolve_github(
 
 async fn resolve_github_org(
     State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
     Path(org): Path<String>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> impl IntoResponse {
-    resolve_org_like(state, org, None, query)
+    resolve_org_like(state, headers, org, None, query)
 }
 
 async fn resolve_github_team(
     State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
     Path((org, team)): Path<(String, String)>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> impl IntoResponse {
-    resolve_org_like(state, org, Some(team), query)
+    resolve_org_like(state, headers, org, Some(team), query)
 }
 
 fn resolve_org_like(
     state: Arc<HttpState>,
+    headers: HeaderMap,
     org: String,
     team: Option<String>,
     query: BTreeMap<String, String>,
@@ -1222,6 +1334,32 @@ fn resolve_org_like(
         },
         None => None,
     };
+    let Some(bearer) = verify_bearer_session(&headers) else {
+        return edge_error(
+            StatusCode::UNAUTHORIZED,
+            "github session required for private org feeds",
+        );
+    };
+    if !bearer.session.has_scope("read:org") {
+        return edge_error(
+            StatusCode::FORBIDDEN,
+            "github org feeds require read:org scope; sign in again for this org",
+        );
+    }
+    if !bearer.session.permits_org(&org) {
+        return edge_error(
+            StatusCode::FORBIDDEN,
+            format!("github org membership required: {org}"),
+        );
+    }
+    if let Some(team) = team.as_ref()
+        && !bearer.session.permits_team(&org, team)
+    {
+        return edge_error(
+            StatusCode::FORBIDDEN,
+            format!("github team membership required: {org}/{team}"),
+        );
+    }
     let query = query
         .iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -1237,7 +1375,20 @@ fn resolve_org_like(
         DirectoryStore::new(),
     );
     match resolver.resolve_github_org(&org, team.as_ref(), &filter) {
-        Ok(ticket) => Json(ResolveOrgResponse::from_ticket(&ticket, &state.config)).into_response(),
+        Ok(ticket) => {
+            let mut response = ResolveOrgResponse::from_ticket_and_headlines(
+                &ticket,
+                &state.config,
+                state
+                    .snapshot
+                    .headlines_for_org(&org, team.as_ref(), &filter),
+            );
+            merge_resolve_feed_views(
+                &mut response.feeds,
+                state.snapshot.feeds_for_org(&org, team.as_ref(), &filter),
+            );
+            Json(response).into_response()
+        }
         Err(err) => edge_error(StatusCode::BAD_GATEWAY, err.to_string()),
     }
 }
@@ -1309,6 +1460,12 @@ struct NetworkPublishRequest {
     #[serde(default)]
     publisher: Option<PublisherIdentity>,
     #[serde(default)]
+    visibility: Option<FeedVisibility>,
+    #[serde(default)]
+    github_org: Option<String>,
+    #[serde(default)]
+    github_team: Option<String>,
+    #[serde(default)]
     capsules: Vec<Signed<StoryCapsule>>,
 }
 
@@ -1369,6 +1526,10 @@ async fn network_publish_verified(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("local:{feed_name}"));
+    let (visibility, access) = match publish_access_policy(&request, &session) {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
     if let Some(publisher) = request.publisher.as_ref() {
         if publisher.github_user_id != Some(session.github_user_id) || !publisher.verified {
             return edge_error(StatusCode::FORBIDDEN, "publisher identity mismatch");
@@ -1377,6 +1538,8 @@ async fn network_publish_verified(
             &feed_id,
             feed_name,
             compatibility,
+            visibility,
+            access.clone(),
             publisher,
         ));
     }
@@ -1424,6 +1587,8 @@ async fn network_publish_verified(
             feed_id: capsule.value.feed_id.clone(),
             feed_label: feed_name.to_string(),
             compatibility: capsule.value.compatibility.clone(),
+            visibility: visibility.as_str().to_string(),
+            access: access.clone(),
             created_at: Some(capsule.value.created_at),
             publisher_github_user_id: publisher.github_user_id,
             publisher_login,
@@ -1457,17 +1622,111 @@ async fn network_publish_verified(
     .into_response()
 }
 
+fn publish_access_policy(
+    request: &NetworkPublishRequest,
+    session: &VerifiedSession,
+) -> Result<(FeedVisibility, FeedAccessPolicy), axum::response::Response> {
+    let visibility = request.visibility.unwrap_or(FeedVisibility::Public);
+    match visibility {
+        FeedVisibility::Public => Ok((visibility, FeedAccessPolicy::public())),
+        FeedVisibility::GithubOrg => {
+            if !session.has_scope("read:org") {
+                return Err(edge_error(
+                    StatusCode::FORBIDDEN,
+                    "github org publishing requires read:org scope; run `agent-feed auth github --github-org <org>`",
+                ));
+            }
+            let Some(org) = request
+                .github_org
+                .as_deref()
+                .map(str::trim)
+                .filter(|org| !org.is_empty())
+            else {
+                return Err(edge_error(
+                    StatusCode::BAD_REQUEST,
+                    "github_org is required for github_org visibility",
+                ));
+            };
+            let org = match GithubOrgName::parse(org) {
+                Ok(org) => org,
+                Err(err) => return Err(edge_error(StatusCode::BAD_REQUEST, err.to_string())),
+            };
+            if !session.permits_org(&org) {
+                return Err(edge_error(
+                    StatusCode::FORBIDDEN,
+                    format!("github org membership required: {org}; sign in again for this org"),
+                ));
+            }
+            Ok((visibility, FeedAccessPolicy::github_org(org)))
+        }
+        FeedVisibility::GithubTeam => {
+            if !session.has_scope("read:org") {
+                return Err(edge_error(
+                    StatusCode::FORBIDDEN,
+                    "github team publishing requires read:org scope; run `agent-feed auth github --github-org <org>`",
+                ));
+            }
+            let Some(org) = request
+                .github_org
+                .as_deref()
+                .map(str::trim)
+                .filter(|org| !org.is_empty())
+            else {
+                return Err(edge_error(
+                    StatusCode::BAD_REQUEST,
+                    "github_org is required for github_team visibility",
+                ));
+            };
+            let Some(team) = request
+                .github_team
+                .as_deref()
+                .map(str::trim)
+                .filter(|team| !team.is_empty())
+            else {
+                return Err(edge_error(
+                    StatusCode::BAD_REQUEST,
+                    "github_team is required for github_team visibility",
+                ));
+            };
+            let org = match GithubOrgName::parse(org) {
+                Ok(org) => org,
+                Err(err) => return Err(edge_error(StatusCode::BAD_REQUEST, err.to_string())),
+            };
+            let team = match GithubTeamSlug::parse(team) {
+                Ok(team) => team,
+                Err(err) => return Err(edge_error(StatusCode::BAD_REQUEST, err.to_string())),
+            };
+            if !session.permits_team(&org, &team) {
+                return Err(edge_error(
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "github team membership required: {org}/{team}; sign in again for this org"
+                    ),
+                ));
+            }
+            Ok((visibility, FeedAccessPolicy::github_team(org, team)))
+        }
+        _ => Err(edge_error(
+            StatusCode::BAD_REQUEST,
+            "edge publish supports public, github_org, and github_team visibility",
+        )),
+    }
+}
+
 fn feed_view_from_publish(
     feed_id: &str,
     feed_name: &str,
     compatibility: &ProtocolCompatibility,
+    visibility: FeedVisibility,
+    access: FeedAccessPolicy,
     publisher: &PublisherIdentity,
 ) -> ResolveFeedView {
     ResolveFeedView::from_publisher(
         feed_id,
         feed_name,
         compatibility.clone(),
-        FeedVisibility::Public,
+        visibility,
+        access,
         publisher,
         OffsetDateTime::now_utc(),
     )
@@ -1502,15 +1761,56 @@ fn feed_matches_github_route(
 }
 
 fn public_feed_is_visible(feed: &ResolveFeedView) -> bool {
-    !feed.feed_id.starts_with("local:")
+    feed.visibility == FeedVisibility::Public.as_str() && !feed.feed_id.starts_with("local:")
 }
 
 fn public_headline_is_visible(headline: &RemoteHeadlineView) -> bool {
-    !headline.feed_id.starts_with("local:")
+    headline.visibility == FeedVisibility::Public.as_str()
+        && !headline.feed_id.starts_with("local:")
         && !remote_copy_has_public_quality_issue(&format!(
             "{} {}",
             headline.headline, headline.deck
         ))
+}
+
+fn feed_matches_org_route(
+    feed: &ResolveFeedView,
+    org: &GithubOrgName,
+    team: Option<&GithubTeamSlug>,
+    filter: &OrgRouteFilter,
+) -> bool {
+    !feed.feed_id.starts_with("local:")
+        && access_permits_org_route(&feed.access, feed.visibility.as_str(), org, team)
+        && filter.stream_filter.permits_label(&feed.label)
+}
+
+fn headline_matches_org_route(
+    headline: &RemoteHeadlineView,
+    org: &GithubOrgName,
+    team: Option<&GithubTeamSlug>,
+    filter: &OrgRouteFilter,
+) -> bool {
+    !headline.feed_id.starts_with("local:")
+        && access_permits_org_route(&headline.access, headline.visibility.as_str(), org, team)
+        && filter.stream_filter.permits_label(&headline.feed_label)
+        && headline_matches_reel_filter(headline, &filter.reel_filter)
+        && !remote_copy_has_public_quality_issue(&format!(
+            "{} {}",
+            headline.headline, headline.deck
+        ))
+}
+
+fn access_permits_org_route(
+    access: &FeedAccessPolicy,
+    visibility: &str,
+    org: &GithubOrgName,
+    team: Option<&GithubTeamSlug>,
+) -> bool {
+    match (visibility, team) {
+        ("github_org", _) => access.permits_org(org),
+        ("github_team", Some(team)) => access.permits_team(org, team),
+        _ => false,
+    }
 }
 
 fn headline_matches_reel_filter(headline: &RemoteHeadlineView, filter: &RemoteReelFilter) -> bool {
@@ -1787,9 +2087,12 @@ fn edge_error(status: StatusCode, message: impl Into<String>) -> axum::response:
         .into_response()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct VerifiedSession {
     github_user_id: u64,
+    scopes: BTreeSet<String>,
+    github_orgs: BTreeSet<String>,
+    github_teams: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1798,14 +2101,62 @@ struct VerifiedBearer {
     token: String,
 }
 
-fn issue_session_token(github_user_id: u64, expires_at: OffsetDateTime) -> Option<String> {
-    let expires = expires_at.unix_timestamp();
+impl VerifiedSession {
+    fn permits_org(&self, org: &GithubOrgName) -> bool {
+        self.github_orgs
+            .contains(&org.as_str().to_ascii_lowercase())
+    }
+
+    fn permits_team(&self, org: &GithubOrgName, team: &GithubTeamSlug) -> bool {
+        self.github_teams.contains(&format!(
+            "{}/{}",
+            org.as_str().to_ascii_lowercase(),
+            team.as_str().to_ascii_lowercase()
+        ))
+    }
+
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.contains(scope)
+    }
+}
+
+fn issue_session_token_for_auth(
+    github_user_id: u64,
+    expires_at: OffsetDateTime,
+    scopes: Vec<String>,
+    github_orgs: Vec<String>,
+    github_teams: Vec<String>,
+) -> Option<String> {
     let secret = session_secret()?;
-    Some(issue_session_token_with_secret(
+    let mut scopes = scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_string())
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    let mut github_orgs = github_orgs
+        .into_iter()
+        .map(|org| org.trim().to_ascii_lowercase())
+        .filter(|org| !org.is_empty())
+        .collect::<Vec<_>>();
+    github_orgs.sort();
+    github_orgs.dedup();
+    let mut github_teams = github_teams
+        .into_iter()
+        .map(|team| team.trim().to_ascii_lowercase())
+        .filter(|team| !team.is_empty())
+        .collect::<Vec<_>>();
+    github_teams.sort();
+    github_teams.dedup();
+    let claims = SessionTokenClaims {
         github_user_id,
-        expires,
-        &secret,
-    ))
+        expires: expires_at.unix_timestamp(),
+        scopes,
+        github_orgs,
+        github_teams,
+    };
+    issue_session_token_with_claims(&claims, &secret)
 }
 
 fn verify_bearer_session(headers: &HeaderMap) -> Option<VerifiedBearer> {
@@ -1823,6 +2174,7 @@ fn verify_session_token(token: &str) -> Option<VerifiedSession> {
     verify_session_token_with_secret(token, &secret, OffsetDateTime::now_utc().unix_timestamp())
 }
 
+#[cfg(test)]
 fn issue_session_token_with_secret(github_user_id: u64, expires: i64, secret: &str) -> String {
     let sig = session_signature(github_user_id, expires, secret);
     format!("feed.{github_user_id}.{expires}.{sig}")
@@ -1835,7 +2187,7 @@ fn verify_session_token_with_secret(
 ) -> Option<VerifiedSession> {
     let mut parts = token.split('.');
     if parts.next()? != "feed" {
-        return None;
+        return verify_session_token_v2_with_secret(token, secret, now_unix);
     }
     let github_user_id = parts.next()?.parse::<u64>().ok()?;
     let expires = parts.next()?.parse::<i64>().ok()?;
@@ -1844,8 +2196,62 @@ fn verify_session_token_with_secret(
         return None;
     }
     let expected = session_signature(github_user_id, expires, secret);
-    constant_time_eq(signature.as_bytes(), expected.as_bytes())
-        .then_some(VerifiedSession { github_user_id })
+    constant_time_eq(signature.as_bytes(), expected.as_bytes()).then_some(VerifiedSession {
+        github_user_id,
+        scopes: BTreeSet::new(),
+        github_orgs: BTreeSet::new(),
+        github_teams: BTreeSet::new(),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionTokenClaims {
+    github_user_id: u64,
+    expires: i64,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    github_orgs: Vec<String>,
+    #[serde(default)]
+    github_teams: Vec<String>,
+}
+
+fn issue_session_token_with_claims(claims: &SessionTokenClaims, secret: &str) -> Option<String> {
+    let payload = serde_json::to_vec(claims).ok()?;
+    let payload = hex_encode(&payload);
+    let sig = session_payload_signature(&payload, secret);
+    Some(format!("feedv2.{payload}.{sig}"))
+}
+
+fn verify_session_token_v2_with_secret(
+    token: &str,
+    secret: &str,
+    now_unix: i64,
+) -> Option<VerifiedSession> {
+    let mut parts = token.split('.');
+    if parts.next()? != "feedv2" {
+        return None;
+    }
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let expected = session_payload_signature(payload, secret);
+    if !constant_time_eq(signature.as_bytes(), expected.as_bytes()) {
+        return None;
+    }
+    let bytes = hex_decode(payload).ok()?;
+    let claims: SessionTokenClaims = serde_json::from_slice(&bytes).ok()?;
+    if claims.expires <= now_unix {
+        return None;
+    }
+    Some(VerifiedSession {
+        github_user_id: claims.github_user_id,
+        scopes: claims.scopes.into_iter().collect(),
+        github_orgs: claims.github_orgs.into_iter().collect(),
+        github_teams: claims.github_teams.into_iter().collect(),
+    })
 }
 
 fn session_secret() -> Option<String> {
@@ -1862,6 +2268,14 @@ fn session_signature(github_user_id: u64, expires: i64, secret: &str) -> String 
     mac.update(github_user_id.to_string().as_bytes());
     mac.update(b":");
     mac.update(expires.to_string().as_bytes());
+    hex_lower(&mac.finalize().into_bytes())
+}
+
+fn session_payload_signature(payload: &str, secret: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts arbitrary key lengths");
+    mac.update(b"agent-feed-session-v2");
+    mac.update(payload.as_bytes());
     hex_lower(&mac.finalize().into_bytes())
 }
 
@@ -1891,13 +2305,23 @@ struct GithubOauthState {
     state: String,
     redirect_uri: Option<String>,
     return_to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    github_org: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GithubTokenResponse {
     access_token: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GithubAccessToken {
+    access_token: String,
+    scopes: Vec<String>,
 }
 
 fn github_client_id() -> Option<String> {
@@ -2075,7 +2499,7 @@ fn exchange_github_code(
     client_secret: &str,
     code: &str,
     redirect_uri: &str,
-) -> Result<String, String> {
+) -> Result<GithubAccessToken, String> {
     let output = Command::new("curl")
         .args([
             "-fsSL",
@@ -2108,10 +2532,22 @@ fn exchange_github_code(
     if let Some(error) = response.error {
         return Err(response.error_description.unwrap_or(error));
     }
-    response
+    let scopes = response
+        .scope
+        .unwrap_or_default()
+        .split(|value| value == ',' || value == ' ')
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let access_token = response
         .access_token
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| "github token response missing access token".to_string())
+        .ok_or_else(|| "github token response missing access token".to_string())?;
+    Ok(GithubAccessToken {
+        access_token,
+        scopes,
+    })
 }
 
 fn fetch_github_profile(
@@ -2470,7 +2906,10 @@ mod tests {
         assert_eq!(
             verify_session_token_with_secret(&token, "secret", 1_767_225_600),
             Some(VerifiedSession {
-                github_user_id: 123
+                github_user_id: 123,
+                scopes: BTreeSet::new(),
+                github_orgs: BTreeSet::new(),
+                github_teams: BTreeSet::new(),
             })
         );
         assert_eq!(
@@ -2481,6 +2920,23 @@ mod tests {
             verify_session_token_with_secret(&token, "secret", 4_102_444_801),
             None
         );
+
+        let claims = SessionTokenClaims {
+            github_user_id: 123,
+            expires: 4_102_444_800,
+            scopes: vec!["read:user".to_string(), "read:org".to_string()],
+            github_orgs: vec!["aberration-technology".to_string()],
+            github_teams: vec!["aberration-technology/release".to_string()],
+        };
+        let token = issue_session_token_with_claims(&claims, "secret").expect("token signs");
+        let session = verify_session_token_with_secret(&token, "secret", 1_767_225_600)
+            .expect("token verifies");
+        let org = GithubOrgName::parse("aberration-technology").expect("org parses");
+        let team = GithubTeamSlug::parse("release").expect("team parses");
+        assert_eq!(session.github_user_id, 123);
+        assert!(session.has_scope("read:org"));
+        assert!(session.permits_org(&org));
+        assert!(session.permits_team(&org, &team));
     }
 
     #[test]
@@ -2490,6 +2946,8 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
@@ -2539,6 +2997,8 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             created_at: Some(stale_time),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
@@ -2556,6 +3016,7 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             label: "workstation".to_string(),
             visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             compatibility: ProtocolCompatibility::current(),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
@@ -2583,6 +3044,8 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
@@ -2628,6 +3091,8 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
@@ -2711,6 +3176,7 @@ mod tests {
             label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
             visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
             publisher_display_name: Some("mosure".to_string()),
@@ -2744,6 +3210,7 @@ mod tests {
             label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
             visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             publisher_github_user_id: Some(123),
             publisher_login: "mosure".to_string(),
             publisher_display_name: Some("mitchell mosure".to_string()),
@@ -2775,6 +3242,9 @@ mod tests {
             compatibility: Some(ProtocolCompatibility::current()),
             feed_name: Some("workstation".to_string()),
             feed_id: Some("github:123:workstation".to_string()),
+            visibility: Some(FeedVisibility::Public),
+            github_org: None,
+            github_team: None,
             publisher: Some(PublisherIdentity::github(
                 123,
                 "mosure",
@@ -2788,6 +3258,9 @@ mod tests {
             VerifiedBearer {
                 session: VerifiedSession {
                     github_user_id: 123,
+                    scopes: BTreeSet::new(),
+                    github_orgs: BTreeSet::new(),
+                    github_teams: BTreeSet::new(),
                 },
                 token: "test-session-token".to_string(),
             },
@@ -2810,6 +3283,86 @@ mod tests {
             snapshot["feeds"][0]["publisher_login"],
             serde_json::json!("mosure")
         );
+    }
+
+    #[tokio::test]
+    async fn network_publish_private_org_feed_stays_out_of_public_snapshot() {
+        let state = Arc::new(HttpState {
+            config: config(),
+            snapshot: SnapshotStore::default(),
+        });
+        let request = NetworkPublishRequest {
+            network_id: Some("agent-feed-mainnet".to_string()),
+            compatibility: Some(ProtocolCompatibility::current()),
+            feed_name: Some("workstation".to_string()),
+            feed_id: Some("github:123:workstation".to_string()),
+            visibility: Some(FeedVisibility::GithubOrg),
+            github_org: Some("aberration-technology".to_string()),
+            github_team: None,
+            publisher: Some(PublisherIdentity::github(
+                123,
+                "mosure",
+                Some("mosure".to_string()),
+                Some("/avatar/github/123".to_string()),
+            )),
+            capsules: Vec::new(),
+        };
+
+        let denied = network_publish_verified(
+            state.clone(),
+            VerifiedBearer {
+                session: VerifiedSession {
+                    github_user_id: 123,
+                    scopes: BTreeSet::new(),
+                    github_orgs: BTreeSet::new(),
+                    github_teams: BTreeSet::new(),
+                },
+                token: "test-session-token".to_string(),
+            },
+            request,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = NetworkPublishRequest {
+            network_id: Some("agent-feed-mainnet".to_string()),
+            compatibility: Some(ProtocolCompatibility::current()),
+            feed_name: Some("workstation".to_string()),
+            feed_id: Some("github:123:workstation".to_string()),
+            visibility: Some(FeedVisibility::GithubOrg),
+            github_org: Some("aberration-technology".to_string()),
+            github_team: None,
+            publisher: Some(PublisherIdentity::github(
+                123,
+                "mosure",
+                Some("mosure".to_string()),
+                Some("/avatar/github/123".to_string()),
+            )),
+            capsules: Vec::new(),
+        };
+        let response = network_publish_verified(
+            state.clone(),
+            VerifiedBearer {
+                session: VerifiedSession {
+                    github_user_id: 123,
+                    scopes: ["read:org".to_string()].into_iter().collect(),
+                    github_orgs: ["aberration-technology".to_string()].into_iter().collect(),
+                    github_teams: BTreeSet::new(),
+                },
+                token: "test-session-token".to_string(),
+            },
+            allowed,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let public_snapshot = network_snapshot_value(&state.config, &state.snapshot);
+        assert_eq!(public_snapshot["feeds"].as_array().expect("feeds").len(), 0);
+        let filter = OrgRouteFilter::from_query(Some("all")).expect("filter parses");
+        let org = GithubOrgName::parse("aberration-technology").expect("org parses");
+        let org_feeds = state.snapshot.feeds_for_org(&org, None, &filter);
+        assert_eq!(org_feeds.len(), 1);
+        assert_eq!(org_feeds[0].visibility, "github_org");
     }
 
     #[tokio::test]
@@ -2865,6 +3418,9 @@ mod tests {
             compatibility: Some(ProtocolCompatibility::current()),
             feed_name: Some("workstation".to_string()),
             feed_id: Some(feed_id.to_string()),
+            visibility: Some(FeedVisibility::Public),
+            github_org: None,
+            github_team: None,
             publisher: Some(publisher),
             capsules: vec![signed],
         };
@@ -2874,6 +3430,9 @@ mod tests {
             VerifiedBearer {
                 session: VerifiedSession {
                     github_user_id: 123,
+                    scopes: BTreeSet::new(),
+                    github_orgs: BTreeSet::new(),
+                    github_teams: BTreeSet::new(),
                 },
                 token: "test-session-token".to_string(),
             },
@@ -2911,6 +3470,8 @@ mod tests {
             feed_id: "github:123:workstation".to_string(),
             feed_label: "workstation".to_string(),
             compatibility: ProtocolCompatibility::current(),
+            visibility: "public".to_string(),
+            access: FeedAccessPolicy::public(),
             created_at: Some(OffsetDateTime::now_utc()),
             publisher_github_user_id: Some(123),
             publisher_login: "old-login".to_string(),

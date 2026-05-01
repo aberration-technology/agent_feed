@@ -498,7 +498,7 @@ mod tests {
         assert!(!html.contains("id=\"mode-local\""));
         assert!(!html.contains("http://127.0.0.1:7777/reel"));
         assert!(html.contains(
-            "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : \"feeds\";"
+            "modeDiscovery.textContent = route.kind === \"global\" ? \"discover\" : route.kind === \"org\" ? \"org feeds\" : \"feeds\";"
         ));
         assert!(html.contains("modeHistory.textContent = \"history\";"));
         assert!(html.contains("modeHistory.setAttribute(\"href\", historyUrl(route));"));
@@ -528,6 +528,17 @@ mod tests {
         assert!(html.contains("/network/snapshot${directoryFallbackQuery(route)}"));
         assert!(html.contains(".timeline-feeds a[data-kind=\"mode\"]"));
         assert!(html.contains(".timeline-feeds .feed-action[data-kind=\"follow\"]"));
+    }
+
+    #[test]
+    fn browser_supports_private_org_feed_routes() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("pathSegments[0] === \"org\""));
+        assert!(html.contains("/resolve/github-org/${encodeURIComponent(org)}"));
+        assert!(html.contains("private org feeds need github org authorization"));
+        assert!(html.contains("params.set(\"scope\", \"read:user read:org\");"));
+        assert!(html.contains("function startOrgRoute"));
     }
 
     #[test]

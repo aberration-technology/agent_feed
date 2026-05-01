@@ -1,4 +1,3 @@
-use agent_feed_auth::Principal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,13 +12,6 @@ pub struct GithubProfile {
     pub login: String,
     pub name: Option<String>,
     pub avatar_url: Option<String>,
-}
-
-impl GithubProfile {
-    #[must_use]
-    pub fn principal(&self) -> Principal {
-        Principal::github(self.id.clone(), self.login.clone())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,6 +38,7 @@ pub struct GithubCliAuthConfig {
     pub callback_bind: SocketAddr,
     pub callback_path: String,
     pub requested_scopes: Vec<String>,
+    pub github_org: Option<String>,
 }
 
 impl Default for GithubCliAuthConfig {
@@ -55,6 +48,7 @@ impl Default for GithubCliAuthConfig {
             callback_bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             callback_path: "/callback/github".to_string(),
             requested_scopes: vec!["read:user".to_string()],
+            github_org: None,
         }
     }
 }
@@ -75,6 +69,8 @@ pub struct GithubCliCallback {
     pub name: Option<String>,
     pub avatar_url: Option<String>,
     pub session_token: Option<String>,
+    pub scopes: Vec<String>,
+    pub github_orgs: Vec<String>,
     pub expires_at: OffsetDateTime,
 }
 
@@ -86,6 +82,10 @@ pub struct GithubAuthSession {
     pub name: Option<String>,
     pub avatar_url: Option<String>,
     pub session_token: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub github_orgs: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub issued_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -175,6 +175,13 @@ pub fn begin_cli_login_with_state(
     if !config.requested_scopes.is_empty() {
         query.push(("scope", config.requested_scopes.join(" ")));
     }
+    if let Some(org) = config
+        .github_org
+        .as_deref()
+        .filter(|org| !org.trim().is_empty())
+    {
+        query.push(("org", org.trim().to_string()));
+    }
     let authorize_url = format!(
         "{}/auth/github?{}",
         config.edge_base_url.trim_end_matches('/'),
@@ -203,6 +210,8 @@ pub fn complete_cli_login(
         name: callback.name,
         avatar_url: callback.avatar_url,
         session_token: callback.session_token,
+        scopes: callback.scopes,
+        github_orgs: callback.github_orgs,
         issued_at: OffsetDateTime::now_utc(),
         expires_at: callback.expires_at,
         edge_base_url: edge_base_url.into(),
@@ -253,8 +262,29 @@ pub fn parse_cli_callback_request(
             .or_else(|| params.get("grant"))
             .cloned()
             .filter(|value| !value.is_empty()),
+        scopes: split_claims(
+            params.get("scopes").map(String::as_str).unwrap_or_default(),
+            ' ',
+        ),
+        github_orgs: split_claims(
+            params
+                .get("github_orgs")
+                .or_else(|| params.get("orgs"))
+                .map(String::as_str)
+                .unwrap_or_default(),
+            ',',
+        ),
         expires_at,
     })
+}
+
+fn split_claims(value: &str, separator: char) -> Vec<String> {
+    value
+        .split(separator)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 pub fn browser_sign_in_url(edge_base_url: &str, return_to: &str) -> String {
@@ -396,9 +426,32 @@ mod tests {
     }
 
     #[test]
+    fn cli_login_start_can_request_org_authorization_scope() {
+        let config = GithubCliAuthConfig {
+            edge_base_url: "https://edge.example".to_string(),
+            requested_scopes: vec!["read:user".to_string(), "read:org".to_string()],
+            github_org: Some("aberration-technology".to_string()),
+            ..GithubCliAuthConfig::default()
+        };
+        let start = begin_cli_login_with_state(
+            &config,
+            SocketAddr::from(([127, 0, 0, 1], 49152)),
+            "state one",
+        )
+        .expect("login starts");
+
+        assert!(
+            start
+                .authorize_url
+                .contains("scope=read%3Auser%20read%3Aorg")
+        );
+        assert!(start.authorize_url.contains("org=aberration-technology"));
+    }
+
+    #[test]
     fn callback_parses_profile_and_session() {
         let callback = parse_cli_callback_request(
-            "/callback/github?state=s1&github_user_id=123&login=mosure&name=mosure&avatar_url=%2Favatar%2Fgithub%2F123&session=grant",
+            "/callback/github?state=s1&github_user_id=123&login=mosure&name=mosure&avatar_url=%2Favatar%2Fgithub%2F123&session=grant&scopes=read%3Auser%20read%3Aorg&github_orgs=aberration-technology",
         )
         .expect("callback parses");
 
@@ -407,6 +460,8 @@ mod tests {
         assert_eq!(callback.login, "mosure");
         assert_eq!(callback.avatar_url.as_deref(), Some("/avatar/github/123"));
         assert_eq!(callback.session_token.as_deref(), Some("grant"));
+        assert_eq!(callback.scopes, vec!["read:user", "read:org"]);
+        assert_eq!(callback.github_orgs, vec!["aberration-technology"]);
     }
 
     #[test]
@@ -424,6 +479,8 @@ mod tests {
             name: None,
             avatar_url: None,
             session_token: None,
+            scopes: Vec::new(),
+            github_orgs: Vec::new(),
             expires_at: OffsetDateTime::now_utc() + Duration::hours(1),
         };
 

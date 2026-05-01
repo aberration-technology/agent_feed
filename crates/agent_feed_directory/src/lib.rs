@@ -21,6 +21,10 @@ pub type ProtocolId = String;
 pub type TopicId = String;
 pub type AvatarRef = String;
 
+fn default_public_visibility() -> String {
+    FeedVisibility::Public.as_str().to_string()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DirectoryError {
     #[error(transparent)]
@@ -708,6 +712,10 @@ pub struct RemoteHeadlineView {
     pub feed_id: FeedId,
     pub feed_label: String,
     pub compatibility: ProtocolCompatibility,
+    #[serde(default = "default_public_visibility")]
+    pub visibility: String,
+    #[serde(default)]
+    pub access: FeedAccessPolicy,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -752,6 +760,8 @@ impl RemoteHeadlineView {
             feed_id: entry.feed_id.clone(),
             feed_label: entry.feed_label.clone(),
             compatibility: capsule.value.compatibility.clone(),
+            visibility: entry.visibility.as_str().to_string(),
+            access: entry.access.clone(),
             created_at: Some(capsule.value.created_at),
             publisher_github_user_id: publisher
                 .github_user_id
@@ -786,6 +796,8 @@ pub struct ResolveFeedView {
     pub label: String,
     pub compatibility: ProtocolCompatibility,
     pub visibility: String,
+    #[serde(default)]
+    pub access: FeedAccessPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publisher_github_user_id: Option<u64>,
     pub publisher_login: String,
@@ -804,6 +816,7 @@ impl ResolveFeedView {
             label: entry.feed_label.clone(),
             compatibility: entry.compatibility.clone(),
             visibility: entry.visibility.as_str().to_string(),
+            access: entry.access.clone(),
             publisher_github_user_id: Some(entry.owner.github_user_id.get()),
             publisher_login: entry.owner.current_login.clone(),
             publisher_display_name: entry.owner.display_name.clone(),
@@ -819,7 +832,8 @@ impl ResolveFeedView {
             feed_id: headline.feed_id,
             label: headline.feed_label,
             compatibility: headline.compatibility,
-            visibility: FeedVisibility::Public.as_str().to_string(),
+            visibility: headline.visibility,
+            access: headline.access,
             publisher_github_user_id: headline.publisher_github_user_id,
             publisher_login: headline.publisher_login,
             publisher_display_name: headline.publisher_display_name,
@@ -835,6 +849,7 @@ impl ResolveFeedView {
         label: impl Into<String>,
         compatibility: ProtocolCompatibility,
         visibility: FeedVisibility,
+        access: FeedAccessPolicy,
         publisher: &PublisherIdentity,
         last_seen_at: OffsetDateTime,
     ) -> Self {
@@ -851,6 +866,7 @@ impl ResolveFeedView {
             label: label.into(),
             compatibility,
             visibility: visibility.as_str().to_string(),
+            access,
             publisher_github_user_id: publisher.github_user_id,
             publisher_login,
             publisher_display_name: publisher.display_name.clone(),
@@ -1308,7 +1324,6 @@ fn entry_is_org_visible(
         (FeedVisibility::GithubOrg, None) => entry.access.permits_org(org),
         (FeedVisibility::GithubOrg, Some(_)) => entry.access.permits_org(org),
         (FeedVisibility::GithubTeam, Some(team)) => entry.access.permits_team(org, team),
-        (FeedVisibility::Public, _) => true,
         _ => false,
     }
 }

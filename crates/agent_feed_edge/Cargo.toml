@@ -9,7 +9,6 @@ readme.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-agent_feed_auth = { workspace = true }
 agent_feed_core = { workspace = true }
 agent_feed_directory = { workspace = true }
 agent_feed_identity = { workspace = true }
@@ -17,7 +16,6 @@ agent_feed_identity_github = { workspace = true }
 agent_feed_p2p = { workspace = true }
 agent_feed_p2p_proto = { workspace = true }
 agent_feed_security = { workspace = true }
-agent_feed_social = { workspace = true }
 axum = { workspace = true }
 hmac = { workspace = true }
 regex = { workspace = true }

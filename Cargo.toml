@@ -3,12 +3,9 @@ resolver = "3"
 members = [
     "crates/agent_feed",
     "crates/agent_feed_adapters",
-    "crates/agent_feed_auth",
     "crates/agent_feed_auth_github",
-    "crates/agent_feed_browser",
     "crates/agent_feed_cli",
     "crates/agent_feed_core",
-    "crates/agent_feed_deploy",
     "crates/agent_feed_edge",
     "crates/agent_feed_filter",
     "crates/agent_feed_highlight",
@@ -25,7 +22,6 @@ members = [
     "crates/agent_feed_reel",
     "crates/agent_feed_security",
     "crates/agent_feed_server",
-    "crates/agent_feed_social",
     "crates/agent_feed_store",
     "crates/agent_feed_story",
     "crates/agent_feed_summarize",
@@ -47,11 +43,8 @@ rust-version = "1.95"
 [workspace.dependencies]
 agent_feed = { path = "crates/agent_feed", version = "0.1.25" }
 agent_feed_adapters = { path = "crates/agent_feed_adapters", version = "0.1.25" }
-agent_feed_auth = { path = "crates/agent_feed_auth", version = "0.1.25" }
 agent_feed_auth_github = { path = "crates/agent_feed_auth_github", version = "0.1.25" }
-agent_feed_browser = { path = "crates/agent_feed_browser", version = "0.1.25" }
 agent_feed_core = { path = "crates/agent_feed_core", version = "0.1.25" }
-agent_feed_deploy = { path = "crates/agent_feed_deploy", version = "0.1.25" }
 agent_feed_edge = { path = "crates/agent_feed_edge", version = "0.1.25" }
 agent_feed_filter = { path = "crates/agent_feed_filter", version = "0.1.25" }
 agent_feed_highlight = { path = "crates/agent_feed_highlight", version = "0.1.25" }
@@ -68,7 +61,6 @@ agent_feed_redaction = { path = "crates/agent_feed_redaction", version = "0.1.25
 agent_feed_reel = { path = "crates/agent_feed_reel", version = "0.1.25" }
 agent_feed_security = { path = "crates/agent_feed_security", version = "0.1.25" }
 agent_feed_server = { path = "crates/agent_feed_server", version = "0.1.25" }
-agent_feed_social = { path = "crates/agent_feed_social", version = "0.1.25" }
 agent_feed_store = { path = "crates/agent_feed_store", version = "0.1.25" }
 agent_feed_story = { path = "crates/agent_feed_story", version = "0.1.25" }
 agent_feed_summarize = { path = "crates/agent_feed_summarize", version = "0.1.25" }

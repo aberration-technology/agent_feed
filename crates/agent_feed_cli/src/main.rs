@@ -135,6 +135,13 @@ enum Commands {
         edge: String,
         #[arg(long, default_value = "agent-feed-mainnet")]
         network_id: String,
+        #[arg(
+            long,
+            help = "publish this feed as a private GitHub org feed; implies github_org visibility"
+        )]
+        github_org: Option<String>,
+        #[arg(long, help = "publish this feed as a private GitHub team feed")]
+        github_team: Option<String>,
         #[arg(long)]
         auth_store: Option<PathBuf>,
         #[arg(long, default_value = "127.0.0.1:0")]
@@ -288,6 +295,8 @@ enum AuthCommand {
         no_browser: bool,
         #[arg(long)]
         print_url: bool,
+        #[arg(long, help = "authorize this session for a private GitHub org feed")]
+        github_org: Option<String>,
         #[arg(long)]
         store: Option<PathBuf>,
     },
@@ -649,6 +658,8 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
             feed,
             edge,
             network_id,
+            github_org,
+            github_team,
             auth_store,
             auth_callback_bind,
             auth_timeout_secs,
@@ -705,6 +716,18 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     "`agent-feed serve --publish --edge-fallback off` needs the native p2p data plane, which is not enabled in this build yet; use --edge-fallback auto for the single-bootstrap edge snapshot path".to_string(),
                 ));
             }
+            if github_team.is_some() && github_org.is_none() {
+                return Err(CliError::Http(
+                    "--github-team requires --github-org for private team feeds".to_string(),
+                ));
+            }
+            let publish_visibility = if github_team.is_some() {
+                FeedVisibility::GithubTeam
+            } else if github_org.is_some() {
+                FeedVisibility::GithubOrg
+            } else {
+                FeedVisibility::Public
+            };
             let p2p_enabled = (p2p || publish) && !no_p2p;
             let p2p_network = P2pNetworkConfig {
                 network_id: network_id.clone(),
@@ -754,6 +777,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     auth_callback_bind,
                     Duration::from_secs(auth_timeout_secs),
                     no_auth_browser,
+                    github_org.as_deref(),
                 )?;
                 let publisher = PublisherIdentity::github(
                     session.github_user_id,
@@ -768,6 +792,9 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     edge: edge.clone(),
                     network_id: network_id.clone(),
                     feed: feed.clone(),
+                    visibility: publish_visibility,
+                    github_org: github_org.clone(),
+                    github_team: github_team.clone(),
                     session,
                     publisher,
                     summary_config,
@@ -786,6 +813,9 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 no_p2p,
                 publish,
                 feed_name = %feed,
+                visibility = ?publish_visibility,
+                github_org = github_org.as_deref().unwrap_or(""),
+                github_team = github_team.as_deref().unwrap_or(""),
                 %edge,
                 %network_id,
                 edge_fallback = edge_fallback.as_str(),
@@ -908,6 +938,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 timeout_secs,
                 no_browser,
                 print_url,
+                github_org,
                 store,
             } => {
                 let session = github_cli_login(
@@ -917,6 +948,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     no_browser,
                     print_url,
                     store,
+                    github_org.as_deref(),
                 )?;
                 println!(
                     "github auth: @{} github:{} expires {}",
@@ -1495,7 +1527,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                             "`agent-feed p2p publish --edge-fallback off` needs the native p2p data plane, which is not enabled in this build yet; use --edge-fallback auto".to_string(),
                         ));
                     }
-                    Some(load_publish_session(auth_store, &edge)?)
+                    Some(load_publish_session(auth_store, &edge, None)?)
                 };
                 let publisher = session.as_ref().map(|session| {
                     PublisherIdentity::github(
@@ -2035,6 +2067,9 @@ struct ServePublishConfig {
     edge: String,
     network_id: String,
     feed: String,
+    visibility: FeedVisibility,
+    github_org: Option<String>,
+    github_team: Option<String>,
     session: GithubAuthSession,
     publisher: PublisherIdentity,
     summary_config: SummaryConfig,
@@ -2200,14 +2235,22 @@ fn run_serve_publisher(config: ServePublishConfig) {
         feed_name = %config.feed,
         edge = %config.edge,
         network_id = %config.network_id,
+        visibility = ?config.visibility,
+        github_org = config.github_org.as_deref().unwrap_or(""),
+        github_team = config.github_team.as_deref().unwrap_or(""),
         interval_ms = config.publish_interval.as_millis(),
         edge_fallback = config.edge_fallback.as_str(),
         data_plane = P2pDataPlane::EdgeSnapshotFallback.as_str(),
         "serve p2p publisher started"
     );
+    let org_scope = config
+        .github_org
+        .as_deref()
+        .map(|org| format!(" for org `{org}`"))
+        .unwrap_or_default();
     println!(
-        "p2p publish: signed in as @{}; publishing future summarized stories to `{}` via edge snapshot fallback",
-        config.session.login, config.feed
+        "p2p publish: signed in as @{}; publishing future summarized stories to `{}`{} via edge snapshot fallback",
+        config.session.login, config.feed, org_scope
     );
     post_serve_publish_status(
         &config,
@@ -2540,6 +2583,9 @@ fn publish_feed_presence(config: &ServePublishConfig) -> Result<EdgePublishAck, 
         "compatibility": ProtocolCompatibility::current(),
         "feed_id": feed_id,
         "feed_name": config.feed,
+        "visibility": config.visibility,
+        "github_org": config.github_org,
+        "github_team": config.github_team,
         "publisher": config.publisher,
         "capsules": [],
     }))?;
@@ -2658,6 +2704,9 @@ fn publish_capsule_batch(
         "compatibility": ProtocolCompatibility::current(),
         "feed_id": feed_id,
         "feed_name": config.feed,
+        "visibility": config.visibility,
+        "github_org": config.github_org,
+        "github_team": config.github_team,
         "publisher": config.publisher,
         "capsules": capsules,
     }))?;
@@ -3383,6 +3432,8 @@ mod tests {
             "deterministic",
             "--edge-fallback",
             "auto",
+            "--github-org",
+            "aberration-technology",
         ])
         .expect("serve publish flags parse");
 
@@ -3394,6 +3445,7 @@ mod tests {
             publish_interval_secs,
             summarizer,
             edge_fallback,
+            github_org,
             ..
         } = cli.command
         else {
@@ -3407,6 +3459,7 @@ mod tests {
         assert_eq!(publish_interval_secs, 5);
         assert_eq!(summarizer, "deterministic");
         assert_eq!(edge_fallback, CliEdgeFallback::Auto);
+        assert_eq!(github_org.as_deref(), Some("aberration-technology"));
     }
 
     #[test]
@@ -7935,7 +7988,7 @@ fn doctor_publish(
     let mut checks = Vec::new();
     let mut next = None::<String>;
 
-    let auth_session = match load_publish_session(auth_store, edge) {
+    let auth_session = match load_publish_session(auth_store, edge, None) {
         Ok(session) => {
             push_doctor_check(
                 &mut checks,
@@ -8721,6 +8774,7 @@ fn post_json(server: &str, path: &str, body: &str) -> Result<String, CliError> {
 fn load_publish_session(
     auth_store: Option<PathBuf>,
     edge: &str,
+    github_org: Option<&str>,
 ) -> Result<GithubAuthSession, CliError> {
     let store = GithubSessionStore::new(auth_store_path(auth_store));
     let Some(session) = store.load()? else {
@@ -8747,6 +8801,22 @@ fn load_publish_session(
             "github auth session is for {actual}; re-run auth with --edge {expected}"
         )));
     }
+    if let Some(org) = github_org {
+        if !session.scopes.iter().any(|scope| scope == "read:org") {
+            return Err(CliError::Http(format!(
+                "github auth session lacks read:org; run `agent-feed auth github --github-org {org}`"
+            )));
+        }
+        if !session
+            .github_orgs
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(org))
+        {
+            return Err(CliError::Http(format!(
+                "github auth session is not authorized for org `{org}`; run `agent-feed auth github --github-org {org}`"
+            )));
+        }
+    }
     Ok(session)
 }
 
@@ -8756,8 +8826,9 @@ fn ensure_publish_session(
     callback_bind: SocketAddr,
     timeout: Duration,
     no_browser: bool,
+    github_org: Option<&str>,
 ) -> Result<GithubAuthSession, CliError> {
-    match load_publish_session(auth_store.clone(), edge) {
+    match load_publish_session(auth_store.clone(), edge, github_org) {
         Ok(session) => Ok(session),
         Err(err) => {
             warn!(
@@ -8773,6 +8844,7 @@ fn ensure_publish_session(
                 no_browser,
                 no_browser,
                 auth_store,
+                github_org,
             )
         }
     }
@@ -8785,6 +8857,7 @@ fn github_cli_login(
     no_browser: bool,
     print_url: bool,
     store: Option<PathBuf>,
+    github_org: Option<&str>,
 ) -> Result<GithubAuthSession, CliError> {
     let listener = TcpListener::bind(callback_bind)?;
     let bind = listener.local_addr()?;
@@ -8804,6 +8877,12 @@ fn github_cli_login(
     let config = GithubCliAuthConfig {
         edge_base_url: edge.clone(),
         callback_bind,
+        requested_scopes: if github_org.is_some() {
+            vec!["read:user".to_string(), "read:org".to_string()]
+        } else {
+            GithubCliAuthConfig::default().requested_scopes
+        },
+        github_org: github_org.map(ToString::to_string),
         ..GithubCliAuthConfig::default()
     };
     let start = begin_cli_login(&config, bind)?;

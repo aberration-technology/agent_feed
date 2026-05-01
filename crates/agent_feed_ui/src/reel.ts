@@ -715,6 +715,9 @@ function quietDetail(route, classification = {}) {
     parts.push(`following ${followTargetCountLabel(feedCount || route.followingTargets?.length || 0)}`);
   } else if (route.kind === "global") {
     parts.push(feedCount > 0 ? `${feedCountLabel(feedCount)} connected` : "network connected");
+  } else if (route.kind === "org") {
+    const stream = routeStreamLabel(route);
+    parts.push(stream && stream !== "visible feeds" ? `${route.login} / ${stream}` : `${route.login} connected`);
   } else {
     const stream = routeStreamLabel(route);
     parts.push(stream && stream !== "visible feeds" ? `@${route.login} / ${stream}` : `@${route.login} connected`);
@@ -755,6 +758,9 @@ function routeEyebrow(route) {
   if (route.kind === "global") {
     return `feed / ${route.network} / ${routeDisplayMode(route)}`;
   }
+  if (route.kind === "org") {
+    return `${route.network} / org / ${routeDisplayMode(route)}`;
+  }
   return `${route.network} / ${routeDisplayMode(route)} / ${routeStreamLabel(route)}`;
 }
 
@@ -765,6 +771,12 @@ function routeDisplayMode(route) {
 function routeStreamLabel(route) {
   if (route.kind === "global") {
     return route.feedMode === "following" ? "followed feeds" : "all public feeds";
+  }
+  if (route.kind === "org") {
+    if (route.feed === "*" || route.feed === "all") {
+      return "all org feeds";
+    }
+    return route.feed || "org feeds";
   }
   if (route.feed === "*") {
     return "all feeds";
@@ -840,9 +852,10 @@ function renderP2pDisabled(route) {
 function renderAuthRequired(route) {
   renderRemoteState(route, "auth-required", [
     "github sign-in required",
-    "private feeds need a signed browser session",
-    "open /network to sign in",
+    route.kind === "org" ? "private org feeds need github org authorization" : "private feeds need a signed browser session",
+    route.kind === "org" ? `authorize access to ${route.org || route.login}` : "open /network to sign in",
   ]);
+  setAuthAction(browserSignInUrl(window.location.href, route.kind === "org" ? route.org || route.login : undefined), "sign in with github");
 }
 
 function renderChips(nextChips) {
@@ -1370,6 +1383,44 @@ function parseRemoteRoute(location) {
     return undefined;
   }
   const pathSegments = path.split("/");
+  if (pathSegments[0] === "org") {
+    if (pathSegments.length !== 2 || pathSegments.some((segment) => !segment || segment.startsWith("."))) {
+      return undefined;
+    }
+    let org = pathSegments[1];
+    try {
+      org = decodeURIComponent(org);
+    } catch (error) {
+      logError("org route decode failed", error);
+      return undefined;
+    }
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(org)) {
+      return undefined;
+    }
+    const params = new URLSearchParams(
+      location.hash && location.hash.length > 1
+        ? location.hash.slice(1)
+        : location.search,
+    );
+    for (const key of ["redact", "raw", "raw_events", "diffs", "prompts"]) {
+      if (params.has(key)) {
+        logWarn(`ignored privacy-weakening query param: ${key}`);
+      }
+    }
+    const streamFilter = params.get("streams") || (params.has("all") ? "*" : "");
+    return {
+      kind: "org",
+      org,
+      login: org,
+      network: params.get("network") || "mainnet",
+      feed: streamFilter === "all" ? "*" : streamFilter,
+      selection: `org/${org}${streamFilter ? `/${streamFilter}` : ""}`,
+      feedMode: routeFeedMode(params, "org"),
+      followingTargets: routeFollowingTargets(org, params),
+      interactive: routeHistoryRequested(params),
+      query: location.search,
+    };
+  }
   if (pathSegments.length > 2 || pathSegments.some((segment) => !segment || segment.startsWith("."))) {
     return undefined;
   }
@@ -1794,7 +1845,7 @@ function setupModeSwitcher(route) {
     hideModeSwitcher();
     return;
   }
-  modeDiscovery.textContent = route.kind === "global" ? "discover" : "feeds";
+  modeDiscovery.textContent = route.kind === "global" ? "discover" : route.kind === "org" ? "org feeds" : "feeds";
   modeFollowing.textContent = route.kind === "user" ? `following @${route.login}` : "following";
   modeHistory.textContent = "history";
   modeDiscovery.setAttribute("href", modeUrl(route, "discovery"));
@@ -1804,7 +1855,7 @@ function setupModeSwitcher(route) {
     "aria-current",
     !route.interactive &&
       ((route.kind === "global" && route.feedMode === "discovery") ||
-        (route.kind === "user" && route.feedMode !== "following")),
+        ((route.kind === "user" || route.kind === "org") && route.feedMode !== "following")),
   );
   modeFollowing.toggleAttribute("aria-current", !route.interactive && route.feedMode === "following");
   modeHistory.toggleAttribute("aria-current", route.interactive);
@@ -1863,6 +1914,14 @@ function modeUrl(route, mode) {
     const query = params.toString();
     return query ? `/?${query}` : "/";
   }
+  if (route.kind === "org") {
+    if (mode === "discovery") {
+      params.delete("feed_mode");
+      params.set("all", "true");
+    }
+    const query = params.toString();
+    return `/org/${encodeURIComponent(route.org || route.login)}${query ? `?${query}` : ""}`;
+  }
   if (mode === "discovery") {
     params.delete("feed_mode");
     params.set("all", "true");
@@ -1915,6 +1974,8 @@ function parseGithubAuthCallback(location) {
     avatar_url: params.get("avatar_url") || params.get("avatar") || "",
     session_token:
       params.get("session") || params.get("session_token") || params.get("grant") || "",
+    scopes: params.get("scopes") || "",
+    github_orgs: params.get("github_orgs") || params.get("orgs") || "",
     expires_at: params.get("expires_at") || "",
     return_to: params.get("return_to") || "/network",
   };
@@ -1957,13 +2018,17 @@ function githubAuthHeaders() {
   return { authorization: `Bearer ${session.session_token}` };
 }
 
-function browserSignInUrl(returnTo = window.location.href) {
+function browserSignInUrl(returnTo = window.location.href, githubOrg = undefined) {
   const state = randomState();
   window.localStorage.setItem("feed.github.auth_state", state);
   const params = new URLSearchParams();
   params.set("client", "feed-browser");
   params.set("return_to", returnTo);
   params.set("state", state);
+  if (githubOrg) {
+    params.set("org", githubOrg);
+    params.set("scope", "read:user read:org");
+  }
   return `${edgeBaseUrl()}/auth/github?${params.toString()}`;
 }
 
@@ -2016,6 +2081,8 @@ function handleGithubAuthCallback(callback) {
     name: callback.name || undefined,
     avatar_url: callback.avatar_url || undefined,
     session_token: callback.session_token || undefined,
+    scopes: callback.scopes ? callback.scopes.split(" ").filter(Boolean) : [],
+    github_orgs: callback.github_orgs ? callback.github_orgs.split(",").filter(Boolean) : [],
     expires_at: callback.expires_at || undefined,
     edge_base_url: edgeBaseUrl(),
   };
@@ -2093,6 +2160,11 @@ async function startRemoteRoute(route) {
     scheduleRemoteRefresh(route, "initial-global");
     return;
   }
+  if (route.kind === "org") {
+    await startOrgRoute(route);
+    scheduleRemoteRefresh(route, "initial-org");
+    return;
+  }
   await startUserRoute(route);
   scheduleRemoteRefresh(route, "initial-user");
 }
@@ -2131,6 +2203,8 @@ async function refreshRemoteRoute(route, reason = "timer") {
       await startFollowingRoute(route, true);
     } else if (route.kind === "global") {
       await startGlobalDiscoveryRoute(route, true);
+    } else if (route.kind === "org") {
+      await startOrgRoute(route, true);
     } else {
       await startUserRoute(route, true);
     }
@@ -2431,6 +2505,91 @@ async function startUserRoute(route, refresh = false) {
       "waiting for p2p live path",
     ]);
     logError("remote route resolution failed", error);
+  }
+}
+
+async function startOrgRoute(route, refresh = false) {
+  if (!refresh) {
+    renderRemoteState(route, "resolving", [
+      `authorizing ${route.org || route.login}`,
+      `finding private org feeds on ${route.network}`,
+      "waiting for settled story capsules",
+    ]);
+  }
+  const org = route.org || route.login;
+  const endpoint = `${edgeBaseUrl()}/resolve/github-org/${encodeURIComponent(org)}${resolverQuery(route)}`;
+  try {
+    logInfo("feed.org.resolver.request", {
+      org,
+      selection: route.selection,
+      endpoint,
+    });
+    const response = await fetch(endpoint, {
+      cache: "no-store",
+      headers: githubAuthHeaders(),
+    });
+    logInfo("feed.org.resolver.response", {
+      org,
+      status: response.status,
+      ok: response.ok,
+    });
+    if (response.status === 401 || response.status === 403) {
+      renderAuthRequired(route);
+      return;
+    }
+    if (response.status === 426) {
+      const message = await responseErrorMessage(response, "update your peer to the latest version");
+      renderRemoteState(route, "version-mismatch", [
+        "feed protocol network or data model changed",
+        message,
+        "update your peer or choose the matching network",
+      ]);
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`org resolver failed: ${response.status}`);
+    }
+    const ticket = await response.json();
+    const ticketStatus = compatibilityStatus(ticket.compatibility || ticket.browser_seed?.compatibility);
+    if (!ticketStatus.compatible) {
+      renderRemoteState(route, "version-mismatch", [
+        "feed protocol or data model changed",
+        ticketStatus.message,
+        "update your peer to the latest version",
+      ]);
+      return;
+    }
+    const feeds = ticketFeeds(ticket).filter((feed) => compatibilityStatus(feed.compatibility).compatible);
+    const headlines = snapshotHeadlines(ticket)
+      .filter((item) => compatibilityStatus(item.compatibility || ticket.compatibility).compatible)
+      .filter((item) => headlineMatchesRoute(item, route));
+    const classification = classifyRemoteSnapshot(route, feeds, headlines, {
+      profile: { login: org, display_name: org },
+    });
+    if (classification.kind === "fresh_unseen" && !route.interactive) {
+      updateSourceCountFromFeeds(feeds);
+      applyRemoteHeadlines(route, headlines, classification);
+      return;
+    }
+    if (feeds.length === 0 && headlines.length === 0) {
+      renderRemoteState(route, "no-feeds", [
+        "github org authorization accepted",
+        "no private org story streams are visible",
+      ], { login: org });
+      updateSourceCountFromFeeds([]);
+      return;
+    }
+    if (route.interactive) {
+      renderTimeline(route, ticket);
+      return;
+    }
+    renderQuietConnected(route, classification, { login: org });
+  } catch (error) {
+    renderRemoteState(route, "failed", [
+      "org feed snapshot unavailable",
+      "waiting for p2p live path",
+    ]);
+    logError("org route resolution failed", error);
   }
 }
 
@@ -3037,7 +3196,7 @@ function headlineMatchesRoute(item, route) {
   if (!item || !route) {
     return false;
   }
-  if (route.kind !== "global") {
+  if (route.kind !== "global" && route.kind !== "org") {
     const expectedLogin = normalizeRouteLogin(route.login);
     const publisherLogin = normalizeRouteLogin(publisherLoginFromHeadline(item));
     if (expectedLogin && publisherLogin && expectedLogin !== publisherLogin) {
@@ -3694,6 +3853,9 @@ function routeProjectFilter(route) {
 function routePath(route) {
   if (!route || route.kind === "global") {
     return "/";
+  }
+  if (route.kind === "org") {
+    return `/org/${encodeURIComponent(route.org || route.login)}`;
   }
   const login = route.login ? encodeURIComponent(route.login) : "";
   if (!login) {

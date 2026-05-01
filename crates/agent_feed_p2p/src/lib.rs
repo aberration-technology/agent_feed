@@ -978,6 +978,16 @@ impl PeerNode {
         if !entry.access_matches_visibility() {
             return Err(P2pError::Directory(DirectoryError::AccessPolicyMismatch));
         }
+        {
+            let state = self
+                .network
+                .state
+                .lock()
+                .map_err(|_| P2pError::StatePoisoned)?;
+            if !state.peer_can_cache_directory_entry(&self.peer_id, &entry) {
+                return Err(P2pError::SubscriptionDenied(entry.feed_id));
+            }
+        }
         if entry.peer_id != self.peer_id {
             tracing::warn!(
                 peer_id = %self.peer_id,
@@ -1021,6 +1031,16 @@ impl PeerNode {
         }
         if !entry.access_matches_visibility() {
             return Err(P2pError::Directory(DirectoryError::AccessPolicyMismatch));
+        }
+        {
+            let state = self
+                .network
+                .state
+                .lock()
+                .map_err(|_| P2pError::StatePoisoned)?;
+            if !state.peer_can_cache_directory_entry(&self.peer_id, &entry) {
+                return Err(P2pError::SubscriptionDenied(entry.feed_id));
+            }
         }
         let feed_id = entry.feed_id.clone();
         let github_user_id = entry.owner.github_user_id;
@@ -1090,7 +1110,13 @@ impl PeerNode {
         let entries: Vec<_> = state
             .directory
             .get(&github_user_id)
-            .map(|entries| entries.values().cloned().collect())
+            .map(|entries| {
+                entries
+                    .values()
+                    .filter(|entry| state.peer_can_cache_directory_entry(&self.peer_id, entry))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         tracing::debug!(
             peer_id = %self.peer_id,
@@ -1111,6 +1137,13 @@ impl PeerNode {
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
+        let authorized = state
+            .org_access
+            .get(&self.peer_id)
+            .is_some_and(|access| &access.org == org);
+        if !authorized {
+            return Err(P2pError::SubscriptionDenied(format!("github-org:{org}")));
+        }
         let entries: Vec<_> = state
             .org_directory
             .get(org)
@@ -1136,6 +1169,15 @@ impl PeerNode {
             .state
             .lock()
             .map_err(|_| P2pError::StatePoisoned)?;
+        let authorized = state
+            .org_access
+            .get(&self.peer_id)
+            .is_some_and(|access| &access.org == org && access.teams.contains(team));
+        if !authorized {
+            return Err(P2pError::SubscriptionDenied(format!(
+                "github-team:{org}/{team}"
+            )));
+        }
         let entries: Vec<_> = state
             .team_directory
             .get(&(org.clone(), team.clone()))
@@ -1334,6 +1376,18 @@ impl PeerNode {
             return Err(P2pError::FeedNotFound(feed_id.to_string()));
         };
         ensure_current_compatibility(&profile.compatibility)?;
+        if profile.visibility != FeedVisibility::Public {
+            let subscribed = state
+                .subscriptions
+                .get(feed_id)
+                .is_some_and(|peers| peers.contains(&self.peer_id));
+            if profile.peer_id != self.peer_id
+                && (!subscribed
+                    || !state.can_receive_peer(feed_id, &self.peer_id, profile.visibility))
+            {
+                return Err(P2pError::SubscriptionDenied(feed_id.to_string()));
+            }
+        }
         let history = state.history.get(feed_id).cloned().unwrap_or_default();
         let keep = limit.min(history.len());
         let skip = history.len().saturating_sub(keep);
@@ -1474,6 +1528,36 @@ impl Default for NetworkState {
 }
 
 impl NetworkState {
+    fn peer_can_cache_directory_entry(
+        &self,
+        peer_id: &PeerIdString,
+        entry: &FeedDirectoryEntry,
+    ) -> bool {
+        match entry.visibility {
+            FeedVisibility::Public => true,
+            FeedVisibility::GithubOrg => {
+                let Some(org) = entry.access.github_org.as_ref() else {
+                    return false;
+                };
+                self.org_access
+                    .get(peer_id)
+                    .is_some_and(|access| &access.org == org)
+            }
+            FeedVisibility::GithubTeam => {
+                let Some(org) = entry.access.github_org.as_ref() else {
+                    return false;
+                };
+                let Some(team) = entry.access.github_team.as_ref() else {
+                    return false;
+                };
+                self.org_access
+                    .get(peer_id)
+                    .is_some_and(|access| &access.org == org && access.teams.contains(team))
+            }
+            _ => false,
+        }
+    }
+
     fn index_directory_entry(&mut self, entry: FeedDirectoryEntry) {
         let feed_id = entry.feed_id.clone();
         self.feed_access
@@ -1946,6 +2030,9 @@ mod tests {
         let member = network.peer("agent-feed-mainnet", "peer-member", "github:2");
         let org = GithubOrgName::parse("aberration-technology")?;
         let entry = org_directory_entry("feed-org", "workstation", "peer-a", None)?;
+        publisher.certify_github_org_access(org.clone(), [])?;
+        fabric.certify_github_org_access(org.clone(), [])?;
+        member.certify_github_org_access(org.clone(), [])?;
         publisher.announce_feed(profile("feed-org", FeedVisibility::GithubOrg)?)?;
         publisher.announce_directory_entry(entry.clone())?;
         fabric.join_fabric([PeerRole::Rendezvous, PeerRole::KadProvider])?;
@@ -1975,6 +2062,7 @@ mod tests {
         let outsider = network.peer("agent-feed-mainnet", "peer-outsider", "github:3");
         let org = GithubOrgName::parse("aberration-technology")?;
         let entry = org_directory_entry("feed-org", "workstation", "peer-a", None)?;
+        publisher.certify_github_org_access(org.clone(), [])?;
         publisher.announce_feed(profile("feed-org", FeedVisibility::GithubOrg)?)?;
         publisher.announce_directory_entry(entry.clone())?;
         member.certify_github_org_access(org, [])?;
@@ -1990,6 +2078,46 @@ mod tests {
     }
 
     #[test]
+    fn private_org_feed_does_not_leak_to_public_fabric_or_snapshots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let network = InMemoryNetwork::new();
+        let publisher = network.peer("agent-feed-mainnet", "peer-a", "github:1");
+        let outsider = network.peer("agent-feed-mainnet", "peer-outsider", "github:3");
+        let member = network.peer("agent-feed-mainnet", "peer-member", "github:2");
+        let public_fabric = network.peer("agent-feed-mainnet", "peer-fabric", "fabric:edge");
+        let org = GithubOrgName::parse("aberration-technology")?;
+        let entry = org_directory_entry("feed-org", "workstation", "peer-a", None)?;
+
+        publisher.certify_github_org_access(org.clone(), [])?;
+        publisher.announce_feed(profile("feed-org", FeedVisibility::GithubOrg)?)?;
+        publisher.announce_directory_entry(entry.clone())?;
+        public_fabric.join_fabric([PeerRole::Rendezvous, PeerRole::KadProvider])?;
+
+        assert!(public_fabric.cache_directory_entry(entry.clone()).is_err());
+        assert!(public_fabric.discover_github_org(&org).is_err());
+        assert!(outsider.discover_github_org(&org).is_err());
+        assert!(
+            outsider
+                .discover_github_user(GithubUserId::new(1))?
+                .is_empty()
+        );
+        assert!(outsider.follow("feed-org").is_err());
+        assert!(outsider.feed_snapshot("feed-org", 10).is_err());
+
+        member.certify_github_org_access(org.clone(), [])?;
+        assert_eq!(member.discover_github_org(&org)?.len(), 1);
+        assert!(member.feed_snapshot("feed-org", 10).is_err());
+        member.follow("feed-org")?;
+        publisher.publish_capsule(capsule_from_entry(&entry, 1)?)?;
+
+        assert_eq!(member.drain()?.len(), 1);
+        assert_eq!(member.feed_snapshot("feed-org", 10)?.len(), 1);
+        assert!(public_fabric.drain()?.is_empty());
+        assert!(outsider.drain()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn team_feed_requires_matching_team_membership() -> Result<(), Box<dyn std::error::Error>> {
         let network = InMemoryNetwork::new();
         let publisher = network.peer("agent-feed-mainnet", "peer-a", "github:1");
@@ -1999,12 +2127,14 @@ mod tests {
         let release = GithubTeamSlug::parse("release")?;
         let lab = GithubTeamSlug::parse("lab")?;
         let entry = org_directory_entry("feed-release", "release", "peer-a", Some("release"))?;
+        publisher.certify_github_org_access(org.clone(), [release.clone()])?;
         publisher.announce_feed(profile("feed-release", FeedVisibility::GithubTeam)?)?;
         publisher.announce_directory_entry(entry.clone())?;
         release_member.certify_github_org_access(org.clone(), [release.clone()])?;
         lab_member.certify_github_org_access(org.clone(), [lab])?;
 
-        let discovered = lab_member.discover_github_team(&org, &release)?;
+        assert!(lab_member.discover_github_team(&org, &release).is_err());
+        let discovered = release_member.discover_github_team(&org, &release)?;
 
         assert_eq!(discovered.len(), 1);
         assert!(lab_member.follow("feed-release").is_err());

@@ -27,14 +27,13 @@ agent_feed_story = { workspace = true }
 agent_feed_summarize = { workspace = true }
 agent_feed_views = { workspace = true }
 agent_feed_auth_github = { workspace = true, optional = true }
-agent_feed_browser = { workspace = true, optional = true }
 agent_feed_edge = { workspace = true, optional = true }
 
 [features]
 default = ["local"]
 local = []
 p2p = ["dep:agent_feed_p2p", "dep:agent_feed_p2p_proto", "dep:agent_feed_directory"]
-p2p-browser = ["p2p", "dep:agent_feed_browser", "dep:agent_feed_p2p_browser"]
+p2p-browser = ["p2p", "dep:agent_feed_p2p_browser"]
 github = ["dep:agent_feed_identity_github"]
 auth-github = ["github", "dep:agent_feed_auth_github"]
 edge = ["p2p", "github", "dep:agent_feed_edge"]

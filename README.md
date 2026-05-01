@@ -119,6 +119,16 @@ publish from every local workspace:
 agent-feed serve --p2p --publish --feed workstation --all-workspaces
 ```
 
+to publish a private org feed, authorize github org membership and mark the
+feed with the org boundary:
+
+```sh
+agent-feed serve --publish --feed workstation --github-org aberration-technology --all-workspaces
+```
+
+private org feeds are visible from `/org/<github-org>` only to signed-in org
+members. public discovery does not expose private org feed records or stories.
+
 to inspect the active network boundary:
 
 ```sh

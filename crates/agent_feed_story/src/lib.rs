@@ -1890,16 +1890,22 @@ fn safe_sentence(input: &str) -> String {
         return "display-safe summary recorded".to_string();
     }
     let trimmed = input.trim();
-    let sentence = first_sentence(trimmed).unwrap_or(trimmed);
+    let sentence = first_substantive_sentence(trimmed).unwrap_or(trimmed);
     clamp_words(sentence.trim_end_matches(['.', '!', '?']), 20)
 }
 
-fn first_sentence(input: &str) -> Option<&str> {
-    [". ", "! ", "? "]
-        .iter()
-        .filter_map(|delimiter| input.find(delimiter).map(|index| &input[..index]))
-        .min_by_key(|sentence| sentence.len())
-        .filter(|sentence| !sentence.trim().is_empty())
+fn first_substantive_sentence(input: &str) -> Option<&str> {
+    input
+        .split_terminator(|char| matches!(char, '.' | '!' | '?'))
+        .map(str::trim)
+        .find(|sentence| !sentence.is_empty() && !sentence_is_vacuous_status(sentence))
+}
+
+fn sentence_is_vacuous_status(sentence: &str) -> bool {
+    matches!(
+        normalized_story_text(sentence).as_str(),
+        "done" | "ok" | "okay" | "fixed" | "complete" | "completed"
+    )
 }
 
 fn normalized_story_text(input: &str) -> String {
@@ -2158,10 +2164,7 @@ fn summary_is_redundant(input: &str) -> bool {
     if trimmed.starts_with("status ")
         || trimmed.starts_with("exit ")
         || trimmed.starts_with("turn completed in ")
-        || trimmed.starts_with("done")
-        || trimmed.starts_with("i have ")
-        || trimmed.starts_with("i've ")
-        || trimmed.starts_with("i’ve ")
+        || (trimmed.starts_with("done") && !summary_has_work_context(input))
         || trimmed.starts_with("i'm ")
         || trimmed.starts_with("i’m ")
         || trimmed.starts_with("i'll ")
@@ -2255,7 +2258,10 @@ fn summary_is_redundant(input: &str) -> bool {
 }
 
 fn meaningful_summary(input: &str) -> bool {
-    !summary_is_redundant(input) && summary_has_work_context(input)
+    let normalized = normalized_story_text(input);
+    !summary_is_redundant(input)
+        && summary_has_work_context(input)
+        && !summary_is_operator_chatter(&normalized)
 }
 
 fn publishable_agent_summary_for_project(input: &str, project: Option<&str>) -> bool {
@@ -2282,7 +2288,7 @@ fn active_update_summary_for_project(input: &str, project: Option<&str>) -> bool
     }
     (summary_has_work_context(input)
         || summary_mentions_public_project(&normalized)
-        || project.is_some_and(project_is_public_signal))
+        || project.is_some_and(project_has_feed_context))
         && active_summary_has_release_outcome(input)
 }
 
@@ -2302,7 +2308,7 @@ fn active_progress_summary_for_project(input: &str, project: Option<&str>) -> bo
     }
     if !(summary_has_work_context(input)
         || summary_mentions_public_project(&normalized)
-        || project.is_some_and(project_is_public_signal))
+        || project.is_some_and(project_has_feed_context))
     {
         return false;
     }
@@ -2330,6 +2336,8 @@ fn active_progress_verb(normalized: &str) -> bool {
         "removes",
         "resolves",
         "supports",
+        "writes",
+        "written",
         "tracks",
         "validates",
         "verifies",
@@ -2501,10 +2509,14 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
         "failed",
         "failure",
         "fixed",
+        "finished",
+        "generated",
         "green",
         "landed",
         "missing",
+        "mismatch",
         "passed",
+        "present",
         "preflight",
         "publish",
         "published",
@@ -2521,6 +2533,7 @@ fn active_summary_has_release_outcome(input: &str) -> bool {
         "success",
         "turned green",
         "unblocked",
+        "written",
         "works",
     ]
     .iter()
@@ -2596,10 +2609,15 @@ fn project_is_public_signal(project: &str) -> bool {
     matches!(project, "burn_p2p" | "burn_dragon")
 }
 
+fn project_has_feed_context(project: &str) -> bool {
+    !project_is_generic_label(project)
+}
+
 fn summary_has_work_context(input: &str) -> bool {
     let lowered = input.to_ascii_lowercase();
     [
         "auth",
+        "artifact",
         "avatar",
         "aws",
         "browser",
@@ -2616,12 +2634,17 @@ fn summary_has_work_context(input: &str) -> bool {
         "diloco",
         "edge",
         "error",
+        "eval",
+        "export",
         "feed",
+        "generation",
         "github",
+        "glb",
         "guardrail",
         "identity",
         "install",
         "integration",
+        "inference",
         "logging",
         "mcp",
         "model",
@@ -2632,15 +2655,20 @@ fn summary_has_work_context(input: &str) -> bool {
         "p2p",
         "privacy",
         "publish",
+        "qualitative",
         "release",
+        "render",
+        "report",
         "readiness",
         "route",
+        "sample",
         "security",
         "story",
         "stream",
         "subscription",
         "summarization",
         "terraform",
+        "trellis",
         "training",
         "wasm",
         "webgpu",
@@ -2923,6 +2951,78 @@ mod tests {
         update.summary = Some(
             "The request body is useful: it shows the present failure mode is not just endpoint failed."
                 .to_string(),
+        );
+
+        assert!(compiler.ingest(update).is_empty());
+
+        assert!(compiler.flush().is_empty());
+    }
+
+    #[test]
+    fn concrete_project_inference_report_publishes_without_public_whitelist() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("gemma4_trellis2".to_string());
+        update.summary = Some(
+            "All 9 inference cases completed. The qualitative eval report was written with GLB previews and artifact counts."
+                .to_string(),
+        );
+
+        assert!(compiler.ingest(update).is_empty());
+        let stories = compiler.flush();
+
+        assert_eq!(
+            stories.len(),
+            1,
+            "{:?}",
+            compiler.diagnostics().last_decision
+        );
+        assert_eq!(stories[0].project.as_deref(), Some("gemma4_trellis2"));
+        assert!(
+            stories[0].deck.contains("inference cases completed")
+                || stories[0].headline.contains("inference cases completed")
+        );
+        assert!(
+            stories[0]
+                .chips
+                .iter()
+                .any(|chip| chip == "gemma4_trellis2")
+        );
+    }
+
+    #[test]
+    fn done_prefixed_report_update_is_not_dropped() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("gemma4_trellis2".to_string());
+        update.summary = Some(
+            "Done. The qualitative eval report is ready with all 9 GLB cases and render previews."
+                .to_string(),
+        );
+
+        assert!(compiler.ingest(update).is_empty());
+        let stories = compiler.flush();
+
+        assert_eq!(
+            stories.len(),
+            1,
+            "{:?}",
+            compiler.diagnostics().last_decision
+        );
+        assert_eq!(stories[0].project.as_deref(), Some("gemma4_trellis2"));
+        assert!(
+            stories[0].headline.contains("qualitative eval report")
+                || stories[0].deck.contains("qualitative eval report")
+        );
+    }
+
+    #[test]
+    fn non_whitelisted_project_status_polling_stays_quiet() {
+        let mut compiler = StoryCompiler::default();
+        let mut update = event(EventKind::AgentMessage, "codex posted an update");
+        update.project = Some("gemma4_trellis2".to_string());
+        update.summary = Some(
+            "No transition yet. The build is still running and I am checking again.".to_string(),
         );
 
         assert!(compiler.ingest(update).is_empty());
