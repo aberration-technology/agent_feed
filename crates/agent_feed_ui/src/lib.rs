@@ -443,7 +443,7 @@ mod tests {
         assert!(html.contains("function headlineMatchesFollowTarget"));
         assert!(html.contains("function renderFollowingTimeline"));
         assert!(html.contains("function toolbarFollowButton"));
-        assert!(html.contains("inactive: wildcard ? `follow @${route.login}` : \"follow feed\""));
+        assert!(html.contains("inactive: `follow ${followTargetLabel(target)}`"));
         assert!(html.contains("button.dataset.kind = \"follow\";"));
         assert!(html.contains("button.dataset.followTarget = normalizeFollowTarget(target);"));
         assert!(html.contains("function refreshAfterFollowingChange"));
@@ -476,12 +476,16 @@ mod tests {
         assert!(html.contains("function renderStageActions"));
         assert!(html.contains("function followTargetForBulletin"));
         assert!(html.contains("function personFollowTargetForBulletin"));
-        assert!(html.contains("followButton(personTarget"));
+        assert!(html.contains(
+            "const primaryTarget = primaryFollowTargetForTargets(personTarget, feedTarget);"
+        ));
+        assert!(html.contains("followButton(primaryTarget"));
         assert!(html.contains("following.textContent = \"open following\";"));
         assert!(html.contains("stageActions.appendChild(historyAction(remoteRoute));"));
         assert!(html.contains("link.textContent = \"history\";"));
         assert!(html.contains("body.controls-visible .stage-actions"));
         assert!(html.contains("button.setAttribute(\"aria-label\", `${active ? \"unfollow\" : \"follow\"} ${followTargetLabel(target)}`);"));
+        assert!(!html.contains("inactive: \"follow feed\""));
         assert!(!html.contains("activity is reduced before display"));
     }
 
@@ -538,9 +542,13 @@ mod tests {
         ));
         assert!(html.contains("const tagTargets = targets.filter(isTagFollowTarget);"));
         assert!(html.contains("followTargetMatchesLogin(target, login)"));
-        assert!(html.contains("followButton(personTarget"));
-        assert!(html.contains("followButton(target, {\n        inactive: \"follow feed\""));
+        assert!(html.contains("function primaryFollowTargetForTargets"));
+        assert!(html.contains(
+            "const primaryTarget = primaryFollowTargetForTargets(personTarget, target, route);"
+        ));
+        assert!(html.contains("followButton(primaryTarget"));
         assert!(html.contains("privateFeedPill(visibility)"));
+        assert!(!html.contains("following feed"));
         assert!(!html.contains("request access"));
         assert!(!html.contains("access pending"));
     }

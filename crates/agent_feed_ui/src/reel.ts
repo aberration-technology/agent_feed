@@ -336,30 +336,22 @@ function renderStageActions(bulletin) {
     return;
   }
   let added = false;
-  if (personTarget) {
+  const primaryTarget = primaryFollowTargetForTargets(personTarget, feedTarget);
+  if (primaryTarget) {
     stageActions.appendChild(
-      followButton(personTarget, {
-        inactive: `follow ${followTargetLabel(personTarget)}`,
-        active: `following ${followTargetLabel(personTarget)}`,
+      followButton(primaryTarget, {
+        inactive: `follow ${followTargetLabel(primaryTarget)}`,
+        active: `following ${followTargetLabel(primaryTarget)}`,
       }),
     );
     added = true;
   }
-  if (feedTarget && feedTarget !== personTarget) {
-    stageActions.appendChild(
-      followButton(feedTarget, {
-        inactive: "follow feed",
-        active: "following feed",
-      }),
-    );
-    added = true;
-  }
-  if (personTarget || feedTarget) {
+  if (primaryTarget) {
     const following = document.createElement("a");
     following.className = "feed-action";
-    following.href = followingTargetUrl(personTarget || feedTarget);
+    following.href = followingTargetUrl(primaryTarget);
     following.textContent = "open following";
-    following.setAttribute("aria-label", `open followed feed ${followTargetLabel(personTarget || feedTarget)}`);
+    following.setAttribute("aria-label", `open followed feed ${followTargetLabel(primaryTarget)}`);
     stageActions.appendChild(following);
     added = true;
   }
@@ -3630,10 +3622,9 @@ function toolbarFollowButton(route) {
   if (!target) {
     return undefined;
   }
-  const wildcard = target.endsWith("/*");
   const button = followButton(target, {
-    inactive: wildcard ? `follow @${route.login}` : "follow feed",
-    active: wildcard ? `following @${route.login}` : "following feed",
+    inactive: `follow ${followTargetLabel(target)}`,
+    active: `following ${followTargetLabel(target)}`,
   });
   button.dataset.kind = "follow";
   return button;
@@ -3648,20 +3639,13 @@ function timelineActions(feed, route) {
     actions.appendChild(tagFollowButton(project));
   }
   const personTarget = personFollowTargetFor(feed, route);
-  if (personTarget) {
-    actions.appendChild(
-      followButton(personTarget, {
-        inactive: `follow ${followTargetLabel(personTarget)}`,
-        active: `following ${followTargetLabel(personTarget)}`,
-      }),
-    );
-  }
   const target = followTargetFor(feed, route);
-  if (target && target !== personTarget) {
+  const primaryTarget = primaryFollowTargetForTargets(personTarget, target, route);
+  if (primaryTarget) {
     actions.appendChild(
-      followButton(target, {
-        inactive: "follow feed",
-        active: "following feed",
+      followButton(primaryTarget, {
+        inactive: `follow ${followTargetLabel(primaryTarget)}`,
+        active: `following ${followTargetLabel(primaryTarget)}`,
       }),
     );
   }
@@ -3739,6 +3723,16 @@ function personFollowTargetFor(feed, route) {
     route.login ||
     "";
   return login ? normalizeFollowTarget(`${login}/*`) : "";
+}
+
+function primaryFollowTargetForTargets(personTarget, feedTarget, route = remoteRoute) {
+  const normalizedPerson = normalizeFollowTarget(personTarget);
+  const normalizedFeed = normalizeFollowTarget(feedTarget);
+  const routeFeed = route?.feed && route.feed !== "*" ? normalizeFeedLabel(route.feed) : "";
+  if (routeFeed && normalizedFeed && !normalizedFeed.endsWith("/*")) {
+    return normalizedFeed;
+  }
+  return normalizedPerson || normalizedFeed;
 }
 
 function followTargetForBulletin(bulletin) {
