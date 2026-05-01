@@ -13,7 +13,7 @@
   --sans: ui-monospace, monospace;
   --mono: ui-monospace, monospace;
   --pad: clamp(28px, 4vw, 72px);
-  --headline: clamp(56px, 7.5vw, 128px);
+  --headline: clamp(52px, 7vw, 116px);
   --headline-leading: 1.16;
   --deck: clamp(24px, 2.7vw, 44px);
   --deck-leading: 1.16;

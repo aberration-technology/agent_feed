@@ -151,6 +151,7 @@ mod tests {
     fn headline_typography_keeps_safe_line_spacing() {
         let html = render_index_with_config(Some("stage"), &config(false));
 
+        assert!(html.contains("--headline: clamp(52px, 7vw, 116px);"));
         assert!(html.contains("--headline-leading: 1.16;"));
         assert!(html.contains("--deck-leading: 1.16;"));
         assert!(html.contains("h1 {\n  width: 100%;\n  min-width: 0;"));
