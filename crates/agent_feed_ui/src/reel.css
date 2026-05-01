@@ -13,9 +13,9 @@
   --sans: ui-monospace, monospace;
   --mono: ui-monospace, monospace;
   --pad: clamp(28px, 4vw, 72px);
-  --headline: clamp(52px, 7vw, 116px);
+  --headline: clamp(50px, 6.8vw, 110px);
   --headline-leading: 1.16;
-  --deck: clamp(24px, 2.7vw, 44px);
+  --deck: clamp(23px, 2.55vw, 40px);
   --deck-leading: 1.16;
   --label: clamp(11px, 1vw, 15px);
   --stage-gap: clamp(18px, 3vh, 34px);
@@ -696,9 +696,9 @@ body[data-mode="breaking"] .chips span {
 @media (max-width: 720px) {
   :root {
     --pad: 28px;
-    --headline: 28px;
+    --headline: 27px;
     --headline-leading: 1.28;
-    --deck: 16px;
+    --deck: 15px;
     --deck-leading: 1.26;
     --history-toolbar: 116px;
     --history-headline: clamp(24px, 8vw, 36px);

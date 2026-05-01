@@ -151,8 +151,9 @@ mod tests {
     fn headline_typography_keeps_safe_line_spacing() {
         let html = render_index_with_config(Some("stage"), &config(false));
 
-        assert!(html.contains("--headline: clamp(52px, 7vw, 116px);"));
+        assert!(html.contains("--headline: clamp(50px, 6.8vw, 110px);"));
         assert!(html.contains("--headline-leading: 1.16;"));
+        assert!(html.contains("--deck: clamp(23px, 2.55vw, 40px);"));
         assert!(html.contains("--deck-leading: 1.16;"));
         assert!(html.contains("h1 {\n  width: 100%;\n  min-width: 0;"));
         assert!(html.contains("--headline-max: min(100%, 28ch);"));
@@ -179,9 +180,9 @@ mod tests {
             .nth(1)
             .expect("mobile breakpoint is embedded");
 
-        assert!(mobile.contains("--headline: 28px;"));
+        assert!(mobile.contains("--headline: 27px;"));
         assert!(mobile.contains("--headline-leading: 1.28;"));
-        assert!(mobile.contains("--deck: 16px;"));
+        assert!(mobile.contains("--deck: 15px;"));
         assert!(mobile.contains("--deck-leading: 1.26;"));
         assert!(html.contains(".reel {\n  width: 100vw;\n  max-width: 100vw;"));
         assert!(mobile.contains("height: 100svh;"));
