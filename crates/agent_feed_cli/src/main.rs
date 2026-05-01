@@ -3918,7 +3918,7 @@ mod tests {
                         "role": "assistant",
                         "content": [{
                             "type": "text",
-                            "text": "Browser feed discovery now follows signed story streams so public viewers can see live publisher work."
+                            "text": "agent_feed browser feed discovery now follows signed story streams so public viewers can see live publisher work."
                         }]
                     }
                 }),

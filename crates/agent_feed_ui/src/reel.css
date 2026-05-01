@@ -14,7 +14,7 @@
   --mono: ui-monospace, monospace;
   --pad: clamp(28px, 4vw, 72px);
   --headline: clamp(56px, 7.5vw, 128px);
-  --headline-leading: 1.08;
+  --headline-leading: 1.16;
   --deck: clamp(24px, 2.7vw, 44px);
   --deck-leading: 1.16;
   --label: clamp(11px, 1vw, 15px);
@@ -697,7 +697,7 @@ body[data-mode="breaking"] .chips span {
   :root {
     --pad: 28px;
     --headline: 28px;
-    --headline-leading: 1.22;
+    --headline-leading: 1.28;
     --deck: 16px;
     --deck-leading: 1.26;
     --history-toolbar: 116px;

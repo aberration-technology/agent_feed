@@ -1748,7 +1748,10 @@ fn local_story_fallback_allowed(request: &SummaryRequest, output: &ProcessorSumm
         return false;
     }
     let combined = normalize_text(&format!("{} {}", story.headline, story.deck));
-    !combined.is_empty() && !public_copy_has_banned_terms(&combined)
+    !combined.is_empty()
+        && !public_copy_has_banned_terms(&combined)
+        && !is_no_change_public_copy(&combined)
+        && !is_operational_status_without_public_impact(&combined)
 }
 
 fn representative_story(request: &SummaryRequest) -> Option<&CompiledStory> {
@@ -2584,18 +2587,6 @@ fn apply_publish_decision(
         nearest_relation,
         StoryUpdateRelation::StateChanged | StoryUpdateRelation::ImpactChanged
     );
-    if summary.metadata.publish_action == PublishAction::SkipProcessor {
-        if summary.metadata.processor == "codex-memory" && changed_update {
-            summary.metadata.publish_action = PublishAction::Publish;
-            summary.metadata.publish_reason = format!(
-                "codex-memory skip overridden because the same topic {}",
-                nearest_relation.as_str()
-            );
-        } else {
-            return false;
-        }
-    }
-
     let exact_text_repeat = nearest.is_some() && nearest_headline == 100 && nearest_deck == 100;
     let duplicate = exact_text_repeat
         || (nearest.is_some()
@@ -2605,12 +2596,42 @@ fn apply_publish_decision(
             )
             && nearest_headline >= policy.max_headline_similarity
             && nearest_deck >= policy.max_deck_similarity_when_headline_matches);
+    let distinct_new_topic = nearest.is_none()
+        || matches!(nearest_relation, StoryUpdateRelation::NewTopic)
+        || nearest_headline < policy.max_headline_similarity
+        || nearest_deck < policy.max_deck_similarity_when_headline_matches;
     if duplicate {
         summary.metadata.publish_action = PublishAction::SkipDuplicate;
         summary.metadata.publish_reason = format!(
             "headline did not meaningfully change from a recent published summary (headline similarity {nearest_headline}, deck similarity {nearest_deck})"
         );
         return false;
+    }
+
+    if summary.metadata.publish_action == PublishAction::SkipProcessor {
+        if summary.metadata.processor == "codex-memory"
+            && summary.score >= 76
+            && !duplicate
+            && (changed_update || distinct_new_topic)
+        {
+            summary.metadata.publish_action = PublishAction::Publish;
+            summary.metadata.publish_reason = if changed_update {
+                format!(
+                    "codex-memory skip overridden because the same topic {}",
+                    nearest_relation.as_str()
+                )
+            } else if nearest.is_some() {
+                format!(
+                    "codex-memory skip overridden because the summary is a distinct story update (nearest headline similarity {nearest_headline}, deck similarity {nearest_deck})"
+                )
+            } else {
+                "codex-memory skip overridden because there is no recent matching feed summary"
+                    .to_string()
+            };
+            return true;
+        } else {
+            return false;
+        }
     }
 
     if summary.score >= policy.severe_score_bypass {
@@ -2678,14 +2699,31 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
 fn is_no_change_public_copy(normalized: &str) -> bool {
     [
         "no public impact change",
+        "no public story change",
+        "no public story delta",
+        "no public outcome shift",
         "no public facing outcome",
         "no public facing delta",
         "no newly reported shift",
+        "no new final outcome",
+        "no new outcome",
+        "no final outcome",
         "no notable public shift",
+        "no shift in public outcome",
+        "no shift in public story",
         "no meaningful feed change",
         "no meaningful headline change",
+        "public outcome remains unchanged",
+        "public story remains unchanged",
         "does not change outcome",
         "does not alter public outcome",
+        "checks remain monitored",
+        "release checks remain monitored",
+        "remains in monitoring",
+        "remain in monitoring",
+        "still in flight without a new",
+        "same public outcome",
+        "same public story",
         "remains in the same holding state",
         "remain in the same holding state",
         "same holding state",
@@ -4421,6 +4459,129 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert_eq!(summaries[0].metadata.publish_action, PublishAction::Publish);
     }
 
+    struct PublicStoryDeltaDecliningProcessor;
+
+    impl SummaryProcessor for PublicStoryDeltaDecliningProcessor {
+        fn name(&self) -> &str {
+            "public-story-delta-declining"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "burn_p2p remains in the existing release lane".to_string(),
+                deck: "no public story delta is visible yet.".to_string(),
+                lower_third: Some("codex-memory · redacted".to_string()),
+                chips: vec!["burn_p2p".to_string(), "redacted".to_string()],
+                publish: Some(false),
+                publish_reason: Some("no public story delta from the prior summary".to_string()),
+                memory_digest: Some("processor declined as unchanged".to_string()),
+                semantic_fingerprint: Some("unchanged:burn-p2p".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn codex_memory_decline_with_public_story_delta_phrase_uses_safe_local_story() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let mut story = public_project_story("burn_p2p", 84);
+        story.headline = "burn_p2p release checks now cover browser discovery paths".to_string();
+        story.deck =
+            "wasm route canaries and p2p snapshot checks are being verified together.".to_string();
+
+        let summaries = summarize_feed_with_processor(
+            "github:35904762:workstation",
+            &[story],
+            &config,
+            &PublicStoryDeltaDecliningProcessor,
+        )
+        .expect("safe local fallback compiles");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].headline,
+            "burn_p2p release checks now cover browser discovery paths"
+        );
+        assert_eq!(summaries[0].metadata.publish_action, PublishAction::Publish);
+    }
+
+    struct MonitoringNoOutcomeProcessor {
+        publish: Option<bool>,
+    }
+
+    impl SummaryProcessor for MonitoringNoOutcomeProcessor {
+        fn name(&self) -> &str {
+            "monitoring-no-outcome"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "release checks remain monitored with no new outcome".to_string(),
+                deck: "workflow state is still in flight without a new final outcome.".to_string(),
+                lower_third: Some("codex-memory · redacted".to_string()),
+                chips: vec!["release".to_string(), "redacted".to_string()],
+                publish: self.publish,
+                publish_reason: Some("no new final outcome".to_string()),
+                memory_digest: Some("monitoring continues".to_string()),
+                semantic_fingerprint: Some("monitoring:no-outcome".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn p2p_summary_rejects_monitoring_without_new_outcome() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut story = public_project_story("burn_dragon", 80);
+        story.headline = "burn_dragon release checks are being monitored".to_string();
+        story.deck =
+            "workflow state is being checked before a final outcome is available.".to_string();
+
+        let summaries = summarize_feed_with_processor(
+            "github:35904762:workstation",
+            &[story],
+            &config,
+            &MonitoringNoOutcomeProcessor {
+                publish: Some(true),
+            },
+        )
+        .expect("monitoring summary evaluates");
+
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn codex_memory_decline_does_not_fallback_to_monitoring_story() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let mut story = public_project_story("burn_dragon", 80);
+        story.headline = "burn_dragon release checks are being monitored".to_string();
+        story.deck =
+            "workflow state is being checked; no new final outcome has landed yet.".to_string();
+
+        let summaries = summarize_feed_with_processor(
+            "github:35904762:workstation",
+            &[story],
+            &config,
+            &MonitoringNoOutcomeProcessor {
+                publish: Some(false),
+            },
+        )
+        .expect("monitoring fallback evaluates");
+
+        assert!(summaries.is_empty());
+    }
+
     struct DecliningStateUpdateProcessor;
 
     impl SummaryProcessor for DecliningStateUpdateProcessor {
@@ -4478,6 +4639,143 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         ));
         assert_eq!(summary.metadata.update_relation, "state_changed");
         assert_eq!(summary.metadata.publish_action, PublishAction::Publish);
+    }
+
+    struct DistinctNewTopicDecliningProcessor;
+
+    impl SummaryProcessor for DistinctNewTopicDecliningProcessor {
+        fn name(&self) -> &str {
+            "distinct-new-topic-declining"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "burn_p2p browser route canary starts covering feed discovery"
+                    .to_string(),
+                deck: "deep links now exercise user resolution, snapshot fallback, and live feed discovery.".to_string(),
+                lower_third: Some("codex-memory · burn_p2p · score 84 · redacted".to_string()),
+                chips: vec![
+                    "burn_p2p".to_string(),
+                    "browser".to_string(),
+                    "score 84".to_string(),
+                    "redacted".to_string(),
+                ],
+                publish: Some(false),
+                publish_reason: Some("processor declined this update".to_string()),
+                memory_digest: Some(
+                    "browser discovery canary is a distinct new release-readiness thread"
+                        .to_string(),
+                ),
+                semantic_fingerprint: Some("burn-p2p:browser-discovery:canary".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn codex_memory_skip_is_overridden_for_distinct_new_topic() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let request = SummaryRequest {
+            feed_id: "local:workstation".to_string(),
+            mode: FeedSummaryMode::PerStory,
+            stories: vec![public_project_story("burn_p2p", 84)],
+            recent_summaries: vec![RecentSummary {
+                headline: "agent_feed local capture now follows active codex sessions".to_string(),
+                deck: "transcript watchers imported future turn events from three workspaces."
+                    .to_string(),
+                story_family: StoryFamily::Test,
+                score: 82,
+            }],
+            prompt_style: None,
+            max_prompt_chars: None,
+            branch: None,
+            session_hint: None,
+        };
+        let mut summary = summarize_request_with_processor(
+            &request,
+            &config,
+            &DistinctNewTopicDecliningProcessor,
+        )
+        .expect("declining processor returns a safe distinct story");
+
+        assert!(apply_publish_decision(
+            &mut summary,
+            &request,
+            &config.publish
+        ));
+        assert_eq!(summary.metadata.update_relation, "new_topic");
+        assert_eq!(summary.metadata.publish_action, PublishAction::Publish);
+        assert!(
+            summary
+                .metadata
+                .publish_reason
+                .contains("codex-memory skip overridden")
+        );
+    }
+
+    struct ExactRepeatDecliningProcessor;
+
+    impl SummaryProcessor for ExactRepeatDecliningProcessor {
+        fn name(&self) -> &str {
+            "exact-repeat-declining"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "browser canary changes deployment status".to_string(),
+                deck: "browser canary is passing and deployment is live.".to_string(),
+                lower_third: Some("codex-memory · redacted".to_string()),
+                chips: vec!["browser".to_string(), "deployment".to_string()],
+                publish: Some(false),
+                publish_reason: Some("processor declined exact repeat".to_string()),
+                memory_digest: Some("exact repeat".to_string()),
+                semantic_fingerprint: Some("browser-canary:deployment:live".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn codex_memory_skip_still_suppresses_exact_duplicate() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let request = SummaryRequest {
+            feed_id: "local:workstation".to_string(),
+            mode: FeedSummaryMode::PerStory,
+            stories: vec![verified_story(84)],
+            recent_summaries: vec![RecentSummary {
+                headline: "browser canary changes deployment status".to_string(),
+                deck: "browser canary is passing and deployment is live.".to_string(),
+                story_family: StoryFamily::Test,
+                score: 82,
+            }],
+            prompt_style: None,
+            max_prompt_chars: None,
+            branch: None,
+            session_hint: None,
+        };
+        let mut summary =
+            summarize_request_with_processor(&request, &config, &ExactRepeatDecliningProcessor)
+                .expect("declining processor returns a duplicate story");
+
+        assert!(!apply_publish_decision(
+            &mut summary,
+            &request,
+            &config.publish
+        ));
+        assert_eq!(
+            summary.metadata.publish_action,
+            PublishAction::SkipDuplicate
+        );
     }
 
     struct StaticImageProcessor {

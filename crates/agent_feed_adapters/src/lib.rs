@@ -40,8 +40,13 @@ fn project_label_from_cwd(cwd: &str) -> Option<String> {
 }
 
 fn normalized_project_label(label: &str) -> String {
-    if label.to_ascii_lowercase().starts_with("agent_reel") {
+    let normalized = label.to_ascii_lowercase();
+    if normalized.starts_with("agent_reel") || normalized.starts_with("agent_feed") {
         "agent_feed".to_string()
+    } else if normalized.starts_with("burn_p2p") {
+        "burn_p2p".to_string()
+    } else if normalized.starts_with("burn_dragon") {
+        "burn_dragon".to_string()
     } else {
         label.to_string()
     }
@@ -464,6 +469,11 @@ pub mod codex {
         if !state.remember_message(&summary) {
             return None;
         }
+        if let Some(project) = project_from_text(&summary)
+            && !is_generic_root_project(&project)
+        {
+            state.active_project = Some(project);
+        }
         Some(build_event(
             state,
             timestamp,
@@ -861,15 +871,20 @@ pub mod codex {
                 | EventKind::SummaryCreated
         );
         let cwd_project = event.cwd.as_deref().and_then(project_from_cwd);
+        let concrete_cwd_project = cwd_project
+            .clone()
+            .filter(|project| !is_generic_root_project(project));
         event.project = if prefer_text_project {
             context_project
                 .clone()
-                .or_else(|| cwd_project.clone())
+                .or_else(|| concrete_cwd_project.clone())
                 .or_else(|| state.active_project.clone())
+                .or_else(|| cwd_project.clone())
                 .or_else(|| state.project.clone())
         } else {
-            cwd_project
+            concrete_cwd_project
                 .or_else(|| state.active_project.clone())
+                .or_else(|| cwd_project.clone())
                 .or_else(|| state.project.clone())
                 .or_else(|| context_project.clone())
         };
