@@ -854,9 +854,13 @@ function renderAuthRequired(route) {
   renderRemoteState(route, "auth-required", [
     "github sign-in required",
     route.kind === "org" ? "private org feeds need github org authorization" : "private feeds need a signed browser session",
-    route.kind === "org" ? `authorize access to ${route.org || route.login}` : "open /network to sign in",
+    route.kind === "org" ? `authorize access to ${route.org || route.login}` : "sign in to continue",
   ]);
-  setAuthAction(browserSignInUrl(window.location.href, route.kind === "org" ? route.org || route.login : undefined), "sign in with github");
+  setAuthAction(
+    browserSignInUrl(window.location.href, route.kind === "org" ? route.org || route.login : undefined),
+    route.kind === "org" ? `sign in for ${route.org || route.login}` : "sign in with github",
+    true,
+  );
 }
 
 function renderChips(nextChips) {

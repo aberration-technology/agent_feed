@@ -539,6 +539,8 @@ mod tests {
         assert!(html.contains("private org feeds need github org authorization"));
         assert!(html.contains("params.set(\"scope\", \"read:user read:org\");"));
         assert!(html.contains("function startOrgRoute"));
+        assert!(html.contains("route.kind === \"org\" ? `sign in for ${route.org || route.login}` : \"sign in with github\""));
+        assert!(html.contains("true,\n  );"));
     }
 
     #[test]
