@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(45);
 const PROCESSOR_MAX_OUTPUT_BYTES: usize = 128 * 1024;
 const HTTP_MAX_RESPONSE_BYTES: usize = 128 * 1024;
+const PROCESSOR_PROMPT_RECENT_LIMIT: usize = 8;
+const PROCESSOR_PROMPT_STORY_LINE_CHARS: usize = 420;
+const PROCESSOR_PROMPT_RECENT_LINE_CHARS: usize = 320;
 pub const DEFAULT_CODEX_SUMMARY_MODEL: &str = "gpt-5.3-codex-spark";
 
 #[derive(Debug, thiserror::Error)]
@@ -1747,11 +1750,41 @@ fn local_story_fallback_allowed(request: &SummaryRequest, output: &ProcessorSumm
     if !processor_declined_as_no_change {
         return false;
     }
-    let combined = normalize_text(&format!("{} {}", story.headline, story.deck));
-    !combined.is_empty()
-        && !public_copy_has_banned_terms(&combined)
-        && !is_no_change_public_copy(&combined)
-        && !is_operational_status_without_public_impact(&combined)
+    story_has_public_outcome(story)
+        && story_is_distinct_from_recent(story, &request.recent_summaries)
+}
+
+fn story_is_distinct_from_recent(
+    story: &CompiledStory,
+    recent_summaries: &[RecentSummary],
+) -> bool {
+    let candidate = story_update_signature(&story.headline, &story.deck);
+    for recent in recent_summaries.iter().take(PROCESSOR_PROMPT_RECENT_LIMIT) {
+        if recent.story_family != story.family {
+            continue;
+        }
+        let relation = story_update_relation(
+            &candidate,
+            &story_update_signature(&recent.headline, &recent.deck),
+        );
+        let headline_score = headline_similarity(&story.headline, &recent.headline);
+        if headline_score == 100
+            && !matches!(
+                relation,
+                StoryUpdateRelation::StateChanged | StoryUpdateRelation::ImpactChanged
+            )
+        {
+            return false;
+        }
+        if matches!(
+            relation,
+            StoryUpdateRelation::ExactRepeat | StoryUpdateRelation::SameState
+        ) && headline_score >= 80
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn representative_story(request: &SummaryRequest) -> Option<&CompiledStory> {
@@ -2588,7 +2621,10 @@ fn apply_publish_decision(
         StoryUpdateRelation::StateChanged | StoryUpdateRelation::ImpactChanged
     );
     let exact_text_repeat = nearest.is_some() && nearest_headline == 100 && nearest_deck == 100;
+    let exact_headline_without_state_change =
+        nearest.is_some() && nearest_headline == 100 && !changed_update;
     let duplicate = exact_text_repeat
+        || exact_headline_without_state_change
         || (nearest.is_some()
             && matches!(
                 nearest_relation,
@@ -2697,8 +2733,27 @@ fn is_generic_or_low_signal_summary(summary: &FeedSummary) -> bool {
 }
 
 fn is_no_change_public_copy(normalized: &str) -> bool {
+    if [
+        r"\bno\s+(?:new\s+)?public\s+(?:outcome|story|impact|facing\s+outcome|facing\s+delta)\s+(?:change|delta|shift|landed|introduced|visible|surfaced|reported)\b",
+        r"\bno\s+(?:new\s+)?public\s+outcome\s+(?:was\s+)?(?:introduced|landed|reported|visible|surfaced)\b",
+        r"\bno\s+new\s+public\s+signal\b",
+        r"\bno\s+additional\s+status\s+shift\b",
+        r"\b(?:public\s+)?(?:outcome|status|posture|baseline|telemetry)\s+(?:remain|remains|remained|is|was)\s+(?:unchanged|the\s+same)\b",
+        r"\bstalled\s+baseline(?:\s+telemetry)?\s+unchanged\b",
+        r"\bopen\s+turn\s+paired\s+lane\s+verification\b",
+        r"\bopen\s+turn\s+verification\s+posture\s+remains\b",
+    ]
+    .iter()
+    .any(|pattern| {
+        Regex::new(pattern)
+            .expect("no-change public copy regex is valid")
+            .is_match(normalized)
+    }) {
+        return true;
+    }
     [
         "no public impact change",
+        "no public outcome change",
         "no public story change",
         "no public story delta",
         "no public outcome shift",
@@ -2715,6 +2770,7 @@ fn is_no_change_public_copy(normalized: &str) -> bool {
         "no meaningful headline change",
         "public outcome remains unchanged",
         "public story remains unchanged",
+        "remains unchanged in this interval",
         "does not change outcome",
         "does not alter public outcome",
         "checks remain monitored",
@@ -2727,6 +2783,12 @@ fn is_no_change_public_copy(normalized: &str) -> bool {
         "remains in the same holding state",
         "remain in the same holding state",
         "same holding state",
+        "paired-lane open-turn verification remains",
+        "paired lane open turn verification remains",
+        "paired checks continue",
+        "baseline telemetry is unchanged",
+        "baseline telemetry remains stalled",
+        "stalled baseline telemetry",
         "existing verification and readiness posture remains",
         "all observed streams remain",
     ]
@@ -2822,6 +2884,7 @@ fn has_public_outcome_context(normalized: &str) -> bool {
 
 fn public_copy_has_banned_terms(normalized: &str) -> bool {
     [
+        "no public outcome change",
         "production scaffold",
         "production flow",
         "agent feed scaffold",
@@ -2843,6 +2906,10 @@ fn public_copy_has_banned_terms(normalized: &str) -> bool {
         "shifts feed to edits",
         "settles run state",
         "codexci statusrun state",
+        "open turn paired lane",
+        "paired-lane open-turn",
+        "paired lane verification",
+        "stalled baseline telemetry",
     ]
     .iter()
     .any(|needle| normalized.contains(needle))
@@ -2953,43 +3020,91 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         .max_prompt_chars
         .unwrap_or(DEFAULT_SUMMARY_PROMPT_MAX_CHARS)
         .max(512);
-    let stories = request
-        .stories
-        .iter()
-        .map(|story| {
-            format!(
-                "- project={} agent={} family={:?} score={} headline={} deck={}",
-                story.project.as_deref().unwrap_or("none"),
-                story.agent,
-                story.family,
-                story.score,
-                story.headline,
-                story.deck
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let recent = request
-        .recent_summaries
-        .iter()
-        .map(|summary| {
-            format!(
-                "- family={:?} score={} headline={} deck={}",
-                summary.story_family, summary.score, summary.headline, summary.deck
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let stories = prompt_story_lines(request);
+    let recent = prompt_recent_lines(request);
+    let long_instructions = format!(
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. The current stories block is authoritative; recent_published is duplicate memory only. Set publish=false when the current stories do not change the public story, or when they only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Never publish a headline or deck whose main message is no public outcome change, unchanged posture, stalled baseline telemetry, or waiting for final outcome. If the same topic moved from blocked to fixed, failing to passing, planned to implemented, unavailable to available, local-only to public/live, or degraded to recovered, publish a compact update. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\nstories:\n{}",
+        request.feed_id, request.mode, stories
+    );
+    let compact_instructions = || {
+        format!(
+            "{INTERNAL_SUMMARIZER_MARKER}\nReturn JSON: headline, deck, lower_third, chips, optional publish/publish_reason. Current stories are authoritative; recent_published is duplicate memory only. Set publish=false for no-change, unchanged posture, stalled telemetry, waiting-for-final-outcome, or agent mechanics without product/user/operator impact. Style: {style}.\nfeed={}\nmode={:?}\nstories:\n{}",
+            request.feed_id, request.mode, stories
+        )
+    };
+    let instructions = if long_instructions.chars().count()
+        > max_prompt_chars.saturating_sub(PROCESSOR_PROMPT_RECENT_LINE_CHARS)
+    {
+        compact_instructions()
+    } else {
+        long_instructions
+    };
     let recent = if recent.is_empty() {
         "recent_published=none".to_string()
     } else {
         format!("recent_published:\n{recent}")
     };
-    let prompt = format!(
-        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. Set publish=false only when the topic and public outcome are unchanged from recent published summaries, or when the facts only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. If the same topic moved from blocked to fixed, failing to passing, planned to implemented, unavailable to available, local-only to public/live, or degraded to recovered, publish a compact update. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\n{}\nstories:\n{}",
-        request.feed_id, request.mode, recent, stories
-    );
-    clamp_chars(&prompt, max_prompt_chars)
+    let mut prompt = format!("{instructions}\n{recent}");
+    if prompt.chars().count() <= max_prompt_chars {
+        return prompt;
+    }
+
+    let recent_budget = max_prompt_chars.saturating_sub(instructions.chars().count() + 1);
+    let recent = if recent_budget >= 160 {
+        clamp_chars(&recent, recent_budget)
+    } else {
+        "recent_published=trimmed_to_preserve_current_stories".to_string()
+    };
+    prompt = format!("{instructions}\n{recent}");
+    if prompt.chars().count() <= max_prompt_chars {
+        return prompt;
+    }
+
+    clamp_chars(&instructions, max_prompt_chars)
+}
+
+fn prompt_story_lines(request: &SummaryRequest) -> String {
+    let lines = request
+        .stories
+        .iter()
+        .map(|story| {
+            clamp_chars(
+                &format!(
+                    "- project={} agent={} family={:?} score={} headline={} deck={}",
+                    story.project.as_deref().unwrap_or("none"),
+                    story.agent,
+                    story.family,
+                    story.score,
+                    story.headline,
+                    story.deck
+                ),
+                PROCESSOR_PROMPT_STORY_LINE_CHARS,
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        "none".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn prompt_recent_lines(request: &SummaryRequest) -> String {
+    request
+        .recent_summaries
+        .iter()
+        .take(PROCESSOR_PROMPT_RECENT_LIMIT)
+        .map(|summary| {
+            clamp_chars(
+                &format!(
+                    "- family={:?} score={} headline={} deck={}",
+                    summary.story_family, summary.score, summary.headline, summary.deck
+                ),
+                PROCESSOR_PROMPT_RECENT_LINE_CHARS,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn image_processor_prompt(request: &ImageRequest) -> String {
@@ -3969,6 +4084,44 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
     }
 
     #[test]
+    fn processor_prompt_preserves_current_stories_before_recent_history() {
+        let mut request = SummaryRequest::new(
+            "github:35904762:workstation",
+            FeedSummaryMode::FeedRollup,
+            vec![public_project_story("burn_dragon", 88)],
+        );
+        request.stories[0].headline =
+            "burn_dragon browser peer handoff recovers for public viewers".to_string();
+        request.stories[0].deck =
+            "webrtc bootstrap and edge snapshot paths now converge on the same live feed."
+                .to_string();
+        request.max_prompt_chars = Some(1400);
+        request.recent_summaries = (0..24)
+            .map(|index| RecentSummary {
+                headline: format!("local wasm smoke passed as well {index}"),
+                deck: "no public outcome change; paired-lane open-turn verification remains unchanged."
+                    .to_string(),
+                story_family: StoryFamily::Turn,
+                score: 76,
+            })
+            .collect();
+
+        let prompt = processor_prompt(&request);
+
+        assert!(prompt.chars().count() <= 1400);
+        assert!(prompt.contains("stories:\n- project=burn_dragon"));
+        assert!(prompt.contains("browser peer handoff recovers"));
+        assert!(prompt.contains("recent_published"));
+        assert!(
+            prompt.find("stories:").expect("stories block")
+                < prompt
+                    .rfind("\nrecent_published")
+                    .expect("recent block after stories")
+        );
+        assert!(!prompt.contains("local wasm smoke passed as well 23"));
+    }
+
+    #[test]
     fn external_processor_request_redacts_context_and_recent_history() {
         let config = SummaryConfig::p2p_default();
         let mut request = SummaryRequest::new(
@@ -4413,10 +4566,10 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             &request,
             &config.publish
         ));
-        assert_eq!(
+        assert!(matches!(
             summary.metadata.publish_action,
-            PublishAction::SkipProcessor
-        );
+            PublishAction::SkipProcessor | PublishAction::SkipDuplicate
+        ));
     }
 
     #[test]
@@ -4555,6 +4708,47 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(summaries.is_empty());
     }
 
+    struct NoPublicOutcomeChangeProcessor;
+
+    impl SummaryProcessor for NoPublicOutcomeChangeProcessor {
+        fn name(&self) -> &str {
+            "no-public-outcome-change"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "local wasm smoke passed as well".to_string(),
+                deck: "no public outcome change; the release remains in open-turn paired-lane verification with stalled baseline telemetry unchanged."
+                    .to_string(),
+                lower_third: Some("codex-memory · redacted".to_string()),
+                chips: vec!["burn_p2p".to_string(), "wasm-smoke".to_string()],
+                publish: Some(true),
+                publish_reason: Some("processor thought this was publishable".to_string()),
+                memory_digest: Some("no public outcome change".to_string()),
+                semantic_fingerprint: Some("wasm-smoke:no-change".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn p2p_summary_rejects_live_no_public_outcome_change_variant() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        let mut story = public_project_story("burn_p2p", 82);
+        story.headline = "local wasm smoke passed as well".to_string();
+        story.deck = "all browser training smoke tests completed.".to_string();
+
+        let summaries = summarize_feed_with_processor(
+            "github:35904762:workstation",
+            &[story],
+            &config,
+            &NoPublicOutcomeChangeProcessor,
+        )
+        .expect("no-change variant evaluates");
+
+        assert!(summaries.is_empty());
+    }
+
     #[test]
     fn codex_memory_decline_does_not_fallback_to_monitoring_story() {
         let mut config = SummaryConfig::p2p_default();
@@ -4580,6 +4774,72 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         .expect("monitoring fallback evaluates");
 
         assert!(summaries.is_empty());
+    }
+
+    struct DecliningRepeatedNoChangeProcessor;
+
+    impl SummaryProcessor for DecliningRepeatedNoChangeProcessor {
+        fn name(&self) -> &str {
+            "declining-repeated-no-change"
+        }
+
+        fn summarize(&self, _request: &SummaryRequest) -> Result<ProcessorSummary, SummaryError> {
+            Ok(ProcessorSummary {
+                headline: "no public outcome change".to_string(),
+                deck:
+                    "baseline telemetry remains stalled and the same verification posture remains."
+                        .to_string(),
+                lower_third: Some("codex-memory · redacted".to_string()),
+                chips: vec!["burn_p2p".to_string(), "redacted".to_string()],
+                publish: Some(false),
+                publish_reason: Some("no public outcome change".to_string()),
+                memory_digest: Some("same stale wasm smoke state".to_string()),
+                semantic_fingerprint: Some("wasm-smoke:no-change".to_string()),
+            })
+        }
+    }
+
+    #[test]
+    fn codex_memory_decline_does_not_fallback_to_repeated_stale_story() {
+        let mut config = SummaryConfig::p2p_default();
+        config.mode = FeedSummaryMode::PerStory;
+        config.processor = SummaryProcessorConfig::CodexSessionMemory {
+            store_path: "/tmp/agent-feed-test-memory.json".to_string(),
+            key: "test".to_string(),
+            command: "codex".to_string(),
+        };
+        let mut request = SummaryRequest::new(
+            "github:35904762:workstation",
+            FeedSummaryMode::PerStory,
+            vec![public_project_story("burn_p2p", 82)],
+        );
+        request.stories[0].headline = "local wasm smoke passed as well".to_string();
+        request.stories[0].deck =
+            "all browser training smoke tests completed, but no public outcome changed."
+                .to_string();
+        request.recent_summaries = vec![RecentSummary {
+            headline: "local wasm smoke passed as well".to_string(),
+            deck: "no public outcome change; open-turn verification remains unchanged.".to_string(),
+            story_family: StoryFamily::Test,
+            score: 76,
+        }];
+
+        let mut summary = summarize_request_with_processor(
+            &request,
+            &config,
+            &DecliningRepeatedNoChangeProcessor,
+        )
+        .expect("stale fallback evaluates");
+
+        assert_eq!(
+            summary.metadata.publish_action,
+            PublishAction::SkipProcessor
+        );
+        assert!(!apply_publish_decision(
+            &mut summary,
+            &request,
+            &config.publish
+        ));
     }
 
     struct DecliningStateUpdateProcessor;
@@ -4639,6 +4899,71 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         ));
         assert_eq!(summary.metadata.update_relation, "state_changed");
         assert_eq!(summary.metadata.publish_action, PublishAction::Publish);
+    }
+
+    #[test]
+    fn exact_headline_repeat_skips_when_state_did_not_change() {
+        let config = SummaryConfig::p2p_default();
+        let request = SummaryRequest {
+            feed_id: "local:workstation".to_string(),
+            mode: FeedSummaryMode::PerStory,
+            stories: vec![verified_story(84)],
+            recent_summaries: vec![RecentSummary {
+                headline: "browser canary changes deployment status".to_string(),
+                deck: "browser canary is passing and deployment is live.".to_string(),
+                story_family: StoryFamily::Test,
+                score: 82,
+            }],
+            prompt_style: None,
+            max_prompt_chars: None,
+            branch: None,
+            session_hint: None,
+        };
+        let mut summary = FeedSummary {
+            story_window: "turn".to_string(),
+            source_agent_kinds: vec!["codex".to_string()],
+            headline: "browser canary changes deployment status".to_string(),
+            deck: "browser canary remains passing and deployment stays live for viewers."
+                .to_string(),
+            lower_third: "codex-memory · redacted".to_string(),
+            chips: vec!["browser".to_string(), "deployment".to_string()],
+            image: None,
+            story_family: StoryFamily::Test,
+            severity: Severity::Notice,
+            score: 84,
+            privacy_class: PrivacyClass::Redacted,
+            evidence_event_ids: vec!["evt".to_string()],
+            metadata: SummaryMetadata {
+                processor: "codex-memory".to_string(),
+                policy: "p2p-strict".to_string(),
+                image_processor: "disabled".to_string(),
+                publish_action: PublishAction::Publish,
+                publish_reason: "candidate".to_string(),
+                headline_fingerprint: String::new(),
+                topic_fingerprint: String::new(),
+                state_fingerprint: String::new(),
+                impact_fingerprint: String::new(),
+                update_relation: String::new(),
+                max_headline_similarity: 0,
+                max_deck_similarity: 0,
+                guardrail_version: 1,
+                input_stories: 1,
+                output_chars: 0,
+                external_cost_allowed: true,
+                image_enabled: false,
+                violations: Vec::new(),
+            },
+        };
+
+        assert!(!apply_publish_decision(
+            &mut summary,
+            &request,
+            &config.publish
+        ));
+        assert_eq!(
+            summary.metadata.publish_action,
+            PublishAction::SkipDuplicate
+        );
     }
 
     struct DistinctNewTopicDecliningProcessor;
