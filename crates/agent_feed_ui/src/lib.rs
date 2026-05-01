@@ -542,6 +542,21 @@ mod tests {
     }
 
     #[test]
+    fn github_callback_handles_fragment_and_raw_oauth_forward() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains(
+            "const forwardedGithubOauthCallback = forwardRawGithubOauthCallback(window.location);"
+        ));
+        assert!(html.contains("function githubCallbackParams(location)"));
+        assert!(html.contains("return new URLSearchParams(hash || query);"));
+        assert!(html.contains("function forwardRawGithubOauthCallback(location)"));
+        assert!(html.contains("!params.has(\"code\") || !params.has(\"state\")"));
+        assert!(html.contains("window.location.replace(target);"));
+        assert!(html.contains("feed.github.callback.forward_edge"));
+    }
+
+    #[test]
     fn following_is_person_first_with_feed_and_tag_refinements() {
         let html = render_index_with_config(Some("remote"), &config(true));
 

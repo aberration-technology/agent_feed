@@ -66,7 +66,8 @@ const FEED_PROTOCOL_VERSION = 1;
 const FEED_MODEL_VERSION = Number(FEED_COMPATIBILITY.model_version ?? FEED_COMPATIBILITY.modelVersion ?? 3);
 const FEED_MIN_MODEL_VERSION = Number(FEED_COMPATIBILITY.min_model_version ?? FEED_COMPATIBILITY.minModelVersion ?? 3);
 
-const githubAuthCallback = parseGithubAuthCallback(window.location);
+const forwardedGithubOauthCallback = forwardRawGithubOauthCallback(window.location);
+const githubAuthCallback = forwardedGithubOauthCallback ? undefined : parseGithubAuthCallback(window.location);
 const remoteRoute = githubAuthCallback ? undefined : parseRemoteRoute(window.location);
 
 if (footerRev) {
@@ -1965,7 +1966,10 @@ function parseGithubAuthCallback(location) {
   if (location.pathname !== "/callback/github") {
     return undefined;
   }
-  const params = new URLSearchParams(location.search);
+  const params = githubCallbackParams(location);
+  if (params.has("code") && !params.has("login") && !params.has("github_user_id")) {
+    return undefined;
+  }
   return {
     state: params.get("state") || "",
     login: params.get("login") || "",
@@ -1979,6 +1983,31 @@ function parseGithubAuthCallback(location) {
     expires_at: params.get("expires_at") || "",
     return_to: params.get("return_to") || "/network",
   };
+}
+
+function githubCallbackParams(location) {
+  const hash = location.hash && location.hash.startsWith("#") ? location.hash.slice(1) : "";
+  const query = location.search && location.search.startsWith("?") ? location.search.slice(1) : "";
+  return new URLSearchParams(hash || query);
+}
+
+function forwardRawGithubOauthCallback(location) {
+  if (location.pathname !== "/callback/github") {
+    return false;
+  }
+  const params = new URLSearchParams(location.search);
+  if (!params.has("code") || !params.has("state")) {
+    return false;
+  }
+  const edge = edgeBaseUrl();
+  if (!edge) {
+    logError("github raw oauth callback cannot be forwarded without edge base url");
+    return false;
+  }
+  const target = `${edge.replace(/\/$/, "")}/callback/github${location.search}`;
+  logInfo("feed.github.callback.forward_edge", { edge });
+  window.location.replace(target);
+  return true;
 }
 
 function edgeBaseUrl() {
