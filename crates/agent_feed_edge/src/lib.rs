@@ -1528,7 +1528,7 @@ async fn network_publish_verified(
         .unwrap_or_else(|| format!("local:{feed_name}"));
     let (visibility, access) = match publish_access_policy(&request, &session) {
         Ok(access) => access,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Some(publisher) = request.publisher.as_ref() {
         if publisher.github_user_id != Some(session.github_user_id) || !publisher.verified {
@@ -1625,16 +1625,16 @@ async fn network_publish_verified(
 fn publish_access_policy(
     request: &NetworkPublishRequest,
     session: &VerifiedSession,
-) -> Result<(FeedVisibility, FeedAccessPolicy), axum::response::Response> {
+) -> Result<(FeedVisibility, FeedAccessPolicy), Box<axum::response::Response>> {
     let visibility = request.visibility.unwrap_or(FeedVisibility::Public);
     match visibility {
         FeedVisibility::Public => Ok((visibility, FeedAccessPolicy::public())),
         FeedVisibility::GithubOrg => {
             if !session.has_scope("read:org") {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::FORBIDDEN,
                     "github org publishing requires read:org scope; run `agent-feed auth github --github-org <org>`",
-                ));
+                )));
             }
             let Some(org) = request
                 .github_org
@@ -1642,29 +1642,34 @@ fn publish_access_policy(
                 .map(str::trim)
                 .filter(|org| !org.is_empty())
             else {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::BAD_REQUEST,
                     "github_org is required for github_org visibility",
-                ));
+                )));
             };
             let org = match GithubOrgName::parse(org) {
                 Ok(org) => org,
-                Err(err) => return Err(edge_error(StatusCode::BAD_REQUEST, err.to_string())),
+                Err(err) => {
+                    return Err(Box::new(edge_error(
+                        StatusCode::BAD_REQUEST,
+                        err.to_string(),
+                    )));
+                }
             };
             if !session.permits_org(&org) {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::FORBIDDEN,
                     format!("github org membership required: {org}; sign in again for this org"),
-                ));
+                )));
             }
             Ok((visibility, FeedAccessPolicy::github_org(org)))
         }
         FeedVisibility::GithubTeam => {
             if !session.has_scope("read:org") {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::FORBIDDEN,
                     "github team publishing requires read:org scope; run `agent-feed auth github --github-org <org>`",
-                ));
+                )));
             }
             let Some(org) = request
                 .github_org
@@ -1672,10 +1677,10 @@ fn publish_access_policy(
                 .map(str::trim)
                 .filter(|org| !org.is_empty())
             else {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::BAD_REQUEST,
                     "github_org is required for github_team visibility",
-                ));
+                )));
             };
             let Some(team) = request
                 .github_team
@@ -1683,33 +1688,43 @@ fn publish_access_policy(
                 .map(str::trim)
                 .filter(|team| !team.is_empty())
             else {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::BAD_REQUEST,
                     "github_team is required for github_team visibility",
-                ));
+                )));
             };
             let org = match GithubOrgName::parse(org) {
                 Ok(org) => org,
-                Err(err) => return Err(edge_error(StatusCode::BAD_REQUEST, err.to_string())),
+                Err(err) => {
+                    return Err(Box::new(edge_error(
+                        StatusCode::BAD_REQUEST,
+                        err.to_string(),
+                    )));
+                }
             };
             let team = match GithubTeamSlug::parse(team) {
                 Ok(team) => team,
-                Err(err) => return Err(edge_error(StatusCode::BAD_REQUEST, err.to_string())),
+                Err(err) => {
+                    return Err(Box::new(edge_error(
+                        StatusCode::BAD_REQUEST,
+                        err.to_string(),
+                    )));
+                }
             };
             if !session.permits_team(&org, &team) {
-                return Err(edge_error(
+                return Err(Box::new(edge_error(
                     StatusCode::FORBIDDEN,
                     format!(
                         "github team membership required: {org}/{team}; sign in again for this org"
                     ),
-                ));
+                )));
             }
             Ok((visibility, FeedAccessPolicy::github_team(org, team)))
         }
-        _ => Err(edge_error(
+        _ => Err(Box::new(edge_error(
             StatusCode::BAD_REQUEST,
             "edge publish supports public, github_org, and github_team visibility",
-        )),
+        ))),
     }
 }
 
@@ -2535,7 +2550,7 @@ fn exchange_github_code(
     let scopes = response
         .scope
         .unwrap_or_default()
-        .split(|value| value == ',' || value == ' ')
+        .split([',', ' '])
         .map(str::trim)
         .filter(|scope| !scope.is_empty())
         .map(ToString::to_string)

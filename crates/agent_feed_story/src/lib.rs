@@ -1896,7 +1896,7 @@ fn safe_sentence(input: &str) -> String {
 
 fn first_substantive_sentence(input: &str) -> Option<&str> {
     input
-        .split_terminator(|char| matches!(char, '.' | '!' | '?'))
+        .split_terminator(['.', '!', '?'])
         .map(str::trim)
         .find(|sentence| !sentence.is_empty() && !sentence_is_vacuous_status(sentence))
 }
