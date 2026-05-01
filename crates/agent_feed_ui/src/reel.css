@@ -44,6 +44,8 @@ body {
 }
 
 .reel {
+  width: 100vw;
+  max-width: 100vw;
   height: 100vh;
   height: 100dvh;
   min-height: 100vh;
@@ -772,16 +774,58 @@ body[data-mode="breaking"] .chips span {
     --stage-gap: 16px;
     --headline-max: 100%;
     --deck-max: 100%;
+    width: 100%;
+    max-width: 100vw;
     justify-content: center;
+    overflow-x: hidden;
     padding: var(--stage-pad-fit, var(--pad));
   }
 
   .eyebrow,
   .publisher,
   .chips,
-  .stage-actions,
   .story-time {
     flex-shrink: 0;
+  }
+
+  .stage-actions:not([hidden]) {
+    position: static;
+    left: auto;
+    bottom: auto;
+    z-index: auto;
+    display: none;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    max-height: 112px;
+    flex-shrink: 0;
+    align-content: flex-start;
+    flex-wrap: wrap;
+    overflow-x: hidden;
+    overflow-y: hidden;
+    padding: 2px 0;
+    scrollbar-width: none;
+  }
+
+  .stage-actions:not([hidden])::-webkit-scrollbar {
+    display: none;
+  }
+
+  body.controls-visible .stage-actions:not([hidden]),
+  .stage-actions:not([hidden]):focus-within {
+    display: flex;
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .stage-actions .feed-action {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;
+    max-width: 100%;
+    justify-content: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   h1 {
@@ -789,7 +833,7 @@ body[data-mode="breaking"] .chips span {
     display: block;
     max-height: none;
     overflow: visible;
-    overflow-wrap: break-word;
+    overflow-wrap: anywhere;
     text-wrap: wrap;
     white-space: normal;
   }

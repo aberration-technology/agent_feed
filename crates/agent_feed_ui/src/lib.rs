@@ -182,6 +182,7 @@ mod tests {
         assert!(mobile.contains("--headline-leading: 1.22;"));
         assert!(mobile.contains("--deck: 16px;"));
         assert!(mobile.contains("--deck-leading: 1.26;"));
+        assert!(html.contains(".reel {\n  width: 100vw;\n  max-width: 100vw;"));
         assert!(mobile.contains("height: 100svh;"));
         assert!(mobile.contains(
             "grid-template-rows: 64px minmax(0, 1fr) calc(58px + env(safe-area-inset-bottom, 0px));"
@@ -202,7 +203,15 @@ mod tests {
         assert!(!mobile.contains("-webkit-line-clamp"));
         assert!(!mobile.contains("-webkit-box-orient"));
         assert!(mobile.contains(".stage {\n    --stage-gap: 16px;"));
+        assert!(mobile.contains("max-width: 100vw;"));
+        assert!(mobile.contains("overflow-x: hidden;"));
         assert!(mobile.contains("padding: var(--stage-pad-fit, var(--pad));"));
+        assert!(mobile.contains(".stage-actions:not([hidden]) {\n    position: static;"));
+        assert!(mobile.contains("body.controls-visible .stage-actions:not([hidden])"));
+        assert!(mobile.contains("display: flex;"));
+        assert!(mobile.contains("flex-wrap: wrap;"));
+        assert!(mobile.contains("overflow-x: hidden;"));
+        assert!(mobile.contains(".stage-actions .feed-action {\n    flex: 1 1 calc(50% - 4px);"));
     }
 
     #[test]
@@ -246,7 +255,8 @@ mod tests {
                 "grid-template-rows: minmax(56px, 8vh) minmax(0, 1fr) minmax(48px, 8vh);"
             )
         );
-        assert!(html.contains(".reel {\n  height: 100vh;"));
+        assert!(html.contains(".reel {\n  width: 100vw;"));
+        assert!(html.contains("height: 100vh;"));
         assert!(html.contains("overflow: hidden;"));
         assert!(html.contains("stage.scrollHeight > stage.clientHeight + 1"));
         assert!(html.contains("headline.scrollWidth > headline.clientWidth + 1"));
