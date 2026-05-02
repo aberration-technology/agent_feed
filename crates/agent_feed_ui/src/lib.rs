@@ -125,6 +125,16 @@ mod tests {
     }
 
     #[test]
+    fn browser_filters_agent_harness_chips() {
+        let html = render_index_with_config(Some("remote"), &config(true));
+
+        assert!(html.contains("function isHarnessTag"));
+        assert!(html.contains("key.startsWith(\"codex_\")"));
+        assert!(html.contains("key.startsWith(\"claude_\")"));
+        assert!(html.contains("if (isHarnessTag(key))"));
+    }
+
+    #[test]
     fn chrome_uses_lowercase_accented_site_links() {
         let html = render_index_with_config(Some("stage"), &config(false));
 

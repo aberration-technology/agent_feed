@@ -877,6 +877,9 @@ function renderChips(nextChips) {
     .filter(Boolean)
     .filter((label) => {
       const key = String(label).toLowerCase();
+      if (isHarnessTag(key)) {
+        return false;
+      }
       if (seen.has(key)) {
         return false;
       }
@@ -890,6 +893,14 @@ function renderChips(nextChips) {
       chips.appendChild(item);
     });
   scheduleStageFit();
+}
+
+function isHarnessTag(value) {
+  const key = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[ .]/g, "_");
+  return key === "codex" || key === "claude" || key.startsWith("codex_") || key.startsWith("claude_");
 }
 
 function renderTicker(items) {

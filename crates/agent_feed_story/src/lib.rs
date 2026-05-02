@@ -628,7 +628,6 @@ impl StoryCompiler {
         if let Some(project) = &project {
             chips.push(project.clone());
         }
-        chips.push(window.key.agent.clone());
         chips.push(story_family_label(window.key.family).to_string());
         if window.counters.files_changed > 0 {
             chips.push(format!("{} files", window.counters.files_changed));
@@ -1068,13 +1067,13 @@ fn deck(window: &StoryWindow) -> String {
 
 fn lower_third(window: &StoryWindow, score: u8) -> String {
     if let Some(project) = display_project_label(window.key.project_hash.as_deref()) {
-        let mut parts = vec![project, window.key.agent.clone()];
+        let mut parts = vec![project];
         parts.push(story_family_label(window.key.family).to_string());
         parts.push(format!("score {score}"));
         parts.push("redacted".to_string());
         return parts.join(" · ");
     }
-    let mut parts = vec![window.key.agent.clone(), "local".to_string()];
+    let mut parts = vec!["local".to_string()];
     parts.push(story_family_label(window.key.family).to_string());
     parts.push(format!("score {score}"));
     parts.push("redacted".to_string());
@@ -3329,8 +3328,10 @@ mod tests {
         assert!(!turn.deck.contains("tests passed"));
         assert!(!turn.deck.contains("cargo test --all"));
         assert_eq!(turn.chips[0], "agent_feed");
-        assert_eq!(turn.chips[1], "codex");
-        assert!(turn.lower_third.starts_with("agent_feed · codex"));
+        assert_eq!(turn.chips[1], "turn");
+        assert!(!turn.chips.iter().any(|chip| chip == "codex"));
+        assert!(turn.lower_third.starts_with("agent_feed · turn"));
+        assert!(!turn.lower_third.contains("codex"));
     }
 
     #[test]

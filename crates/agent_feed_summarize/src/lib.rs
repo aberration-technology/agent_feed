@@ -2057,6 +2057,9 @@ fn clean_chip(
     guardrails: &SummaryGuardrails,
     project_tags: &[String],
 ) -> Result<(String, Vec<GuardrailViolation>), SummaryError> {
+    if is_agent_harness_label(value) {
+        return Ok((String::new(), Vec::new()));
+    }
     if guardrails.allow_project_tags
         && project_tags
             .iter()
@@ -2064,8 +2067,28 @@ fn clean_chip(
     {
         return Ok((clamp_chars(value.trim(), max_chars), Vec::new()));
     }
-    clean_and_clamp(value, max_chars, guardrails)
-        .map(|(chip, violations)| (remove_project_placeholder_segments(&chip), violations))
+    clean_and_clamp(value, max_chars, guardrails).map(|(chip, violations)| {
+        let chip = remove_project_placeholder_segments(&chip);
+        if is_agent_harness_label(&chip) {
+            (String::new(), violations)
+        } else {
+            (chip, violations)
+        }
+    })
+}
+
+fn is_agent_harness_label(value: &str) -> bool {
+    let key = normalize_chip_label(value);
+    key == "codex"
+        || key == "claude"
+        || key.starts_with("codex_")
+        || key.starts_with("codex-")
+        || key.starts_with("claude_")
+        || key.starts_with("claude-")
+}
+
+fn normalize_chip_label(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace([' ', '.'], "_")
 }
 
 fn project_tags_for_stories(
@@ -2232,11 +2255,12 @@ fn polish_public_summary(summary: &mut FeedSummary) {
     summary.lower_third = remove_project_placeholder_inline(&remove_project_placeholder_segments(
         &polish_public_copy(&summary.lower_third),
     ));
+    summary.lower_third = remove_agent_harness_segments(&summary.lower_third);
     summary.chips = summary
         .chips
         .iter()
         .map(|chip| polish_public_copy(chip))
-        .filter(|chip| !chip.trim().is_empty())
+        .filter(|chip| !chip.trim().is_empty() && !is_agent_harness_label(chip))
         .fold(Vec::<String>::new(), |mut chips, chip| {
             if !chips.iter().any(|existing| existing == &chip) {
                 chips.push(chip);
@@ -2245,6 +2269,21 @@ fn polish_public_summary(summary: &mut FeedSummary) {
         });
     if summary.chips.is_empty() {
         summary.chips.push("redacted".to_string());
+    }
+}
+
+fn remove_agent_harness_segments(value: &str) -> String {
+    let separator = if value.contains('·') { " · " } else { " " };
+    let parts = value
+        .split('·')
+        .flat_map(|segment| segment.split(','))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty() && !is_agent_harness_label(segment))
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        "feed · redacted".to_string()
+    } else {
+        parts.join(separator)
     }
 }
 
@@ -4254,8 +4293,9 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             summarize_feed("github:35904762:workstation", &stories, &config).expect("summary");
 
         assert_eq!(summaries[0].chips[0], "burn_dragon");
-        assert!(summaries[0].chips.iter().any(|chip| chip == "codex"));
+        assert!(!summaries[0].chips.iter().any(|chip| chip == "codex"));
         assert!(summaries[0].lower_third.starts_with("burn_dragon ·"));
+        assert!(!summaries[0].lower_third.contains("codex"));
         assert!(!summaries[0].lower_third.contains("[project]"));
         assert!(!summaries[0].chips.iter().any(|chip| chip == "[project]"));
         assert!(!summaries[0].headline.contains("burn_dragon"));
@@ -4586,6 +4626,7 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(!display.contains("raw prompts"));
         assert!(!display.contains("command output"));
         assert!(!display.contains("do not include"));
+        assert!(!summary.chips.iter().any(|chip| chip == "codex"));
         assert!(
             summary
                 .metadata
