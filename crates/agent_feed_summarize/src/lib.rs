@@ -4555,9 +4555,11 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
 
     #[test]
     fn image_prompt_carries_extra_visual_guidance_inside_safety_envelope() {
-        let mut policy = ImageConfig::default();
-        policy.enabled = true;
-        policy.extra_instructions = vec!["use a sparse abstract signal-room composition".into()];
+        let policy = ImageConfig {
+            enabled: true,
+            extra_instructions: vec!["use a sparse abstract signal-room composition".into()],
+            ..ImageConfig::default()
+        };
         let request = ImageRequest {
             feed_id: "github:35904762:workstation".to_string(),
             headline: "browser route canary starts covering feed discovery".to_string(),

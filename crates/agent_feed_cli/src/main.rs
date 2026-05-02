@@ -5881,6 +5881,7 @@ impl UserImageConfig {
     }
 }
 
+#[derive(Default)]
 struct SummaryCliOptions<'a> {
     summarizer: Option<&'a str>,
     summary_style: Option<&'a str>,
@@ -5901,32 +5902,6 @@ struct SummaryCliOptions<'a> {
     image_style: Option<&'a str>,
     image_prompt_max_chars: Option<usize>,
     allow_remote_image_urls: bool,
-}
-
-impl<'a> Default for SummaryCliOptions<'a> {
-    fn default() -> Self {
-        Self {
-            summarizer: None,
-            summary_style: None,
-            summary_prompt_max_chars: None,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &[],
-            images: false,
-            image_processor: None,
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        }
-    }
 }
 
 fn apply_user_summary_config(
