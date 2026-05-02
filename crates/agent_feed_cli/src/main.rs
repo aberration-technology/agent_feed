@@ -22,11 +22,12 @@ use agent_feed_server::{ServerConfig, serve_with_ready};
 #[cfg(test)]
 use agent_feed_story::StoryCompiler;
 use agent_feed_story::{CompiledStory, StoryFamily, compile_events};
+#[cfg(test)]
+use agent_feed_summarize::{DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE};
 use agent_feed_summarize::{
-    DEFAULT_SUMMARY_PROMPT_MAX_CHARS, DEFAULT_SUMMARY_PROMPT_STYLE, FeedSummary, FeedSummaryMode,
-    GuardrailPattern, INTERNAL_SUMMARIZER_MARKER, ImageDecisionMode, ImageProcessorConfig,
-    RecentSummary, SummaryConfig, SummaryError, SummaryProcessorConfig, summarize_feed,
-    summarize_feed_with_recent,
+    FeedSummary, FeedSummaryMode, GuardrailPattern, INTERNAL_SUMMARIZER_MARKER, ImageDecisionMode,
+    ImageProcessorConfig, RecentSummary, SummaryConfig, SummaryError, SummaryProcessorConfig,
+    summarize_feed, summarize_feed_with_recent,
 };
 use agent_feed_views::{PublishStatusUpdate, PublishStatusView, StatusView};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -50,6 +51,7 @@ const STARTUP_STATE_SAMPLE_BYTES: usize = 1024 * 1024;
 const STARTUP_CONTEXT_TAIL_BYTES: usize = 4 * 1024 * 1024;
 const STARTUP_RECAP_MAX_AGE: time::Duration = time::Duration::minutes(45);
 const STARTUP_CONTEXT_TAG: &str = "startup-context";
+const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("default_config.toml");
 
 #[derive(Debug, Parser)]
 #[command(name = "agent-feed", version)]
@@ -65,6 +67,13 @@ struct Cli {
     log_level: String,
     #[arg(long, global = true, value_enum, default_value = "compact")]
     log_format: LogFormat,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "read user config from this path instead of ~/.agent_feed/config.toml"
+    )]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -97,6 +106,10 @@ impl From<CliEdgeFallback> for EdgeFallbackMode {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     Doctor {
         #[command(subcommand)]
         command: Option<DoctorCommand>,
@@ -187,16 +200,16 @@ enum Commands {
         codex_sessions_dir: Option<PathBuf>,
         #[arg(long)]
         claude_projects_dir: Option<PathBuf>,
-        #[arg(long, default_value = "codex-memory")]
-        summarizer: String,
+        #[arg(long, help = "summary processor route; default: codex-memory")]
+        summarizer: Option<String>,
         #[arg(
             long,
             visible_alias = "headline-style",
-            default_value = DEFAULT_SUMMARY_PROMPT_STYLE
+            help = "summary style guidance; defaults to the built-in feed style"
         )]
-        summary_style: String,
-        #[arg(long, default_value_t = DEFAULT_SUMMARY_PROMPT_MAX_CHARS)]
-        summary_prompt_max_chars: usize,
+        summary_style: Option<String>,
+        #[arg(long)]
+        summary_prompt_max_chars: Option<usize>,
         #[arg(long)]
         per_story: bool,
         #[arg(long)]
@@ -264,6 +277,16 @@ enum Commands {
         #[arg(long)]
         restore_hooks: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Path,
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    Validate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -501,16 +524,16 @@ enum P2pCommand {
             help = "replay selected transcript history instead of only future deltas"
         )]
         include_history: bool,
-        #[arg(long, default_value = "codex-memory")]
-        summarizer: String,
+        #[arg(long, help = "summary processor route; default: codex-memory")]
+        summarizer: Option<String>,
         #[arg(
             long,
             visible_alias = "headline-style",
-            default_value = DEFAULT_SUMMARY_PROMPT_STYLE
+            help = "summary style guidance; defaults to the built-in feed style"
         )]
-        summary_style: String,
-        #[arg(long, default_value_t = DEFAULT_SUMMARY_PROMPT_MAX_CHARS)]
-        summary_prompt_max_chars: usize,
+        summary_style: Option<String>,
+        #[arg(long)]
+        summary_prompt_max_chars: Option<usize>,
         #[arg(long)]
         per_story: bool,
         #[arg(long)]
@@ -531,8 +554,8 @@ enum P2pCommand {
         guardrail_pattern: Vec<String>,
         #[arg(long)]
         images: bool,
-        #[arg(long, default_value = "codex-exec")]
-        image_processor: String,
+        #[arg(long, help = "image processor route; default: codex-exec")]
+        image_processor: Option<String>,
         #[arg(long)]
         image_endpoint: Option<String>,
         #[arg(long)]
@@ -584,6 +607,8 @@ enum CliError {
     Io(#[from] std::io::Error),
     #[error("json failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("toml failed: {0}")]
+    Toml(#[from] toml::de::Error),
     #[error(transparent)]
     Auth(#[from] GithubAuthError),
     #[error(transparent)]
@@ -608,7 +633,7 @@ async fn main() -> Result<(), CliError> {
         log_format = ?cli.log_format,
         "cli command started"
     );
-    let result = run_command(cli.command).await;
+    let result = run_command(cli.command, cli.config).await;
     if let Err(err) = &result {
         error!(%command, error = %err, "cli command failed");
     } else {
@@ -617,8 +642,37 @@ async fn main() -> Result<(), CliError> {
     result
 }
 
-async fn run_command(command: Commands) -> Result<(), CliError> {
+async fn run_command(command: Commands, config_path: Option<PathBuf>) -> Result<(), CliError> {
     match command {
+        Commands::Config { command } => match command {
+            ConfigCommand::Path => {
+                println!("{}", user_config_path(config_path.as_deref()).display());
+            }
+            ConfigCommand::Init { force } => {
+                let path = init_user_config(config_path.as_deref(), force)?;
+                println!("config initialized: {}", path.display());
+            }
+            ConfigCommand::Validate => {
+                let path = resolved_existing_user_config_path(config_path.as_deref());
+                let config = load_user_config(config_path.as_deref())?;
+                let mut summary_config =
+                    summary_config(SummaryCliOptions::default(), Some(&config))?;
+                let selected = parse_agent_list("codex,claude");
+                scope_summary_memory(&mut summary_config, "workstation", &selected, None, false)?;
+                println!(
+                    "config valid: path={} summarizer={} style_chars={} prompt_extra={} memory_extra={} image_enabled={} image_processor={}",
+                    path.as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "built-in defaults".to_string()),
+                    summary_processor_label(&summary_config),
+                    summary_config.prompt.style.chars().count(),
+                    summary_config.prompt.extra_instructions.len(),
+                    summary_config.prompt.memory_instructions.len(),
+                    summary_config.image.enabled,
+                    summary_config.image.processor.name()
+                );
+            }
+        },
         Commands::Doctor { command } => match command {
             Some(DoctorCommand::Publish {
                 server,
@@ -647,6 +701,10 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
         } => {
             for step in init_plan(auto, codex, claude) {
                 println!("{step}");
+            }
+            if auto {
+                let path = init_user_config(config_path.as_deref(), false)?;
+                println!("config: {}", path.display());
             }
         }
         Commands::Serve {
@@ -735,28 +793,32 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                 ..P2pNetworkConfig::mainnet_single_bootstrap(edge_fallback)
             };
             let publish_sink = if publish {
+                let user_config = load_user_config(config_path.as_deref())?;
                 let selected_agents = parse_agent_list(&agents);
-                let mut summary_config = summary_config(SummaryCliOptions {
-                    summarizer: &summarizer,
-                    summary_style: &summary_style,
-                    summary_prompt_max_chars,
-                    per_story: true,
-                    allow_project_names,
-                    summary_memory_store: summary_memory_store.as_deref(),
-                    summary_endpoint: summary_endpoint.as_deref(),
-                    summary_auth_header_env: summary_auth_header_env.as_deref(),
-                    summary_command: summary_command.as_deref(),
-                    summary_args: &summary_args,
-                    guardrail_patterns: &guardrail_pattern,
-                    images: false,
-                    image_processor: "disabled",
-                    image_endpoint: None,
-                    image_command: None,
-                    image_args: &[],
-                    image_style: None,
-                    image_prompt_max_chars: None,
-                    allow_remote_image_urls: false,
-                })?;
+                let mut summary_config = summary_config(
+                    SummaryCliOptions {
+                        summarizer: summarizer.as_deref(),
+                        summary_style: summary_style.as_deref(),
+                        summary_prompt_max_chars,
+                        per_story: true,
+                        allow_project_names,
+                        summary_memory_store: summary_memory_store.as_deref(),
+                        summary_endpoint: summary_endpoint.as_deref(),
+                        summary_auth_header_env: summary_auth_header_env.as_deref(),
+                        summary_command: summary_command.as_deref(),
+                        summary_args: &summary_args,
+                        guardrail_patterns: &guardrail_pattern,
+                        images: false,
+                        image_processor: None,
+                        image_endpoint: None,
+                        image_command: None,
+                        image_args: &[],
+                        image_style: None,
+                        image_prompt_max_chars: None,
+                        allow_remote_image_urls: false,
+                    },
+                    Some(&user_config),
+                )?;
                 let workspace_filter_for_memory = if all_workspaces {
                     None
                 } else {
@@ -1451,7 +1513,7 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     sessions,
                     workspace = workspace_filter.log_value(),
                     include_history,
-                    summarizer = %summarizer,
+                    summarizer = summarizer.as_deref().unwrap_or("config/default"),
                     per_story,
                     images,
                     dry_run,
@@ -1491,27 +1553,31 @@ async fn run_command(command: Commands) -> Result<(), CliError> {
                     }
                     captured_paths.extend(paths);
                 }
-                let mut summary_config = summary_config(SummaryCliOptions {
-                    summarizer: &summarizer,
-                    summary_style: &summary_style,
-                    summary_prompt_max_chars,
-                    per_story,
-                    allow_project_names,
-                    summary_memory_store: summary_memory_store.as_deref(),
-                    summary_endpoint: summary_endpoint.as_deref(),
-                    summary_auth_header_env: summary_auth_header_env.as_deref(),
-                    summary_command: summary_command.as_deref(),
-                    summary_args: &summary_args,
-                    guardrail_patterns: &guardrail_pattern,
-                    images,
-                    image_processor: &image_processor,
-                    image_endpoint: image_endpoint.as_deref(),
-                    image_command: image_command.as_deref(),
-                    image_args: &image_args,
-                    image_style: image_style.as_deref(),
-                    image_prompt_max_chars,
-                    allow_remote_image_urls,
-                })?;
+                let user_config = load_user_config(config_path.as_deref())?;
+                let mut summary_config = summary_config(
+                    SummaryCliOptions {
+                        summarizer: summarizer.as_deref(),
+                        summary_style: summary_style.as_deref(),
+                        summary_prompt_max_chars,
+                        per_story,
+                        allow_project_names,
+                        summary_memory_store: summary_memory_store.as_deref(),
+                        summary_endpoint: summary_endpoint.as_deref(),
+                        summary_auth_header_env: summary_auth_header_env.as_deref(),
+                        summary_command: summary_command.as_deref(),
+                        summary_args: &summary_args,
+                        guardrail_patterns: &guardrail_pattern,
+                        images,
+                        image_processor: image_processor.as_deref(),
+                        image_endpoint: image_endpoint.as_deref(),
+                        image_command: image_command.as_deref(),
+                        image_args: &image_args,
+                        image_style: image_style.as_deref(),
+                        image_prompt_max_chars,
+                        allow_remote_image_urls,
+                    },
+                    Some(&user_config),
+                )?;
                 scope_summary_memory(
                     &mut summary_config,
                     &feed,
@@ -1705,6 +1771,11 @@ fn log_filter(filter: &str) -> tracing_subscriber::EnvFilter {
 
 fn command_name(command: &Commands) -> &'static str {
     match command {
+        Commands::Config { command } => match command {
+            ConfigCommand::Path => "config.path",
+            ConfigCommand::Init { .. } => "config.init",
+            ConfigCommand::Validate => "config.validate",
+        },
         Commands::Doctor { command } => match command {
             Some(DoctorCommand::Publish { .. }) => "doctor.publish",
             None => "doctor",
@@ -3094,36 +3165,48 @@ mod tests {
         else {
             panic!("expected p2p publish command");
         };
-        assert_eq!(summarizer, "codex-memory");
-        assert_eq!(summary_style, DEFAULT_SUMMARY_PROMPT_STYLE);
-        assert_eq!(summary_prompt_max_chars, DEFAULT_SUMMARY_PROMPT_MAX_CHARS);
+        assert_eq!(summarizer, None);
+        assert_eq!(summary_style, None);
+        assert_eq!(summary_prompt_max_chars, None);
         assert!(!include_history);
+
+        let config =
+            summary_config(SummaryCliOptions::default(), None).expect("default config builds");
+        assert_eq!(config.processor.name(), "codex-memory");
+        assert_eq!(config.prompt.style, DEFAULT_SUMMARY_PROMPT_STYLE);
+        assert_eq!(
+            config.prompt.max_prompt_chars,
+            DEFAULT_SUMMARY_PROMPT_MAX_CHARS
+        );
     }
 
     #[test]
     fn summary_config_routes_codex_memory_processor() {
         let store = PathBuf::from("/tmp/agent-feed-summary-memory-test.json");
-        let mut config = summary_config(SummaryCliOptions {
-            summarizer: "codex-memory",
-            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
-            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: Some(&store),
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &[],
-            images: false,
-            image_processor: "codex-exec",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let mut config = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("codex-memory"),
+                summary_style: Some(DEFAULT_SUMMARY_PROMPT_STYLE),
+                summary_prompt_max_chars: Some(DEFAULT_SUMMARY_PROMPT_MAX_CHARS),
+                per_story: false,
+                allow_project_names: false,
+                summary_memory_store: Some(&store),
+                summary_endpoint: None,
+                summary_auth_header_env: None,
+                summary_command: None,
+                summary_args: &[],
+                guardrail_patterns: &[],
+                images: false,
+                image_processor: Some("codex-exec"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect("summary config builds");
         let selected = parse_agent_list("codex,claude");
         scope_summary_memory(&mut config, "workstation", &selected, None, false)
@@ -3146,27 +3229,30 @@ mod tests {
     #[test]
     fn summary_config_routes_cli_processors_and_keeps_strict_defaults() {
         let guardrail_patterns = vec![r"(?i)customer-name".to_string()];
-        let config = summary_config(SummaryCliOptions {
-            summarizer: "claude-code",
-            summary_style: "quiet feed style",
-            summary_prompt_max_chars: 128,
-            per_story: true,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &guardrail_patterns,
-            images: false,
-            image_processor: "http-endpoint",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let config = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("claude-code"),
+                summary_style: Some("quiet feed style"),
+                summary_prompt_max_chars: Some(128),
+                per_story: true,
+                allow_project_names: false,
+                summary_memory_store: None,
+                summary_endpoint: None,
+                summary_auth_header_env: None,
+                summary_command: None,
+                summary_args: &[],
+                guardrail_patterns: &guardrail_patterns,
+                images: false,
+                image_processor: Some("http-endpoint"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect("summary config builds");
 
         assert_eq!(config.mode, FeedSummaryMode::PerStory);
@@ -3183,28 +3269,136 @@ mod tests {
     }
 
     #[test]
+    fn user_config_template_parses_and_merges_prompt_preferences() {
+        let user_config = toml::from_str::<AgentFeedUserConfig>(DEFAULT_CONFIG_TEMPLATE)
+            .expect("template parses");
+        let config = summary_config(SummaryCliOptions::default(), Some(&user_config))
+            .expect("template config builds");
+
+        assert_eq!(config.mode, FeedSummaryMode::FeedRollup);
+        assert_eq!(config.processor.name(), "codex-memory");
+        assert!(config.prompt.style.contains("compact news headline"));
+        assert!(
+            config
+                .prompt
+                .extra_instructions
+                .iter()
+                .any(|instruction| instruction.contains("user/operator impact"))
+        );
+        assert!(
+            config
+                .prompt
+                .memory_instructions
+                .iter()
+                .any(|instruction| instruction.contains("same-topic updates"))
+        );
+        assert!(!config.image.enabled);
+    }
+
+    #[test]
+    fn cli_summary_options_override_user_config() {
+        let mut user_config = AgentFeedUserConfig::default();
+        user_config.summarize.summarizer = Some("deterministic".to_string());
+        user_config.summarize.style = Some("configured style".to_string());
+        user_config.summarize.max_prompt_chars = Some(1600);
+        user_config.summarize.prompt.extra_instructions =
+            vec!["configured extra instruction".to_string()];
+
+        let config = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("claude-code"),
+                summary_style: Some("cli style"),
+                summary_prompt_max_chars: Some(700),
+                ..SummaryCliOptions::default()
+            },
+            Some(&user_config),
+        )
+        .expect("config builds");
+
+        assert_eq!(config.processor, SummaryProcessorConfig::ClaudeCodeExec);
+        assert_eq!(config.prompt.style, "cli style");
+        assert_eq!(config.prompt.max_prompt_chars, 700);
+        assert_eq!(
+            config.prompt.extra_instructions,
+            vec!["configured extra instruction".to_string()]
+        );
+    }
+
+    #[test]
+    fn user_config_validation_rejects_invalid_guardrail_regex() {
+        let mut user_config = AgentFeedUserConfig::default();
+        user_config
+            .summarize
+            .guardrails
+            .reject_patterns
+            .push("(".to_string());
+
+        let err = validate_user_config(&user_config).expect_err("bad regex rejected");
+        assert!(err.to_string().contains("invalid config guardrail regex"));
+    }
+
+    #[test]
+    fn config_init_writes_commented_template_without_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-feed-config-init-test-{}",
+            std::process::id()
+        ));
+        let path = root.join("config.toml");
+        let _ = fs::remove_dir_all(&root);
+
+        let initialized = init_user_config(Some(&path), false).expect("config initializes");
+        assert_eq!(initialized, path);
+        let body = fs::read_to_string(&initialized).expect("config reads");
+        assert!(body.contains("# agent-feed user config"));
+        assert!(body.contains("[summarize]"));
+
+        fs::write(
+            &initialized,
+            "# custom\n[summarize]\nsummarizer = \"deterministic\"\n",
+        )
+        .expect("custom config writes");
+        init_user_config(Some(&path), false).expect("existing config validates");
+        let existing = fs::read_to_string(&initialized).expect("existing config reads");
+        assert!(existing.contains("deterministic"));
+
+        init_user_config(Some(&path), true).expect("forced config rewrites");
+        let rewritten = fs::read_to_string(&initialized).expect("rewritten config reads");
+        assert!(rewritten.contains("# agent-feed user config"));
+        let backups = fs::read_dir(&root)
+            .expect("root reads")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".bak."))
+            .count();
+        assert!(backups >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn summary_config_exposes_external_summary_processors() {
-        let command_config = summary_config(SummaryCliOptions {
-            summarizer: "process",
-            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
-            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: Some("summarize-feed"),
-            summary_args: &["--json".to_string()],
-            guardrail_patterns: &[],
-            images: false,
-            image_processor: "codex-exec",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let command_config = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("process"),
+                summary_style: Some(DEFAULT_SUMMARY_PROMPT_STYLE),
+                summary_prompt_max_chars: Some(DEFAULT_SUMMARY_PROMPT_MAX_CHARS),
+                per_story: false,
+                allow_project_names: false,
+                summary_memory_store: None,
+                summary_endpoint: None,
+                summary_auth_header_env: None,
+                summary_command: Some("summarize-feed"),
+                summary_args: &["--json".to_string()],
+                guardrail_patterns: &[],
+                images: false,
+                image_processor: Some("codex-exec"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect("process summarizer config builds");
 
         assert_eq!(
@@ -3215,27 +3409,30 @@ mod tests {
             }
         );
 
-        let endpoint_config = summary_config(SummaryCliOptions {
-            summarizer: "http-endpoint",
-            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
-            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: Some("http://127.0.0.1:8181/summarize"),
-            summary_auth_header_env: Some("FEED_SUMMARY_AUTH"),
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &[],
-            images: false,
-            image_processor: "codex-exec",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let endpoint_config = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("http-endpoint"),
+                summary_style: Some(DEFAULT_SUMMARY_PROMPT_STYLE),
+                summary_prompt_max_chars: Some(DEFAULT_SUMMARY_PROMPT_MAX_CHARS),
+                per_story: false,
+                allow_project_names: false,
+                summary_memory_store: None,
+                summary_endpoint: Some("http://127.0.0.1:8181/summarize"),
+                summary_auth_header_env: Some("FEED_SUMMARY_AUTH"),
+                summary_command: None,
+                summary_args: &[],
+                guardrail_patterns: &[],
+                images: false,
+                image_processor: Some("codex-exec"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect("http summarizer config builds");
 
         assert_eq!(
@@ -3249,51 +3446,57 @@ mod tests {
 
     #[test]
     fn summary_config_rejects_unknown_routes_and_unsafe_image_config() {
-        let unknown = summary_config(SummaryCliOptions {
-            summarizer: "random-llm",
-            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
-            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &[],
-            images: false,
-            image_processor: "codex-exec",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let unknown = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("random-llm"),
+                summary_style: Some(DEFAULT_SUMMARY_PROMPT_STYLE),
+                summary_prompt_max_chars: Some(DEFAULT_SUMMARY_PROMPT_MAX_CHARS),
+                per_story: false,
+                allow_project_names: false,
+                summary_memory_store: None,
+                summary_endpoint: None,
+                summary_auth_header_env: None,
+                summary_command: None,
+                summary_args: &[],
+                guardrail_patterns: &[],
+                images: false,
+                image_processor: Some("codex-exec"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect_err("unknown summarizer is rejected");
         assert!(unknown.to_string().contains("unknown summarizer"));
 
-        let missing_endpoint = summary_config(SummaryCliOptions {
-            summarizer: "codex-exec",
-            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
-            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &[],
-            images: true,
-            image_processor: "http-endpoint",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let missing_endpoint = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("codex-exec"),
+                summary_style: Some(DEFAULT_SUMMARY_PROMPT_STYLE),
+                summary_prompt_max_chars: Some(DEFAULT_SUMMARY_PROMPT_MAX_CHARS),
+                per_story: false,
+                allow_project_names: false,
+                summary_memory_store: None,
+                summary_endpoint: None,
+                summary_auth_header_env: None,
+                summary_command: None,
+                summary_args: &[],
+                guardrail_patterns: &[],
+                images: true,
+                image_processor: Some("http-endpoint"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect_err("http image processor requires endpoint");
         assert!(
             missing_endpoint
@@ -3301,27 +3504,30 @@ mod tests {
                 .contains("--image-endpoint is required")
         );
 
-        let missing_summary_endpoint = summary_config(SummaryCliOptions {
-            summarizer: "http-endpoint",
-            summary_style: DEFAULT_SUMMARY_PROMPT_STYLE,
-            summary_prompt_max_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
-            per_story: false,
-            allow_project_names: false,
-            summary_memory_store: None,
-            summary_endpoint: None,
-            summary_auth_header_env: None,
-            summary_command: None,
-            summary_args: &[],
-            guardrail_patterns: &[],
-            images: false,
-            image_processor: "codex-exec",
-            image_endpoint: None,
-            image_command: None,
-            image_args: &[],
-            image_style: None,
-            image_prompt_max_chars: None,
-            allow_remote_image_urls: false,
-        })
+        let missing_summary_endpoint = summary_config(
+            SummaryCliOptions {
+                summarizer: Some("http-endpoint"),
+                summary_style: Some(DEFAULT_SUMMARY_PROMPT_STYLE),
+                summary_prompt_max_chars: Some(DEFAULT_SUMMARY_PROMPT_MAX_CHARS),
+                per_story: false,
+                allow_project_names: false,
+                summary_memory_store: None,
+                summary_endpoint: None,
+                summary_auth_header_env: None,
+                summary_command: None,
+                summary_args: &[],
+                guardrail_patterns: &[],
+                images: false,
+                image_processor: Some("codex-exec"),
+                image_endpoint: None,
+                image_command: None,
+                image_args: &[],
+                image_style: None,
+                image_prompt_max_chars: None,
+                allow_remote_image_urls: false,
+            },
+            None,
+        )
         .expect_err("http summary processor requires endpoint");
         assert!(
             missing_summary_endpoint
@@ -3457,7 +3663,7 @@ mod tests {
         assert_eq!(feed, "gpu-vm");
         assert!(all_workspaces);
         assert_eq!(publish_interval_secs, 5);
-        assert_eq!(summarizer, "deterministic");
+        assert_eq!(summarizer.as_deref(), Some("deterministic"));
         assert_eq!(edge_fallback, CliEdgeFallback::Auto);
         assert_eq!(github_org.as_deref(), Some("aberration-technology"));
     }
@@ -5608,10 +5814,77 @@ fn publish_feed_id_for_publisher(feed: &str, publisher: Option<&PublisherIdentit
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AgentFeedUserConfig {
+    summarize: UserSummarizeConfig,
+    images: UserImageConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserSummarizeConfig {
+    summarizer: Option<String>,
+    style: Option<String>,
+    max_prompt_chars: Option<usize>,
+    per_story: Option<bool>,
+    allow_project_names: Option<bool>,
+    prompt: UserPromptConfig,
+    memory: UserMemoryConfig,
+    processor: UserProcessorConfig,
+    guardrails: UserGuardrailConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserPromptConfig {
+    extra_instructions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserMemoryConfig {
+    store: Option<String>,
+    extra_instructions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserProcessorConfig {
+    command: Option<String>,
+    args: Vec<String>,
+    endpoint: Option<String>,
+    auth_header_env: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserGuardrailConfig {
+    reject_patterns: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserImageConfig {
+    enabled: Option<bool>,
+    processor: Option<String>,
+    style: Option<String>,
+    max_prompt_chars: Option<usize>,
+    allow_remote_urls: Option<bool>,
+    extra_instructions: Vec<String>,
+    external: UserProcessorConfig,
+}
+
+impl UserImageConfig {
+    fn processor_config(&self) -> &UserProcessorConfig {
+        &self.external
+    }
+}
+
 struct SummaryCliOptions<'a> {
-    summarizer: &'a str,
-    summary_style: &'a str,
-    summary_prompt_max_chars: usize,
+    summarizer: Option<&'a str>,
+    summary_style: Option<&'a str>,
+    summary_prompt_max_chars: Option<usize>,
     per_story: bool,
     allow_project_names: bool,
     summary_memory_store: Option<&'a Path>,
@@ -5621,7 +5894,7 @@ struct SummaryCliOptions<'a> {
     summary_args: &'a [String],
     guardrail_patterns: &'a [String],
     images: bool,
-    image_processor: &'a str,
+    image_processor: Option<&'a str>,
     image_endpoint: Option<&'a str>,
     image_command: Option<&'a str>,
     image_args: &'a [String],
@@ -5630,16 +5903,145 @@ struct SummaryCliOptions<'a> {
     allow_remote_image_urls: bool,
 }
 
-fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliError> {
+impl<'a> Default for SummaryCliOptions<'a> {
+    fn default() -> Self {
+        Self {
+            summarizer: None,
+            summary_style: None,
+            summary_prompt_max_chars: None,
+            per_story: false,
+            allow_project_names: false,
+            summary_memory_store: None,
+            summary_endpoint: None,
+            summary_auth_header_env: None,
+            summary_command: None,
+            summary_args: &[],
+            guardrail_patterns: &[],
+            images: false,
+            image_processor: None,
+            image_endpoint: None,
+            image_command: None,
+            image_args: &[],
+            image_style: None,
+            image_prompt_max_chars: None,
+            allow_remote_image_urls: false,
+        }
+    }
+}
+
+fn apply_user_summary_config(
+    config: &mut SummaryConfig,
+    user_config: &AgentFeedUserConfig,
+) -> Result<(), CliError> {
+    if let Some(style) = user_config
+        .summarize
+        .style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+    {
+        config.prompt.style = style.to_string();
+    }
+    if let Some(max_prompt_chars) = user_config.summarize.max_prompt_chars {
+        config.prompt.max_prompt_chars = max_prompt_chars.max(512);
+    }
+    config.prompt.extra_instructions =
+        validated_config_instructions(&user_config.summarize.prompt.extra_instructions)?;
+    config.prompt.memory_instructions =
+        validated_config_instructions(&user_config.summarize.memory.extra_instructions)?;
+    if let Some(style) = user_config
+        .images
+        .style
+        .as_deref()
+        .map(str::trim)
+        .filter(|style| !style.is_empty())
+    {
+        config.image.prompt_style = style.to_string();
+    }
+    if let Some(max_prompt_chars) = user_config.images.max_prompt_chars {
+        config.image.max_prompt_chars = max_prompt_chars.max(512);
+    }
+    config.image.extra_instructions =
+        validated_config_instructions(&user_config.images.extra_instructions)?;
+    for (index, pattern) in user_config
+        .summarize
+        .guardrails
+        .reject_patterns
+        .iter()
+        .enumerate()
+    {
+        validate_guardrail_regex(pattern)?;
+        config.guardrails.patterns.push(GuardrailPattern::reject(
+            format!("config-guardrail-{index}"),
+            pattern.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn validated_config_instructions(instructions: &[String]) -> Result<Vec<String>, CliError> {
+    let mut output = Vec::new();
+    for instruction in instructions.iter().map(|value| value.trim()) {
+        if instruction.is_empty() {
+            continue;
+        }
+        if instruction.chars().count() > 800 {
+            return Err(CliError::Http(
+                "config prompt instruction is too long; keep each entry under 800 characters"
+                    .to_string(),
+            ));
+        }
+        output.push(instruction.to_string());
+    }
+    Ok(output)
+}
+
+fn validate_guardrail_regex(pattern: &str) -> Result<(), CliError> {
+    regex::Regex::new(pattern)
+        .map(|_| ())
+        .map_err(|err| CliError::Http(format!("invalid config guardrail regex: {err}")))
+}
+
+fn merged_args(cli_args: &[String], config_args: Option<&[String]>) -> Vec<String> {
+    if cli_args.is_empty() {
+        config_args.unwrap_or_default().to_vec()
+    } else {
+        cli_args.to_vec()
+    }
+}
+
+fn summary_config(
+    options: SummaryCliOptions<'_>,
+    user_config: Option<&AgentFeedUserConfig>,
+) -> Result<SummaryConfig, CliError> {
     let mut config = SummaryConfig::p2p_default();
-    config.mode = if options.per_story {
+    if let Some(user_config) = user_config {
+        apply_user_summary_config(&mut config, user_config)?;
+    }
+    config.mode = if options.per_story
+        || user_config
+            .and_then(|config| config.summarize.per_story)
+            .unwrap_or(false)
+    {
         FeedSummaryMode::PerStory
     } else {
         FeedSummaryMode::FeedRollup
     };
-    config.prompt.style = options.summary_style.to_string();
-    config.prompt.max_prompt_chars = options.summary_prompt_max_chars.max(512);
-    config.processor = match options.summarizer {
+    if let Some(style) = options.summary_style {
+        config.prompt.style = style.to_string();
+    }
+    if let Some(max_prompt_chars) = options.summary_prompt_max_chars {
+        config.prompt.max_prompt_chars = max_prompt_chars.max(512);
+    }
+    let summarizer = options
+        .summarizer
+        .or_else(|| {
+            user_config
+                .and_then(|config| config.summarize.summarizer.as_deref())
+                .filter(|summarizer| !summarizer.trim().is_empty())
+        })
+        .unwrap_or("codex-memory");
+    config.processor = match summarizer {
         "deterministic" | "offline" => SummaryProcessorConfig::Deterministic,
         "aesthetic" | "codex" | "codex-exec" => SummaryProcessorConfig::CodexExec,
         "codex-memory" | "codex-session" | "aesthetic-memory" => {
@@ -5648,6 +6050,13 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
                     .summary_memory_store
                     .map(Path::display)
                     .map(|path| path.to_string())
+                    .or_else(|| {
+                        user_config
+                            .and_then(|config| config.summarize.memory.store.as_deref())
+                            .map(str::trim)
+                            .filter(|store| !store.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
                     .unwrap_or_else(default_summary_memory_store_string),
                 key: "default".to_string(),
                 command: default_codex_command(),
@@ -5657,22 +6066,56 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
         "process" | "command" => SummaryProcessorConfig::Process {
             command: options
                 .summary_command
+                .or_else(|| {
+                    user_config.and_then(|config| {
+                        config
+                            .summarize
+                            .processor
+                            .command
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|command| !command.is_empty())
+                    })
+                })
                 .ok_or_else(|| {
                     CliError::Http(
                         "--summary-command is required for process summarizer".to_string(),
                     )
                 })?
                 .to_string(),
-            args: options.summary_args.to_vec(),
+            args: merged_args(
+                options.summary_args,
+                user_config.map(|config| config.summarize.processor.args.as_slice()),
+            ),
         },
         "http" | "http-endpoint" => SummaryProcessorConfig::HttpEndpoint {
             url: options
                 .summary_endpoint
+                .or_else(|| {
+                    user_config.and_then(|config| {
+                        config
+                            .summarize
+                            .processor
+                            .endpoint
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|endpoint| !endpoint.is_empty())
+                    })
+                })
                 .ok_or_else(|| {
                     CliError::Http("--summary-endpoint is required for http summarizer".to_string())
                 })?
                 .to_string(),
-            auth_header_env: options.summary_auth_header_env.map(str::to_string),
+            auth_header_env: options
+                .summary_auth_header_env
+                .map(str::to_string)
+                .or_else(|| {
+                    user_config
+                        .and_then(|config| config.summarize.processor.auth_header_env.as_deref())
+                        .map(str::trim)
+                        .filter(|env| !env.is_empty())
+                        .map(ToOwned::to_owned)
+                }),
         },
         other => {
             return Err(CliError::Http(format!(
@@ -5680,9 +6123,18 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
             )));
         }
     };
-    config.guardrails.allow_project_names = options.allow_project_names;
-    config.image.enabled = options.images;
-    config.image.allow_remote_urls = options.allow_remote_image_urls;
+    config.guardrails.allow_project_names = options.allow_project_names
+        || user_config
+            .and_then(|config| config.summarize.allow_project_names)
+            .unwrap_or(false);
+    config.image.enabled = options.images
+        || user_config
+            .and_then(|config| config.images.enabled)
+            .unwrap_or(false);
+    config.image.allow_remote_urls = options.allow_remote_image_urls
+        || user_config
+            .and_then(|config| config.images.allow_remote_urls)
+            .unwrap_or(false);
     config.image.decision = ImageDecisionMode::BestJudgement;
     if let Some(style) = options.image_style {
         config.image.prompt_style = style.to_string();
@@ -5690,12 +6142,52 @@ fn summary_config(options: SummaryCliOptions<'_>) -> Result<SummaryConfig, CliEr
     if let Some(max_prompt_chars) = options.image_prompt_max_chars {
         config.image.max_prompt_chars = max_prompt_chars.max(512);
     }
-    config.image.processor = if options.images {
+    let image_processor = options
+        .image_processor
+        .or_else(|| {
+            user_config
+                .and_then(|config| config.images.processor.as_deref())
+                .filter(|processor| !processor.trim().is_empty())
+        })
+        .unwrap_or("codex-exec");
+    config.image.processor = if config.image.enabled {
         parse_image_processor(
-            options.image_processor,
-            options.image_endpoint,
-            options.image_command,
-            options.image_args,
+            image_processor,
+            options.image_endpoint.or_else(|| {
+                user_config.and_then(|config| {
+                    config
+                        .images
+                        .processor_config()
+                        .endpoint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|endpoint| !endpoint.is_empty())
+                })
+            }),
+            user_config.and_then(|config| {
+                config
+                    .images
+                    .processor_config()
+                    .auth_header_env
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|env| !env.is_empty())
+            }),
+            options.image_command.or_else(|| {
+                user_config.and_then(|config| {
+                    config
+                        .images
+                        .processor_config()
+                        .command
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|command| !command.is_empty())
+                })
+            }),
+            &merged_args(
+                options.image_args,
+                user_config.map(|config| config.images.processor_config().args.as_slice()),
+            ),
         )?
     } else {
         ImageProcessorConfig::Disabled
@@ -5756,9 +6248,86 @@ fn default_codex_command() -> String {
     std::env::var("AGENT_FEED_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
 }
 
+fn user_config_path(explicit: Option<&Path>) -> PathBuf {
+    if let Some(path) = explicit {
+        return path.to_path_buf();
+    }
+    if let Ok(path) = std::env::var("AGENT_FEED_CONFIG") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".agent_feed")
+        .join("config.toml")
+}
+
+fn resolved_existing_user_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    let path = user_config_path(explicit);
+    path.exists().then_some(path)
+}
+
+fn load_user_config(explicit: Option<&Path>) -> Result<AgentFeedUserConfig, CliError> {
+    let path = user_config_path(explicit);
+    if !path.exists() {
+        return Ok(AgentFeedUserConfig::default());
+    }
+    let body = fs::read_to_string(&path)?;
+    let config = toml::from_str::<AgentFeedUserConfig>(&body)?;
+    validate_user_config(&config)?;
+    debug!(path = %path.display(), "loaded user config");
+    Ok(config)
+}
+
+fn validate_user_config(config: &AgentFeedUserConfig) -> Result<(), CliError> {
+    let mut candidate = SummaryConfig::p2p_default();
+    apply_user_summary_config(&mut candidate, config)?;
+    let options = SummaryCliOptions::default();
+    let _ = summary_config(options, Some(config))?;
+    Ok(())
+}
+
+fn init_user_config(explicit: Option<&Path>, force: bool) -> Result<PathBuf, CliError> {
+    let path = user_config_path(explicit);
+    if path.exists() && !force {
+        validate_user_config(&load_user_config(Some(&path))?)?;
+        return Ok(path);
+    }
+    if path.exists() {
+        let backup = timestamped_backup_path(&path);
+        fs::copy(&path, &backup)?;
+        info!(
+            path = %path.display(),
+            backup = %backup.display(),
+            "backed up existing user config"
+        );
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, DEFAULT_CONFIG_TEMPLATE)?;
+    set_owner_only_permissions(&path)?;
+    validate_user_config(&load_user_config(Some(&path))?)?;
+    Ok(path)
+}
+
+fn timestamped_backup_path(path: &Path) -> PathBuf {
+    let stamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    path.with_file_name(format!("{file_name}.bak.{stamp}"))
+}
+
 fn parse_image_processor(
     processor: &str,
     endpoint: Option<&str>,
+    auth_header_env: Option<&str>,
     command: Option<&str>,
     args: &[String],
 ) -> Result<ImageProcessorConfig, CliError> {
@@ -5779,7 +6348,7 @@ fn parse_image_processor(
                     CliError::Http("--image-endpoint is required for http image processor".into())
                 })?
                 .to_string(),
-            auth_header_env: None,
+            auth_header_env: auth_header_env.map(str::to_string),
         }),
         "disabled" | "none" => Ok(ImageProcessorConfig::Disabled),
         other => Err(CliError::Http(format!(

@@ -30,11 +30,13 @@ agent_feed_story = { workspace = true }
 agent_feed_summarize = { workspace = true }
 agent_feed_views = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+regex = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 

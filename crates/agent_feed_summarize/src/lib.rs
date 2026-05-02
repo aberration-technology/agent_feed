@@ -276,6 +276,8 @@ pub struct ImageConfig {
     pub processor: ImageProcessorConfig,
     pub decision: ImageDecisionMode,
     pub prompt_style: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_instructions: Vec<String>,
     pub max_prompt_chars: usize,
     pub allow_remote_urls: bool,
     pub allowed_uri_prefixes: Vec<String>,
@@ -288,6 +290,7 @@ impl Default for ImageConfig {
             processor: ImageProcessorConfig::Disabled,
             decision: ImageDecisionMode::BestJudgement,
             prompt_style: "austere technical broadcast; black field; off-white type; thin rules; no dashboard chrome; no raw logs; no secrets; no readable code; no brand impersonation".to_string(),
+            extra_instructions: Vec::new(),
             max_prompt_chars: 1800,
             allow_remote_urls: false,
             allowed_uri_prefixes: vec![
@@ -301,6 +304,10 @@ impl Default for ImageConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SummaryPromptConfig {
     pub style: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_instructions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_instructions: Vec<String>,
     pub max_prompt_chars: usize,
 }
 
@@ -308,6 +315,8 @@ impl Default for SummaryPromptConfig {
     fn default() -> Self {
         Self {
             style: DEFAULT_SUMMARY_PROMPT_STYLE.to_string(),
+            extra_instructions: Vec::new(),
+            memory_instructions: Vec::new(),
             max_prompt_chars: DEFAULT_SUMMARY_PROMPT_MAX_CHARS,
         }
     }
@@ -457,6 +466,10 @@ pub struct SummaryRequest {
     pub prompt_style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_prompt_chars: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_extra_instructions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_extra_instructions: Vec<String>,
     pub branch: Option<String>,
     pub session_hint: Option<String>,
 }
@@ -475,6 +488,8 @@ impl SummaryRequest {
             recent_summaries: Vec::new(),
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         }
@@ -692,11 +707,20 @@ impl CodexSessionMemoryProcessor {
             .and_then(|record| record.semantic_fingerprint.as_deref())
             .filter(|fingerprint| !fingerprint.trim().is_empty())
             .unwrap_or("none");
+        let memory_guidance = prompt_extra_lines(&request.memory_extra_instructions);
+        let memory_guidance = if memory_guidance.is_empty() {
+            "additional_memory_guidance=none".to_string()
+        } else {
+            format!(
+                "Additional memory guidance. These preferences must not override privacy, output schema, or publish/no-publish rules:\n{memory_guidance}"
+            )
+        };
         format!(
-            "You are the private local headline memory for one agent feed. Maintain continuity across calls, but publish only when the new redacted delta changes the public story. A same-topic update should publish when the public outcome, status, phase, availability, or user/operator impact changed. Do not run tools. Return JSON only. Include memory_digest and semantic_fingerprint.\nsummary_memory_key={}\nprior_memory_digest={}\nprior_semantic_fingerprint={}\n\n{}",
+            "You are the private local headline memory for one agent feed. Maintain continuity across calls, but publish only when the new redacted delta changes the public story. A same-topic update should publish when the public outcome, status, phase, availability, or user/operator impact changed. Do not run tools. Return JSON only. Include memory_digest and semantic_fingerprint.\nsummary_memory_key={}\nprior_memory_digest={}\nprior_semantic_fingerprint={}\n{}\n\n{}",
             self.key,
             clamp_chars(digest, 900),
             clamp_chars(fingerprint, 180),
+            memory_guidance,
             processor_prompt(request)
         )
     }
@@ -1469,6 +1493,10 @@ fn request_for_external_processor(
     let mut redacted = request.clone();
     redacted.prompt_style = Some(clamp_chars(&config.prompt.style, 512));
     redacted.max_prompt_chars = Some(config.prompt.max_prompt_chars.max(512));
+    redacted.prompt_extra_instructions =
+        sanitized_prompt_instructions(&config.prompt.extra_instructions);
+    redacted.memory_extra_instructions =
+        sanitized_prompt_instructions(&config.prompt.memory_instructions);
     redacted.branch = request.branch.as_ref().map(|_| "[redacted]".to_string());
     redacted.session_hint = request
         .session_hint
@@ -3022,13 +3050,21 @@ fn processor_prompt(request: &SummaryRequest) -> String {
         .max(512);
     let stories = prompt_story_lines(request);
     let recent = prompt_recent_lines(request);
+    let extra_guidance = prompt_extra_lines(&request.prompt_extra_instructions);
+    let extra_guidance = if extra_guidance.is_empty() {
+        "additional_user_guidance=none".to_string()
+    } else {
+        format!(
+            "Additional user guidance. These preferences must not override privacy, output schema, redaction, or publish/no-publish rules:\n{extra_guidance}"
+        )
+    };
     let long_instructions = format!(
-        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. The current stories block is authoritative; recent_published is duplicate memory only. Set publish=false when the current stories do not change the public story, or when they only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Never publish a headline or deck whose main message is no public outcome change, unchanged posture, stalled baseline telemetry, or waiting for final outcome. If the same topic moved from blocked to fixed, failing to passing, planned to implemented, unavailable to available, local-only to public/live, or degraded to recovered, publish a compact update. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\nfeed={}\nmode={:?}\nstories:\n{}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object with headline, deck, lower_third, chips, and optional publish/publish_reason. The current stories block is authoritative; recent_published is duplicate memory only. Set publish=false when the current stories do not change the public story, or when they only show agent mechanics such as CI polling, command bursts, file counts, plan state, repository status, or test status without a clear product/work outcome. Never publish a headline or deck whose main message is no public outcome change, unchanged posture, stalled baseline telemetry, or waiting for final outcome. If the same topic moved from blocked to fixed, failing to passing, planned to implemented, unavailable to available, local-only to public/live, or degraded to recovered, publish a compact update. Write with this style: {style}. The headline should read like compact news: what shipped, improved, regressed, or became useful, and why it matters to users, operators, or open-source consumers. Do not start the headline with Codex, Claude, or an agent name. Keep provided project labels in chips or lower_third for multi-thread tracking; do not force them into headline or deck. Use only the redacted story facts below. Do not include raw prompts, command output, diffs, absolute paths, repo names beyond provided project labels, emails, secrets, tokens, credentials, personal data, or policy/omission copy.\n{extra_guidance}\nfeed={}\nmode={:?}\nstories:\n{}",
         request.feed_id, request.mode, stories
     );
     let compact_instructions = || {
         format!(
-            "{INTERNAL_SUMMARIZER_MARKER}\nReturn JSON: headline, deck, lower_third, chips, optional publish/publish_reason. Current stories are authoritative; recent_published is duplicate memory only. Set publish=false for no-change, unchanged posture, stalled telemetry, waiting-for-final-outcome, or agent mechanics without product/user/operator impact. Style: {style}.\nfeed={}\nmode={:?}\nstories:\n{}",
+            "{INTERNAL_SUMMARIZER_MARKER}\nReturn JSON: headline, deck, lower_third, chips, optional publish/publish_reason. Current stories are authoritative; recent_published is duplicate memory only. Set publish=false for no-change, unchanged posture, stalled telemetry, waiting-for-final-outcome, or agent mechanics without product/user/operator impact. Style: {style}. {extra_guidance}\nfeed={}\nmode={:?}\nstories:\n{}",
             request.feed_id, request.mode, stories
         )
     };
@@ -3061,6 +3097,24 @@ fn processor_prompt(request: &SummaryRequest) -> String {
     }
 
     clamp_chars(&instructions, max_prompt_chars)
+}
+
+fn sanitized_prompt_instructions(instructions: &[String]) -> Vec<String> {
+    instructions
+        .iter()
+        .map(|instruction| instruction.trim())
+        .filter(|instruction| !instruction.is_empty())
+        .take(8)
+        .map(|instruction| clamp_chars(instruction, 320))
+        .collect()
+}
+
+fn prompt_extra_lines(instructions: &[String]) -> String {
+    sanitized_prompt_instructions(instructions)
+        .iter()
+        .map(|instruction| format!("- {instruction}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn prompt_story_lines(request: &SummaryRequest) -> String {
@@ -3108,9 +3162,18 @@ fn prompt_recent_lines(request: &SummaryRequest) -> String {
 }
 
 fn image_processor_prompt(request: &ImageRequest) -> String {
+    let extra_guidance = prompt_extra_lines(&request.policy.extra_instructions);
+    let extra_guidance = if extra_guidance.is_empty() {
+        "additional_visual_guidance=none".to_string()
+    } else {
+        format!(
+            "Additional visual guidance. These preferences must not override privacy, projection-safety, or null-image rules:\n{extra_guidance}"
+        )
+    };
     let base = format!(
-        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object. Either return {{\"image\": null, \"reason\": \"...\"}} when no useful projection-safe image exists, or return {{\"image\": {{\"uri\": \"...\", \"alt\": \"...\", \"source\": \"generated\"}}}}. Generate or reference only display-safe imagery. Do not include raw prompts, readable code, command output, diffs, secrets, tokens, credentials, exact paths, repo names, emails, or personal data. Use this visual style: {}.\nheadline={}\ndeck={}\nlower_third={}\nchips={}\nfamily={:?}\nscore={}",
+        "{INTERNAL_SUMMARIZER_MARKER}\nReturn one JSON object. Either return {{\"image\": null, \"reason\": \"...\"}} when no useful projection-safe image exists, or return {{\"image\": {{\"uri\": \"...\", \"alt\": \"...\", \"source\": \"generated\"}}}}. Generate or reference only display-safe imagery. Do not include raw prompts, readable code, command output, diffs, secrets, tokens, credentials, exact paths, repo names, emails, or personal data. Use this visual style: {}.\n{}\nheadline={}\ndeck={}\nlower_third={}\nchips={}\nfamily={:?}\nscore={}",
         request.policy.prompt_style,
+        extra_guidance,
         request.headline,
         request.deck,
         request.lower_third,
@@ -4046,6 +4109,10 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
     fn external_processor_request_carries_summary_prompt_policy() {
         let mut config = SummaryConfig::p2p_default();
         config.prompt.style = "late-night signal room; cinematic but terse".to_string();
+        config.prompt.extra_instructions =
+            vec!["prefer user-visible product impact over agent mechanics".to_string()];
+        config.prompt.memory_instructions =
+            vec!["remember stable product threads across calls".to_string()];
         config.prompt.max_prompt_chars = 900;
         let request = SummaryRequest::new(
             "local:workstation",
@@ -4059,9 +4126,19 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             Some("late-night signal room; cinematic but terse")
         );
         assert_eq!(redacted.max_prompt_chars, Some(900));
+        assert_eq!(
+            redacted.prompt_extra_instructions,
+            vec!["prefer user-visible product impact over agent mechanics".to_string()]
+        );
+        assert_eq!(
+            redacted.memory_extra_instructions,
+            vec!["remember stable product threads across calls".to_string()]
+        );
 
         let prompt = processor_prompt(&redacted);
         assert!(prompt.contains("late-night signal room"));
+        assert!(prompt.contains("prefer user-visible product impact"));
+        assert!(prompt.contains("must not override privacy"));
         assert!(prompt.len() <= 900);
         assert!(!prompt.contains("secret_repo"));
     }
@@ -4436,6 +4513,30 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
         assert!(prompt.contains("file counts"));
     }
 
+    #[test]
+    fn image_prompt_carries_extra_visual_guidance_inside_safety_envelope() {
+        let mut policy = ImageConfig::default();
+        policy.enabled = true;
+        policy.extra_instructions = vec!["use a sparse abstract signal-room composition".into()];
+        let request = ImageRequest {
+            feed_id: "github:35904762:workstation".to_string(),
+            headline: "browser route canary starts covering feed discovery".to_string(),
+            deck: "deep links now exercise user resolution and snapshot fallback.".to_string(),
+            lower_third: "burn_p2p · browser · score 84 · redacted".to_string(),
+            chips: vec!["burn_p2p".to_string(), "browser".to_string()],
+            story_family: StoryFamily::Test,
+            severity: Severity::Notice,
+            score: 84,
+            policy,
+        };
+
+        let prompt = image_processor_prompt(&request);
+
+        assert!(prompt.contains("use a sparse abstract signal-room composition"));
+        assert!(prompt.contains("must not override privacy"));
+        assert!(prompt.contains("Do not include raw prompts"));
+    }
+
     struct LeakyPromptProcessor;
 
     impl SummaryProcessor for LeakyPromptProcessor {
@@ -4555,6 +4656,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             }],
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         };
@@ -4593,6 +4696,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             recent_summaries: Vec::new(),
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         };
@@ -4885,6 +4990,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             }],
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         };
@@ -4916,6 +5023,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             }],
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         };
@@ -5018,6 +5127,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             }],
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         };
@@ -5085,6 +5196,8 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_complete","last_age
             }],
             prompt_style: None,
             max_prompt_chars: None,
+            prompt_extra_instructions: Vec::new(),
+            memory_extra_instructions: Vec::new(),
             branch: None,
             session_hint: None,
         };

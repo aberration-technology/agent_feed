@@ -1,0 +1,66 @@
+# agent-feed user config
+#
+# This file is optional. If it is missing, agent-feed uses compiled defaults.
+# Values here tune local summarization and publishing behavior before CLI flags.
+# Safety rules are not configurable here: raw prompts, raw command output, raw
+# diffs, secrets, credentials, and private paths are never publish material.
+
+[summarize]
+# Summarizer route:
+#   codex-memory   keeps local continuity across publish intervals
+#   codex-exec     asks Codex once per summary
+#   claude-code    asks Claude Code once per summary
+#   process        sends the prompt to the command in [summarize.processor]
+#   http-endpoint  sends the prompt to the endpoint in [summarize.processor]
+#   deterministic  uses the built-in no-network summarizer
+summarizer = "codex-memory"
+
+# Editorial style. This can tune tone and selection, but cannot override the
+# redaction, JSON output, or publish/no-publish rules compiled into the binary.
+style = "austere technical broadcast; lowercase; compact news headline; lead with what shipped, improved, regressed, or became useful"
+max_prompt_chars = 3000
+per_story = false
+allow_project_names = false
+
+[summarize.prompt]
+# Extra summary guidance is appended inside the safe prompt envelope.
+extra_instructions = [
+  "prefer durable user/operator impact over agent mechanics",
+  "use project tags in chips when they help separate parallel work",
+]
+
+[summarize.memory]
+# Leave blank to use ~/.agent_feed/summary-memory.json.
+store = ""
+extra_instructions = [
+  "treat same-topic updates as publishable only when outcome, phase, availability, or impact changed",
+]
+
+[summarize.processor]
+# Used only when summarizer = "process" or "http-endpoint".
+command = ""
+args = []
+endpoint = ""
+auth_header_env = ""
+
+[summarize.guardrails]
+# Additional reject regexes. These add to the built-in secret/PII filters.
+reject_patterns = []
+
+[images]
+# Images are disabled by default. Enabling images only asks the configured
+# processor for optional projection-safe image references; it may still return
+# no image for a headline.
+enabled = false
+processor = "codex-exec"
+style = "austere technical broadcast; black field; off-white type; thin rules; no readable code"
+max_prompt_chars = 1800
+allow_remote_urls = false
+extra_instructions = []
+
+[images.external]
+# Used only when images.processor = "process" or "http-endpoint".
+command = ""
+args = []
+endpoint = ""
+auth_header_env = ""
