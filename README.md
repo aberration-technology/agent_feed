@@ -158,6 +158,10 @@ with p2p enabled, the root page is the global discovery feed: it asks the edge
 for network bootstrap/snapshot material and displays any visible, settled story
 headlines. it never requests raw events.
 
+global discovery is a bounded read model, not a global p2p content broadcast.
+feed capsules stay on per-feed streams, and discovery does not auto-subscribe a
+viewer or fabric peer.
+
 ```text
 https://feed.aberration.technology/?feed_mode=discovery
 https://feed.aberration.technology/?feed_mode=following

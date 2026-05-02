@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 
 const SNAPSHOT_HEADLINE_LIMIT: usize = 48;
+const GLOBAL_DISCOVERY_HEADLINE_LIMIT: usize = SNAPSHOT_HEADLINE_LIMIT;
 const MAX_PUBLISH_CAPSULES: usize = 16;
 type HmacSha256 = Hmac<Sha256>;
 
@@ -716,6 +717,25 @@ impl SnapshotStore {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn global_discovery_headlines(
+        &self,
+        filter: Option<&RemoteReelFilter>,
+    ) -> Vec<RemoteHeadlineView> {
+        let mut headlines = self
+            .headlines()
+            .into_iter()
+            .filter(|headline| {
+                filter
+                    .map(|filter| headline_matches_reel_filter(headline, filter))
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>();
+        if headlines.len() > GLOBAL_DISCOVERY_HEADLINE_LIMIT {
+            headlines.drain(0..headlines.len() - GLOBAL_DISCOVERY_HEADLINE_LIMIT);
+        }
+        headlines
     }
 
     fn feeds(&self) -> Vec<ResolveFeedView> {
@@ -2213,18 +2233,11 @@ fn network_snapshot_value_filtered(
     snapshot: &SnapshotStore,
     filter: Option<&RemoteReelFilter>,
 ) -> serde_json::Value {
-    let headlines = snapshot
-        .headlines()
-        .into_iter()
-        .filter(|headline| {
-            filter
-                .map(|filter| headline_matches_reel_filter(headline, filter))
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>();
+    let headlines = snapshot.global_discovery_headlines(filter);
     serde_json::json!({
         "state": "ready",
         "product": "feed",
+        "scope": "global-discovery",
         "network_id": config.network_id,
         "compatibility": ProtocolCompatibility::current(),
         "edge_base_url": config.edge_domain,
@@ -2232,9 +2245,16 @@ fn network_snapshot_value_filtered(
         "bootstrap_peers": config.bootstrap_peers,
         "bootstrap_topology": "single_bootstrap",
         "data_plane": "edge_snapshot_fallback",
+        "content_transport": "edge_snapshot_fallback",
+        "global_broadcast": false,
+        "auto_subscribe": false,
         "feed_mode": "discovery",
         "story_only": true,
         "raw_events": false,
+        "content_topics": "per-feed-only",
+        "headline_limit": GLOBAL_DISCOVERY_HEADLINE_LIMIT,
+        "headline_ttl_secs": snapshot_headline_ttl().whole_seconds(),
+        "feed_ttl_secs": snapshot_feed_ttl().whole_seconds(),
         "feeds": snapshot.feeds(),
         "headlines": headlines,
     })
@@ -3076,9 +3096,17 @@ mod tests {
         let snapshot = network_snapshot_value(&config(), &store);
 
         assert_eq!(snapshot["state"], "ready");
+        assert_eq!(snapshot["scope"], "global-discovery");
         assert_eq!(snapshot["feed_mode"], "discovery");
         assert_eq!(snapshot["story_only"], true);
         assert_eq!(snapshot["raw_events"], false);
+        assert_eq!(snapshot["global_broadcast"], false);
+        assert_eq!(snapshot["auto_subscribe"], false);
+        assert_eq!(snapshot["content_topics"], "per-feed-only");
+        assert_eq!(
+            snapshot["headline_limit"],
+            serde_json::json!(SNAPSHOT_HEADLINE_LIMIT)
+        );
         assert!(snapshot["feeds"].as_array().is_some());
         assert!(snapshot["headlines"].as_array().is_some());
         assert_eq!(snapshot["compatibility"]["protocol_version"], 1);

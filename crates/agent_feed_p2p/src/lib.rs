@@ -5,7 +5,7 @@ use agent_feed_directory::{
 use agent_feed_identity::{GithubOrgName, GithubTeamSlug, GithubUserId};
 use agent_feed_p2p_proto::{
     FeedId, FeedProfile, FeedVisibility, NetworkId, PeerIdString, ProtocolCompatibility, Signed,
-    StoryCapsule, feed_topic,
+    StoryCapsule, feed_topic, topic_allows_story_capsules,
 };
 use agent_feed_summarize::headline_similarity;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -547,6 +547,8 @@ pub enum P2pError {
     SubscriptionDenied(String),
     #[error("capsule signature rejected")]
     InvalidSignature,
+    #[error("story capsule topic rejected: {0}")]
+    InvalidStoryTopic(String),
     #[error("p2p compatibility rejected: {0}")]
     IncompatibleProtocol(String),
     #[error("p2p data plane unavailable: {0}")]
@@ -1361,6 +1363,37 @@ impl PeerNode {
         Ok(delivered)
     }
 
+    pub fn publish_capsule_on_topic(
+        &self,
+        topic: &str,
+        signed: Signed<StoryCapsule>,
+    ) -> Result<usize, P2pError> {
+        self.ensure_compatible()?;
+        let state = self
+            .network
+            .state
+            .lock()
+            .map_err(|_| P2pError::StatePoisoned)?;
+        let profile = state
+            .feeds
+            .get(&signed.value.feed_id)
+            .ok_or_else(|| P2pError::FeedNotFound(signed.value.feed_id.clone()))?;
+        let expected = feed_topic(&profile.network_id, &signed.value.feed_id);
+        if !topic_allows_story_capsules(topic, &profile.network_id, &signed.value.feed_id) {
+            tracing::warn!(
+                peer_id = %self.peer_id,
+                feed_id = %signed.value.feed_id,
+                topic = %topic,
+                expected_topic = %expected,
+                capsule_id = %signed.value.capsule_id,
+                "p2p story capsule rejected on non-feed topic"
+            );
+            return Err(P2pError::InvalidStoryTopic(topic.to_string()));
+        }
+        drop(state);
+        self.publish_capsule(signed)
+    }
+
     pub fn feed_snapshot(
         &self,
         feed_id: &str,
@@ -1663,7 +1696,8 @@ mod tests {
     use agent_feed_directory::{FeedDirectoryEntry, GithubPrincipal};
     use agent_feed_identity::GithubUserId;
     use agent_feed_p2p_proto::{
-        FeedVisibility, ProtoError, ProtocolCompatibility, Signed, StoryCapsule,
+        FeedVisibility, ProtoError, ProtocolCompatibility, Signed, StoryCapsule, directory_topic,
+        github_user_topic, presence_topic,
     };
     use agent_feed_story::compile_events;
     use time::OffsetDateTime;
@@ -1794,6 +1828,35 @@ mod tests {
         assert_eq!(delivered, 1);
         assert_eq!(inbox.len(), 1);
         assert!(inbox[0].verify_capsule()?);
+        Ok(())
+    }
+
+    #[test]
+    fn story_capsules_are_rejected_on_discovery_topics() -> Result<(), Box<dyn std::error::Error>> {
+        let network_id = "agent-feed-mainnet";
+        let network = InMemoryNetwork::new();
+        let publisher = network.peer(network_id, "peer-a", "github:1");
+        let subscriber = network.peer(network_id, "peer-b", "github:2");
+        publisher.announce_feed(profile("feed-public", FeedVisibility::Public)?)?;
+        subscriber.follow("feed-public")?;
+
+        for topic in [
+            directory_topic(network_id),
+            presence_topic(network_id),
+            github_user_topic(network_id, 1),
+        ] {
+            let err = publisher
+                .publish_capsule_on_topic(&topic, capsule("feed-public", 1)?)
+                .expect_err("discovery topics do not carry story capsules");
+            assert!(matches!(err, P2pError::InvalidStoryTopic(_)));
+        }
+
+        let feed = feed_topic(network_id, "feed-public");
+        assert_eq!(
+            publisher.publish_capsule_on_topic(&feed, capsule("feed-public", 1)?)?,
+            1
+        );
+        assert_eq!(subscriber.drain()?.len(), 1);
         Ok(())
     }
 

@@ -655,6 +655,16 @@ pub fn feed_topic(network_id: &str, feed_id: &str) -> String {
 }
 
 #[must_use]
+pub fn story_capsule_topic(network_id: &str, capsule: &StoryCapsule) -> String {
+    feed_topic(network_id, &capsule.feed_id)
+}
+
+#[must_use]
+pub fn topic_allows_story_capsules(topic: &str, network_id: &str, feed_id: &str) -> bool {
+    topic == feed_topic(network_id, feed_id)
+}
+
+#[must_use]
 pub fn directory_topic(network_id: &str) -> String {
     format!(
         "{}.v{}.{network_id}.directory",
@@ -942,6 +952,35 @@ mod tests {
         assert!(topic.starts_with("agent-feed.v1.agent-feed-mainnet.feed."));
         assert!(!topic.contains("mosure"));
         assert!(!topic.contains("workstation"));
+    }
+
+    #[test]
+    fn only_per_feed_topics_allow_story_capsules() -> Result<(), ProtoError> {
+        let capsule = StoryCapsule::from_story("feed-workstation", 1, "github:123", &story())?;
+        let network_id = "agent-feed-mainnet";
+        let feed = story_capsule_topic(network_id, &capsule);
+
+        assert!(topic_allows_story_capsules(
+            &feed,
+            network_id,
+            &capsule.feed_id
+        ));
+        assert!(!topic_allows_story_capsules(
+            &directory_topic(network_id),
+            network_id,
+            &capsule.feed_id
+        ));
+        assert!(!topic_allows_story_capsules(
+            &presence_topic(network_id),
+            network_id,
+            &capsule.feed_id
+        ));
+        assert!(!topic_allows_story_capsules(
+            &github_user_topic(network_id, 123),
+            network_id,
+            &capsule.feed_id
+        ));
+        Ok(())
     }
 
     #[test]
