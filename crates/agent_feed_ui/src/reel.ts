@@ -633,6 +633,7 @@ function renderRemoteState(route, state, lines = [], nextPublisher = undefined) 
 }
 
 function renderQuietConnected(route, classification = {}, nextPublisher = undefined) {
+  updateSourceCountFromClassification(route, classification);
   if (renderLatestSeenStory(route, classification, nextPublisher)) {
     return;
   }
@@ -670,6 +671,7 @@ function renderQuietConnected(route, classification = {}, nextPublisher = undefi
 }
 
 function renderLatestSeenStory(route, classification = {}, nextPublisher = undefined) {
+  updateSourceCountFromClassification(route, classification);
   const latest = classification.latestBulletin;
   if (!latest || !bulletinIsRecentForLatestHold(latest)) {
     return false;
@@ -756,13 +758,14 @@ function historyAction(route) {
 }
 
 function routeEyebrow(route) {
+  const mode = routeDisplayMode(route);
   if (route.kind === "global") {
-    return `feed / ${route.network} / ${routeDisplayMode(route)}`;
+    return `feed / ${route.network} / ${mode === "discover" ? "public discovery" : mode}`;
   }
   if (route.kind === "org") {
-    return `${route.network} / org / ${routeDisplayMode(route)}`;
+    return `feed / ${route.network} / org / ${route.org || route.login} / ${mode}`;
   }
-  return `${route.network} / ${routeDisplayMode(route)} / ${routeStreamLabel(route)}`;
+  return `feed / ${route.network} / @${route.login} / ${routeStreamLabel(route)}`;
 }
 
 function routeDisplayMode(route) {
@@ -2342,13 +2345,12 @@ async function startGlobalDiscoveryRoute(route, refresh = false) {
       fresh_unseen: classification.freshUnseenCount,
     });
     if (classification.kind === "fresh_unseen") {
-      updateSourceCountFromFeeds(feeds);
+      updateSourceCountFromFeeds(feeds, headlines);
       applyRemoteHeadlines(route, headlines, classification);
       return;
     }
     if (classification.historyAvailable) {
       renderQuietConnected(route, classification);
-      updateSourceCountFromFeeds(feeds);
       return;
     }
     renderRemoteState(route, "no-feeds", [
@@ -2507,7 +2509,7 @@ async function startUserRoute(route, refresh = false) {
       fresh_unseen: classification.freshUnseenCount,
     });
     if (classification.kind === "fresh_unseen" && !route.interactive) {
-      updateSourceCountFromFeeds(compatibleFeeds);
+      updateSourceCountFromFeeds(compatibleFeeds, headlines);
       applyRemoteHeadlines(route, headlines, classification);
       return;
     }
@@ -2600,7 +2602,7 @@ async function startOrgRoute(route, refresh = false) {
       profile: { login: org, display_name: org },
     });
     if (classification.kind === "fresh_unseen" && !route.interactive) {
-      updateSourceCountFromFeeds(feeds);
+      updateSourceCountFromFeeds(feeds, headlines);
       applyRemoteHeadlines(route, headlines, classification);
       return;
     }
@@ -3110,7 +3112,7 @@ function classifyRemoteSnapshot(route, feeds = [], headlines = [], context = {})
   return {
     kind,
     feeds: feedList,
-    feedCount: feedList.length,
+    feedCount: logicalFeedCount(feedList, routeHeadlines),
     headlines: routeHeadlines,
     headlineCount: routeHeadlines.length,
     latestBulletin,
@@ -3153,6 +3155,7 @@ function latestTimeValue(items, keys) {
 
 function applyRemoteHeadlines(route, headlines, classification = undefined) {
   const state = classification || classifyRemoteSnapshot(route, [], headlines);
+  updateSourceCountFromClassification(route, state);
   const nextHeadlines = state.headlines || headlines || [];
   const nextSignature = remoteSnapshotSignature(nextHeadlines);
   if (nextSignature && nextSignature === remoteHeadlinesSignature && bulletins.length) {
@@ -3209,7 +3212,7 @@ function remoteHeadlineToBulletin(route, item, index) {
       `${publisherLogin || route.login || "network"}/${item.feed_label || item.label || route.feed || "*"}`,
     feed_label: item.feed_label || item.label || route.feed || "",
     created_at: item.created_at || item.createdAt || item.published_at || item.publishedAt,
-    eyebrow: `feed / ${route.network} / ${route.feedMode === "following" ? "following" : "discover"}`,
+    eyebrow: routeEyebrow(route),
     headline: headlineText,
     deck: item.deck || item.summary || "settled story capsule published to the network.",
     lower_third: item.lower_third || item.lowerThird || item.publisher_label || "verified peer",
@@ -3468,7 +3471,7 @@ function renderGlobalTimeline(route, snapshot) {
   document.body.dataset.view = "history";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "browse");
-  setText(sourceCount, `${Math.max(feeds.length, headlines.length)} net`);
+  updateSourceCountFromFeeds(feeds, headlines);
   timeline.replaceChildren();
 
   const toolbar = document.createElement("div");
@@ -3588,7 +3591,7 @@ function renderTimeline(route, ticket) {
   document.body.dataset.view = "history";
   document.body.dataset.mode = "dispatch";
   setText(liveState, "browse");
-  updateSourceCountFromFeeds(ticket.feeds || ticket.candidate_feeds || []);
+  updateSourceCountFromFeeds(feeds, headlines);
   timeline.replaceChildren();
 
   const toolbar = document.createElement("div");
@@ -4130,9 +4133,68 @@ function publisherLoginForProfile(feed, ticket) {
     .split(/\s|\//)[0];
 }
 
-function updateSourceCountFromFeeds(feeds) {
-  remoteFeedCount = Array.isArray(feeds) ? feeds.length : 0;
+function updateSourceCountFromClassification(route, classification = {}) {
+  if (!remoteRoute && route) {
+    return;
+  }
+  if (classification.feedCount !== undefined) {
+    remoteFeedCount = Number(classification.feedCount) || 0;
+    updateSourceCount();
+  }
+}
+
+function updateSourceCountFromFeeds(feeds, headlines = []) {
+  remoteFeedCount = logicalFeedCount(feeds, headlines);
   setText(sourceCount, feedCountLabel(remoteFeedCount));
+}
+
+function logicalFeedCount(feeds = [], headlines = []) {
+  const keys = new Set();
+  for (const feed of feeds || []) {
+    const key = logicalFeedKeyFromFeed(feed);
+    if (key) {
+      keys.add(key);
+    }
+  }
+  for (const item of headlines || []) {
+    const key = logicalFeedKeyFromHeadline(item);
+    if (key) {
+      keys.add(key);
+    }
+  }
+  return keys.size;
+}
+
+function logicalFeedKeyFromFeed(feed) {
+  if (!feed) {
+    return "";
+  }
+  const owner =
+    feed.publisher_github_user_id ||
+    feed.github_user_id ||
+    feed.owner?.github_user_id ||
+    normalizeRouteLogin(feed.publisher_login || feed.github_login || feed.owner?.current_login || "");
+  const label = normalizeRouteLogin(feed.label || feed.feed_label || "feed");
+  if (owner && label) {
+    return `${owner}/${label}`;
+  }
+  return String(feed.feed_id || feed.id || "");
+}
+
+function logicalFeedKeyFromHeadline(item) {
+  if (!item) {
+    return "";
+  }
+  const owner =
+    item.publisher_github_user_id ||
+    item.github_user_id ||
+    item.publisher?.github_user_id ||
+    normalizeRouteLogin(publisherLoginFromHeadline(item));
+  const label = normalizeRouteLogin(item.feed_label || item.label || item.feed || "feed");
+  if (owner && label) {
+    return `${owner}/${label}`;
+  }
+  return String(item.feed_id || item.id || item.capsule_id || "");
 }
 
 function feedCountLabel(count) {

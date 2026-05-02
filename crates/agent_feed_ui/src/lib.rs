@@ -99,7 +99,7 @@ mod tests {
     fn favicon_matches_feed_mark() {
         let html = render_index_with_config(Some("stage"), &config(false));
 
-        assert!(html.contains("href=\"./favicon.svg\" type=\"image/svg+xml\""));
+        assert!(html.contains("href=\"/favicon.svg\" type=\"image/svg+xml\""));
         assert!(super::FAVICON_SVG.contains("rx=\"12\" fill=\"#000000\""));
         assert!(super::FAVICON_SVG.contains("fill=\"#d87c7c\""));
         assert!(super::FAVICON_SVG.contains("V30h-7v-8h7v-3"));
@@ -302,6 +302,13 @@ mod tests {
         assert!(html.contains("function routeEyebrow"));
         assert!(html.contains("function remoteHeadlineForState"));
         assert!(html.contains("setText(eyebrow, routeEyebrow(route));"));
+        assert!(html.contains("mode === \"discover\" ? \"public discovery\" : mode"));
+        assert!(
+            html.contains("feed / ${route.network} / org / ${route.org || route.login} / ${mode}")
+        );
+        assert!(
+            html.contains("feed / ${route.network} / @${route.login} / ${routeStreamLabel(route)}")
+        );
         assert!(html.contains("setText(headline, remoteHeadlineForState(state));"));
         assert!(html
             .contains("renderPublisher(nextPublisher || (route.kind === \"global\" ? undefined : { login: route.login }));"));
@@ -366,7 +373,15 @@ mod tests {
 
         assert!(html.contains(r#"<span id="source-count">0 feeds</span>"#));
         assert!(html.contains("let remoteFeedCount = undefined;"));
-        assert!(html.contains("function updateSourceCountFromFeeds(feeds)"));
+        assert!(html.contains("function updateSourceCountFromFeeds(feeds, headlines = [])"));
+        assert!(html.contains("function logicalFeedCount(feeds = [], headlines = [])"));
+        assert!(html.contains("function logicalFeedKeyFromFeed(feed)"));
+        assert!(html.contains("function logicalFeedKeyFromHeadline(item)"));
+        assert!(
+            html.contains(
+                "function updateSourceCountFromClassification(route, classification = {})"
+            )
+        );
         assert!(html.contains("setText(sourceCount, feedCountLabel(remoteFeedCount));"));
         assert!(html.contains("if (remoteRoute && remoteFeedCount !== undefined)"));
         assert!(html.contains("source_key:"));

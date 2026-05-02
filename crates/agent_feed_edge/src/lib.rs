@@ -782,6 +782,75 @@ impl SnapshotStore {
         feeds
     }
 
+    fn headlines_for_github_user(
+        &self,
+        github_user_id: u64,
+        github_login: &str,
+        route: &RemoteUserRoute,
+        session: Option<&VerifiedSession>,
+    ) -> Vec<RemoteHeadlineView> {
+        let now = OffsetDateTime::now_utc();
+        self.headlines
+            .lock()
+            .map(|headlines| {
+                headlines
+                    .iter()
+                    .filter(|headline| headline_is_within_retention(headline, now))
+                    .filter(|headline| {
+                        headline_matches_github_route_with_access(
+                            headline,
+                            github_user_id,
+                            github_login,
+                            route,
+                            session,
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn feeds_for_github_user(
+        &self,
+        github_user_id: u64,
+        github_login: &str,
+        route: &RemoteUserRoute,
+        session: Option<&VerifiedSession>,
+    ) -> Vec<ResolveFeedView> {
+        let now = OffsetDateTime::now_utc();
+        let mut feeds = self
+            .feeds
+            .lock()
+            .map(|feeds| {
+                feeds
+                    .iter()
+                    .filter(|feed| feed_is_within_retention(feed, now))
+                    .filter(|feed| {
+                        feed_matches_github_route_with_access(
+                            feed,
+                            github_user_id,
+                            github_login,
+                            route,
+                            session,
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        merge_resolve_feed_views(
+            &mut feeds,
+            feed_views_from_headlines(self.headlines_for_github_user(
+                github_user_id,
+                github_login,
+                route,
+                session,
+            )),
+        );
+        feeds
+    }
+
     fn persist_snapshot(&self, feeds: Vec<ResolveFeedView>, headlines: Vec<RemoteHeadlineView>) {
         let Some(path) = &self.path else {
             return;
@@ -1226,6 +1295,7 @@ async fn callback_github(
 
 async fn resolve_github(
     State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
     Path(login): Path<String>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> impl IntoResponse {
@@ -1244,34 +1314,22 @@ async fn resolve_github(
         CurlGithubResolver,
         DirectoryStore::new(),
     );
+    let bearer = verify_bearer_session(&headers);
+    let session = bearer.as_ref().map(|bearer| &bearer.session);
     match resolver.resolve_github_user(&route) {
         Ok(ticket) => {
-            let feeds = state
-                .snapshot
-                .feeds()
-                .into_iter()
-                .filter(|feed| {
-                    feed_matches_github_route(
-                        feed,
-                        ticket.resolved_github_id.get(),
-                        ticket.profile.login.as_str(),
-                        &route,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let headlines = state
-                .snapshot
-                .headlines()
-                .into_iter()
-                .filter(|headline| {
-                    headline_matches_github_route(
-                        headline,
-                        ticket.resolved_github_id.get(),
-                        ticket.profile.login.as_str(),
-                        &route,
-                    )
-                })
-                .collect();
+            let feeds = state.snapshot.feeds_for_github_user(
+                ticket.resolved_github_id.get(),
+                ticket.profile.login.as_str(),
+                &route,
+                session,
+            );
+            let headlines = state.snapshot.headlines_for_github_user(
+                ticket.resolved_github_id.get(),
+                ticket.profile.login.as_str(),
+                &route,
+                session,
+            );
             let mut response =
                 ResolveGithubResponse::from_ticket_and_headlines(&ticket, &state.config, headlines);
             merge_resolve_feed_views(&mut response.feeds, feeds);
@@ -1279,7 +1337,7 @@ async fn resolve_github(
         }
         Err(EdgeError::Github(GithubResolveError::NotFound(_))) => {
             if let Some(response) =
-                resolve_github_from_snapshot(&state.config, &state.snapshot, &route)
+                resolve_github_from_snapshot(&state.config, &state.snapshot, &route, session)
             {
                 return ([(header::CACHE_CONTROL, "no-store")], Json(response)).into_response();
             }
@@ -1747,45 +1805,99 @@ fn feed_view_from_publish(
     )
 }
 
+#[cfg(test)]
 fn headline_matches_github_route(
     headline: &RemoteHeadlineView,
     github_user_id: u64,
     github_login: &str,
     route: &RemoteUserRoute,
 ) -> bool {
+    headline_matches_github_route_with_access(headline, github_user_id, github_login, route, None)
+}
+
+fn headline_matches_github_route_with_access(
+    headline: &RemoteHeadlineView,
+    github_user_id: u64,
+    github_login: &str,
+    route: &RemoteUserRoute,
+    session: Option<&VerifiedSession>,
+) -> bool {
     let identity_matches = headline.publisher_github_user_id == Some(github_user_id)
         || (headline.publisher_github_user_id.is_none()
             && headline.publisher_login.eq_ignore_ascii_case(github_login));
     identity_matches
-        && public_headline_is_visible(headline)
+        && headline_is_visible_for_session(headline, session)
         && route.stream_filter.permits_label(&headline.feed_label)
         && headline_matches_reel_filter(headline, &route.reel_filter)
 }
 
-fn feed_matches_github_route(
+fn feed_matches_github_route_with_access(
     feed: &ResolveFeedView,
     github_user_id: u64,
     github_login: &str,
     route: &RemoteUserRoute,
+    session: Option<&VerifiedSession>,
 ) -> bool {
     let identity_matches = feed.publisher_github_user_id == Some(github_user_id)
         || feed.publisher_login.eq_ignore_ascii_case(github_login);
     identity_matches
-        && public_feed_is_visible(feed)
+        && feed_is_visible_for_session(feed, session)
         && route.stream_filter.permits_label(&feed.label)
 }
 
 fn public_feed_is_visible(feed: &ResolveFeedView) -> bool {
-    feed.visibility == FeedVisibility::Public.as_str() && !feed.feed_id.starts_with("local:")
+    feed_is_visible_for_session(feed, None)
 }
 
 fn public_headline_is_visible(headline: &RemoteHeadlineView) -> bool {
-    headline.visibility == FeedVisibility::Public.as_str()
+    headline_is_visible_for_session(headline, None)
+}
+
+fn feed_is_visible_for_session(feed: &ResolveFeedView, session: Option<&VerifiedSession>) -> bool {
+    !feed.feed_id.starts_with("local:")
+        && session_can_access_policy(session, feed.visibility.as_str(), &feed.access)
+}
+
+fn headline_is_visible_for_session(
+    headline: &RemoteHeadlineView,
+    session: Option<&VerifiedSession>,
+) -> bool {
+    session_can_access_policy(session, headline.visibility.as_str(), &headline.access)
         && !headline.feed_id.starts_with("local:")
         && !remote_copy_has_public_quality_issue(&format!(
             "{} {}",
             headline.headline, headline.deck
         ))
+}
+
+fn session_can_access_policy(
+    session: Option<&VerifiedSession>,
+    visibility: &str,
+    access: &FeedAccessPolicy,
+) -> bool {
+    match visibility {
+        "public" => true,
+        "github_user" => session.is_some_and(|session| {
+            access
+                .github_users
+                .iter()
+                .any(|user_id| user_id.get() == session.github_user_id)
+        }),
+        "github_org" => session.is_some_and(|session| {
+            access
+                .github_org
+                .as_ref()
+                .is_some_and(|org| session.permits_org(org))
+        }),
+        "github_team" => session.is_some_and(|session| {
+            access
+                .github_org
+                .as_ref()
+                .zip(access.github_team.as_ref())
+                .is_some_and(|(org, team)| session.permits_team(org, team))
+        }),
+        _ => false,
+    }
 }
 
 fn feed_matches_org_route(
@@ -1974,10 +2086,40 @@ fn resolve_github_from_snapshot(
     config: &EdgeConfig,
     snapshot: &SnapshotStore,
     route: &RemoteUserRoute,
+    session: Option<&VerifiedSession>,
 ) -> Option<ResolveGithubResponse> {
     let login = route.login.as_str();
-    let feeds = snapshot.feeds();
-    let headlines = snapshot.headlines();
+    let now = OffsetDateTime::now_utc();
+    let feeds = snapshot
+        .feeds
+        .lock()
+        .map(|feeds| {
+            feeds
+                .iter()
+                .filter(|feed| feed_is_within_retention(feed, now))
+                .filter(|feed| {
+                    feed.publisher_login.eq_ignore_ascii_case(login)
+                        && feed_is_visible_for_session(feed, session)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let headlines = snapshot
+        .headlines
+        .lock()
+        .map(|headlines| {
+            headlines
+                .iter()
+                .filter(|headline| headline_is_within_retention(headline, now))
+                .filter(|headline| {
+                    headline.publisher_login.eq_ignore_ascii_case(login)
+                        && headline_is_visible_for_session(headline, session)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let github_user_id = feeds
         .iter()
         .find(|feed| feed.publisher_login.eq_ignore_ascii_case(login))
@@ -2017,12 +2159,26 @@ fn resolve_github_from_snapshot(
         .unwrap_or_else(|| route.login.to_string());
     let matching_feeds = feeds
         .into_iter()
-        .filter(|feed| feed_matches_github_route(feed, github_user_id, &current_login, route))
+        .filter(|feed| {
+            feed_matches_github_route_with_access(
+                feed,
+                github_user_id,
+                &current_login,
+                route,
+                session,
+            )
+        })
         .collect::<Vec<_>>();
     let matching_headlines = headlines
         .into_iter()
         .filter(|headline| {
-            headline_matches_github_route(headline, github_user_id, &current_login, route)
+            headline_matches_github_route_with_access(
+                headline,
+                github_user_id,
+                &current_login,
+                route,
+                session,
+            )
         })
         .collect::<Vec<_>>();
     if matching_feeds.is_empty() && matching_headlines.is_empty() {
@@ -2749,6 +2905,69 @@ mod tests {
         entry.sign(peer_id).expect("entry signs")
     }
 
+    fn private_org_access() -> FeedAccessPolicy {
+        FeedAccessPolicy::github_org(
+            GithubOrgName::parse("aberration-technology").expect("org parses"),
+        )
+    }
+
+    fn private_org_session() -> VerifiedSession {
+        VerifiedSession {
+            github_user_id: 456,
+            scopes: BTreeSet::from(["read:org".to_string()]),
+            github_orgs: BTreeSet::from(["aberration-technology".to_string()]),
+            github_teams: BTreeSet::new(),
+        }
+    }
+
+    fn other_org_session() -> VerifiedSession {
+        VerifiedSession {
+            github_user_id: 789,
+            scopes: BTreeSet::from(["read:org".to_string()]),
+            github_orgs: BTreeSet::from(["elsewhere".to_string()]),
+            github_teams: BTreeSet::new(),
+        }
+    }
+
+    fn private_org_feed() -> ResolveFeedView {
+        ResolveFeedView {
+            feed_id: "github:123:workstation".to_string(),
+            label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            visibility: FeedVisibility::GithubOrg.as_str().to_string(),
+            access: private_org_access(),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            publisher_verified: true,
+            last_seen_at: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn private_org_headline() -> RemoteHeadlineView {
+        RemoteHeadlineView {
+            feed_id: "github:123:workstation".to_string(),
+            feed_label: "workstation".to_string(),
+            compatibility: ProtocolCompatibility::current(),
+            visibility: FeedVisibility::GithubOrg.as_str().to_string(),
+            access: private_org_access(),
+            created_at: Some(OffsetDateTime::now_utc()),
+            publisher_github_user_id: Some(123),
+            publisher_login: "mosure".to_string(),
+            publisher_display_name: Some("mosure".to_string()),
+            publisher_avatar: Some("/avatar/github/123".to_string()),
+            verified: true,
+            headline: "burn p2p release hardening ships".to_string(),
+            deck: "browser auth and deployment guardrails shipped for the private org feed."
+                .to_string(),
+            lower_third: "@mosure / workstation".to_string(),
+            chips: vec!["burn_p2p".to_string(), "release".to_string()],
+            score: 88,
+            image: None,
+        }
+    }
+
     #[test]
     fn edge_resolves_login_to_signed_discovery_ticket() {
         let edge = resolver_with_directory();
@@ -3236,14 +3455,72 @@ mod tests {
         let route =
             RemoteUserRoute::parse("/mosure", Some("streams=workstation")).expect("route parses");
 
-        let response =
-            resolve_github_from_snapshot(&config(), &store, &route).expect("snapshot resolves");
+        let response = resolve_github_from_snapshot(&config(), &store, &route, None)
+            .expect("snapshot resolves");
 
         assert_eq!(response.state, "resolved");
         assert_eq!(response.github_user_id, 123);
         assert_eq!(response.profile.login, "mosure");
         assert_eq!(response.feeds.len(), 1);
         assert_eq!(response.feeds[0].label, "workstation");
+    }
+
+    #[test]
+    fn github_user_route_requires_org_session_for_private_org_feed() {
+        let store = SnapshotStore::default();
+        store.upsert_feed(private_org_feed());
+        assert!(store.push(private_org_headline()));
+        let route =
+            RemoteUserRoute::parse("/mosure", Some("streams=workstation")).expect("route parses");
+
+        assert!(store.feeds().is_empty());
+        assert!(store.headlines().is_empty());
+        assert!(
+            store
+                .feeds_for_github_user(123, "mosure", &route, None)
+                .is_empty()
+        );
+        assert!(
+            store
+                .headlines_for_github_user(123, "mosure", &route, None)
+                .is_empty()
+        );
+        assert!(
+            store
+                .feeds_for_github_user(123, "mosure", &route, Some(&other_org_session()))
+                .is_empty()
+        );
+
+        let session = private_org_session();
+        let feeds = store.feeds_for_github_user(123, "mosure", &route, Some(&session));
+        let headlines = store.headlines_for_github_user(123, "mosure", &route, Some(&session));
+
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].label, "workstation");
+        assert_eq!(headlines.len(), 1);
+        assert_eq!(headlines[0].headline, "burn p2p release hardening ships");
+    }
+
+    #[test]
+    fn github_snapshot_fallback_can_resolve_private_org_user_when_authorized() {
+        let store = SnapshotStore::default();
+        store.upsert_feed(private_org_feed());
+        assert!(store.push(private_org_headline()));
+        let route =
+            RemoteUserRoute::parse("/mosure", Some("streams=workstation")).expect("route parses");
+
+        assert!(resolve_github_from_snapshot(&config(), &store, &route, None).is_none());
+
+        let session = private_org_session();
+        let response = resolve_github_from_snapshot(&config(), &store, &route, Some(&session))
+            .expect("private org snapshot resolves for org member");
+
+        assert_eq!(response.state, "resolved");
+        assert_eq!(response.github_user_id, 123);
+        assert_eq!(response.profile.login, "mosure");
+        assert_eq!(response.feeds.len(), 1);
+        assert_eq!(response.headlines.len(), 1);
+        assert_eq!(response.feeds[0].visibility, "github_org");
     }
 
     #[tokio::test]
